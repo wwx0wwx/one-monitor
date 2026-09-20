@@ -1,0 +1,78 @@
+name: release-theme
+
+# A theme's release is tagged theme-<short>-<version> -- theme-default-v1.2.3 --
+# and the tag alone decides which themes/<short>/ builds: the repository also
+# publishes the hub and the agent, so no release here belongs to "latest".
+on:
+  push:
+    tags: ["theme-*"]
+  workflow_dispatch:
+    inputs:
+      short:
+        description: 哪个主题（themes/ 下的目录名）
+        default: default
+
+permissions:
+  contents: write
+
+jobs:
+  # Reads the short out of the tag; a manual dispatch carries no tag to read,
+  # so the input names it instead.
+  route:
+    runs-on: ubuntu-latest
+    outputs:
+      short: ${{ steps.route.outputs.short }}
+    steps:
+      - id: route
+        run: |
+          short="${GITHUB_REF_NAME#theme-}"
+          short="${short%%-*}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            short="${{ inputs.short }}"
+          fi
+          case "$short" in
+            "" | *[!A-Za-z0-9-]*) echo "tag 里读不出主题的 short：$GITHUB_REF_NAME" >&2; exit 1 ;;
+          esac
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: route
+    runs-on: ubuntu-latest
+    env:
+      SHORT: ${{ needs.route.outputs.short }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: themes/*/package-lock.json
+
+      - name: Build whichever theme the tag named
+        run: |
+          test -d "themes/$SHORT" || { echo "themes/$SHORT 不存在；tag 指向了没有的主题" >&2; exit 1; }
+          cd "themes/$SHORT"
+          npm ci
+          npm run build
+
+          # The archive is an installable theme directory rather than a source
+          # snapshot: dist/ beside theme.json is exactly the layout the hub
+          # reads a theme from on disk. The file the hub embeds at build time
+          # and the file a user extracts into <themes>/<short>/ are therefore
+          # identical, and this release is the reference form for a
+          # third-party theme. preview.png is the panel's thumbnail, packaged
+          # beside theme.json rather than inside dist/ because it is metadata
+          # rather than content the theme serves.
+          tar czf theme.tar.gz dist theme.json preview.png
+          sha256sum theme.tar.gz | cut -d' ' -f1 | tee theme.tar.gz.sha256
+
+      # A manual dispatch builds and packages without publishing, so the path
+      # can be exercised without cutting a release. gh ships on the runner,
+      # keeping a third-party action out of the contents:write step.
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd "themes/$SHORT"
+          gh release create "$GITHUB_REF_NAME" theme.tar.gz theme.tar.gz.sha256 \
+            --generate-notes --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}

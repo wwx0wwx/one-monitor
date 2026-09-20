@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Linux monitoring agent for the monitor hub"
-repository = "https://github.com/monitor-probe/agent"
+repository = "https://github.com/wwx0wwx/one-monitor"
 
 [dependencies]
 anyhow = "1"

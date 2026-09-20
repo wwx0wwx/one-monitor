@@ -9,12 +9,16 @@
 
 ## 组成
 
-| 仓库 | 说明 |
+三个组件同仓发布在 [one-monitor](https://github.com/wwx0wwx/one-monitor)：
+
+| 目录 | 说明 |
 |---|---|
-| [monitor](https://github.com/wwx0wwx/monitor) | hub：后台、API、公开页宿主（fork） |
-| [agent](https://github.com/wwx0wwx/agent) | Linux agent（fork：版本代号制，pio → voy → cas → new） |
-| [monitor-theme-default](https://github.com/wwx0wwx/monitor-theme-default) | 内置默认主题（fork） |
+| `hub/`（本目录） | hub：后台、API、公开页宿主 |
+| [`agent/`](../agent) | Linux agent（版本代号制，pio → voy → cas → new） |
+| [`themes/default/`](../themes/default) | 内置默认主题 |
 
 ```
 agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 ```
+
+发版与 tag 纪律见[仓库根 README](../README.md)。

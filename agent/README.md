@@ -1,6 +1,6 @@
 # monitor-agent
 
-[monitor](https://github.com/monitor-probe/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
+[monitor](https://github.com/wwx0wwx/one-monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
 
 静态链接单文件，无运行时依赖，常驻内存数 MB。
 
@@ -45,7 +45,7 @@ monitor-agent --server https://your-hub --token <token>
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
 
-协议说明见 [hub 仓库](https://github.com/monitor-probe/monitor)。
+协议说明见 [hub 源码](https://github.com/wwx0wwx/one-monitor/tree/main/hub)。
 
 ## 构建
 

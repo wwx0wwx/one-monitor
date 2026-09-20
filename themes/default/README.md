@@ -1,6 +1,6 @@
 # monitor-theme-default
 
-[monitor](https://github.com/monitor-probe/monitor) 的内置默认主题，同时作为第三方主题的参考实现。
+[monitor](https://github.com/wwx0wwx/one-monitor) 的内置默认主题，同时作为第三方主题的参考实现。
 
 React + Vite + shadcn/ui，黑白配色。
 

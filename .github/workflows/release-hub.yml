@@ -1,5 +1,7 @@
-name: release
+name: release-hub
 
+# vX.Y.Z is the hub's lane in this repository's release list; the agent's
+# codenames and the themes' theme-<short>- tags each have their own workflow.
 on:
   push:
     tags: ["v*"]
@@ -14,6 +16,9 @@ jobs:
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    defaults:
+      run:
+        working-directory: hub
     steps:
       - uses: actions/checkout@v7
 
@@ -27,11 +32,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web-admin/package-lock.json
+          # Relative to the repository root, not to the defaults above.
+          cache-dependency-path: hub/web-admin/package-lock.json
 
       # The hub embeds the panel, so its dist/ must exist before cargo runs.
       - run: npm ci && npm run build
-        working-directory: web-admin
+        working-directory: hub/web-admin
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,7 +46,10 @@ jobs:
       - run: cargo install --locked cross
       - run: cross build --release --locked --target ${{ matrix.target }}
 
-      - run: cp "target/${{ matrix.target }}/release/monitor-hub" "monitor-hub-${{ matrix.target }}"
+      # collect from target/ (the defaults keep this step in hub/) to the
+      # repository root, where the artifact upload and the release job expect
+      # the bare asset names.
+      - run: cp "target/${{ matrix.target }}/release/monitor-hub" "../monitor-hub-${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -81,12 +90,12 @@ jobs:
       #
       # Both registries receive the same manifest from one build: Docker Hub is
       # where `docker run monitor` looks first, ghcr is what the repository
-      # publishes alongside its binaries. A fork without the Docker Hub secrets
-      # still gets its ghcr image rather than a failed release.
+      # publishes alongside its binaries. A checkout without the Docker Hub
+      # secrets still gets its ghcr image rather than a failed release.
       - if: startsWith(github.ref, 'refs/tags/')
         run: |
-          cp bin/monitor-hub-x86_64-unknown-linux-musl monitor-hub-amd64
-          cp bin/monitor-hub-aarch64-unknown-linux-musl monitor-hub-arm64
+          cp bin/monitor-hub-x86_64-unknown-linux-musl hub/monitor-hub-amd64
+          cp bin/monitor-hub-aarch64-unknown-linux-musl hub/monitor-hub-arm64
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           VERSION="${GITHUB_REF_NAME#v}"
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
@@ -100,8 +109,10 @@ jobs:
             echo "no Docker Hub credentials configured; publishing to ghcr only"
           fi
           # The default builder cannot produce two platforms in one manifest.
+          # The build context is hub/, where the Dockerfile and the binaries
+          # above now sit.
           docker buildx create --use --driver docker-container
-          docker buildx build --platform linux/amd64,linux/arm64 --push $TAGS .
+          docker buildx build --platform linux/amd64,linux/arm64 --push $TAGS hub
         env:
           GH_TOKEN: ${{ github.token }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}

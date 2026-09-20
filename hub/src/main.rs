@@ -114,9 +114,13 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
     Some(chain.split(',').next()?.trim())
 }
 
-/// Where the agent binaries are published. Not a setting: redirecting it
-/// implies a fork, which rebuilds this line anyway.
-const AGENT_REPO: &str = "wwx0wwx/agent";
+/// Where the agent binaries are published, and at which codename release. The
+/// repository also publishes the hub and the themes, so "latest" no longer
+/// names an agent release; the codename does, and moving to the next one (pio →
+/// voy → cas → new) means moving this tag in the same change that cuts it. Not
+/// settings: redirecting them implies a fork, which rebuilds these lines anyway.
+const AGENT_REPO: &str = "wwx0wwx/one-monitor";
+const AGENT_TAG: &str = "pio";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -135,7 +139,7 @@ fn release_url(app: &App, arch: &str) -> String {
     proxied(
         app,
         format!(
-            "https://github.com/{AGENT_REPO}/releases/latest/download/monitor-agent-{arch}-unknown-linux-musl"
+            "https://github.com/{AGENT_REPO}/releases/download/{AGENT_TAG}/monitor-agent-{arch}-unknown-linux-musl"
         ),
     )
 }
@@ -835,12 +839,17 @@ mod tests {
 
     /// The proxy is a hub setting rather than an install-command argument, so
     /// this is the only place the URL is built. A trailing slash in the setting
-    /// must not become a double slash the proxy will not match.
+    /// must not become a double slash the proxy will not match. The URL itself
+    /// names the pinned codename tag rather than "latest", whose release in the
+    /// monorepo may be the hub's or a theme's.
     #[test]
     fn a_github_proxy_prefixes_the_release_url_and_an_empty_one_does_not() {
         let app = app("");
         let direct = release_url(&app, "x86_64");
-        assert!(direct.starts_with("https://github.com/wwx0wwx/agent/releases/"), "{direct}");
+        assert!(
+            direct.starts_with("https://github.com/wwx0wwx/one-monitor/releases/download/pio/"),
+            "{direct}"
+        );
 
         for set in ["https://ghfast.top", "https://ghfast.top/", "  https://ghfast.top/  "] {
             app.db.set("github_proxy", set).unwrap();

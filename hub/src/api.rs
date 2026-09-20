@@ -1267,14 +1267,66 @@ fn path_segment(segment: &str) -> bool {
         && segment.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
 }
 
-/// Reinstalls one theme from the latest GitHub release of the repository its
-/// manifest names.
+/// The next page of a GitHub listing, read from the response's `Link` header:
+/// `<https://api.github.com/...?page=2>; rel="next", <...>; rel="first"`.
+/// None when the header is absent or names no next page, which is how the
+/// last page says so. Only the exact `next` relation matches: the hub walks a
+/// list forward and never back, and a URL the header did not name is never
+/// followed.
+fn next_page(link: &str) -> Option<String> {
+    link.split(',').find_map(|entry| {
+        let (url, relation) = entry.split_once(';')?;
+        (relation.trim() == r#"rel="next""#)
+            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_owned())
+    })
+}
+
+/// Whether version `a` is newer than `b`, both read after a tag's prefix:
+/// `1.3.0` against `1.2.4`. Segments are compared numerically from the left,
+/// the first difference deciding; a side that runs out of segments reads the
+/// missing ones as zero, so `1.2` ties `1.2.0` and loses to `1.2.1`. Within a
+/// tied numeral an empty remainder -- the release itself -- orders above any
+/// suffix, so a prerelease loses to the release it precedes, and two
+/// prereleases order as text.
+fn newer(a: &str, b: &str) -> bool {
+    // One dot-separated segment as its leading numeral plus what follows it:
+    // "3-rc1" reads as 3 with "-rc1" behind it.
+    fn segment(s: &str) -> (u64, bool, &str) {
+        let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let rest = &s[digits..];
+        (s[..digits].parse().unwrap_or(0), rest.is_empty(), rest)
+    }
+
+    let missing = (0, true, "");
+    let mut a = a.split('.').map(segment);
+    let mut b = b.split('.').map(segment);
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return false,
+            (Some(x), None) => return x > missing,
+            (None, Some(y)) => return missing > y,
+            (Some(x), Some(y)) if x != y => return x > y,
+            _ => continue,
+        }
+    }
+}
+
+/// Reinstalls one theme from the newest release of the repository its manifest
+/// names that is tagged as a release of this theme.
 ///
-/// The manifest supplies `<owner>/<repo>` and nothing more: the release is read
-/// from api.github.com and the archive from github.com, both at addresses the hub
-/// constructs itself, so no URL from the theme is ever followed. The installed
-/// version is compared against the release tag first, which is all most
-/// invocations do, making this also the check-for-updates action.
+/// The manifest supplies `<owner>/<repo>` and nothing more: releases are read
+/// from api.github.com and the archive from github.com, both at addresses the
+/// hub constructs itself, so no URL from the theme is ever followed. A theme's
+/// releases are tagged `theme-<short>-<version>`, and the prefix is what routes
+/// a tag to the theme it belongs to: the same repository also publishes the hub
+/// and the agent, so `releases/latest` names whichever component tagged last
+/// rather than this theme. The installed version is compared against the newest
+/// matching tag first, which is all most invocations do, making this also the
+/// check-for-updates action.
+///
+/// The version after the prefix is the manifest's `version` with an optional
+/// `v` in front: `theme-default-v1.2.3` against `1.2.3`. See [`newer`] for how
+/// two of them order.
 pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match update(&app, &short).await {
         Ok((updated, version)) => Json(json!({"updated": updated, "version": version})).into_response(),
@@ -1291,34 +1343,54 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         .context("没有这个主题")?;
     let (owner, repo) = github_repo(&installed.url)
         .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
+    let prefix = format!("theme-{short}-");
 
-    // Unauthenticated: 60 requests per hour from this address, ample for a manual
-    // action. GitHub returns 403 without a User-Agent.
-    let release: Release = app
-        .http
-        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
-        .header(header::USER_AGENT, "monitor-hub")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?
-        .json()
-        .await?;
+    // Unauthenticated: 60 requests per hour from this address, ample for a
+    // manual action. GitHub returns 403 without a User-Agent. The hub's and
+    // the agent's releases share this list with the theme's, so pages are
+    // followed while GitHub offers a next one, bounded at three: releases
+    // arrive newest first, and a theme whose newest release is older than
+    // three hundred releases of everything combined has stopped shipping.
+    let mut next = Some(format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"));
+    let mut newest: Option<(String, String)> = None;
+    for _ in 0..3 {
+        let Some(url) = next.take() else { break };
+        let response = app
+            .http
+            .get(url)
+            .header(header::USER_AGENT, "monitor-hub")
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("读不到 {owner}/{repo} 的 releases"))?;
+        next = response.headers().get(header::LINK).and_then(|link| link.to_str().ok()).and_then(next_page);
+        for release in response.json::<Vec<Release>>().await? {
+            // This theme's tags only; a release without the archive is not
+            // installable, so it is not this theme's either. Both checks come
+            // before the tag reaches a URL or a version comparison.
+            let Some(tail) = release.tag_name.strip_prefix(&prefix) else { continue };
+            if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
+                continue;
+            }
+            if !path_segment(&release.tag_name) {
+                bail!("release 的 tag {:?} 不能出现在下载地址里", release.tag_name);
+            }
+            // Owned before the tag itself is moved into the pair below: the
+            // tail and its v-less form both borrow release.tag_name.
+            let version = tail.strip_prefix('v').unwrap_or(tail).to_owned();
+            if newest.as_ref().is_none_or(|(_, best)| newer(&version, best)) {
+                newest = Some((release.tag_name, version));
+            }
+        }
+    }
 
-    // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
-    // anything else is installed, including a deliberate downgrade, since the
-    // release is what the author published.
-    let tag = &release.tag_name;
-    if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
+    let Some((tag, version)) = newest else {
+        bail!("{owner}/{repo} 的 releases 里没有 {prefix} 开头、带 {ARCHIVE} 的版本");
+    };
+    // Equal means up to date; anything else is installed, including a
+    // deliberate downgrade, since the release is what the author published.
+    if version == installed.version {
         return Ok((false, installed.version));
-    }
-    if !path_segment(tag) {
-        bail!("release 的 tag {tag:?} 不能出现在下载地址里");
-    }
-    // Checked here rather than by downloading and reading a 404: the asset name is
-    // the contract, and stating so is the entire error message.
-    if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-        bail!("release {tag} 里没有 {ARCHIVE}");
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
@@ -1747,7 +1819,7 @@ mod tests {
     /// whatever this accepts, the hub will fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
-        assert_eq!(github_repo("https://github.com/wwx0wwx/monitor"), Some(("wwx0wwx", "monitor")));
+        assert_eq!(github_repo("https://github.com/wwx0wwx/one-monitor"), Some(("wwx0wwx", "one-monitor")));
         // A link to the repository, in whatever form the author wrote it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
@@ -1775,9 +1847,44 @@ mod tests {
         }
 
         // The release tag also lands in that URL, arriving from the API rather
-        // than the manifest.
-        assert!(path_segment("v0.1.15") && path_segment("2024.1"));
+        // than the manifest. A theme's tag carries the prefix the update path
+        // filters on, and the prefix grammar keeps it a single segment.
+        assert!(path_segment("v0.1.15") && path_segment("2024.1") && path_segment("theme-default-v1.2.3"));
         assert!(!path_segment("release/1.0") && !path_segment("..") && !path_segment(""));
+    }
+
+    /// The newest of the releases carrying one theme's prefix is the one the
+    /// update path installs, so ordering the versions behind those prefixes is
+    /// what decides whether it offers an update at all.
+    #[test]
+    fn theme_versions_order_numerically_segment_by_segment() {
+        assert!(newer("1.3.0", "1.2.4"));
+        assert!(newer("0.10.0", "0.9.9"));
+        assert!(!newer("1.2.4", "1.3.0") && !newer("1.2.3", "1.2.3"));
+        // A missing segment reads as zero: longer wins only by what the extra
+        // segment says.
+        assert!(!newer("1.2", "1.2.0") && !newer("1.2.0", "1.2"));
+        assert!(newer("1.2.1", "1.2") && !newer("1.2", "1.2.1"));
+        // The release outranks the prereleases of itself, and they order as
+        // text behind the same numeral.
+        assert!(newer("1.3.0", "1.3.0-rc2") && newer("1.3.0-rc2", "1.3.0-rc1"));
+        assert!(!newer("1.3.0-rc1", "1.3.0"));
+    }
+
+    /// A theme's releases share the repository's list with the hub's and the
+    /// agent's, so the update path walks pages of it: the next page is read
+    /// from the Link header and only from its `next` relation.
+    #[test]
+    fn a_listing_names_its_next_page_by_the_next_relation_alone() {
+        let header = r#"<https://api.github.com/repos/a/b/releases?per_page=100&page=2>; rel="next", <https://api.github.com/repos/a/b/releases?per_page=100&page=1>; rel="prev""#;
+        assert_eq!(
+            next_page(header).as_deref(),
+            Some("https://api.github.com/repos/a/b/releases?per_page=100&page=2")
+        );
+        // The last page offers no next relation, and a header the hub did not
+        // expect offers nothing to follow.
+        assert_eq!(next_page(r#"<...?page=1>; rel="prev""#), None);
+        assert_eq!(next_page(""), None);
     }
 
     /// The entire chunked-upload protocol: an upload is only ever as long as what

@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/wwx0wwx/monitor/main/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://raw.githubusercontent.com/wwx0wwx/one-monitor/main/hub/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -14,7 +14,14 @@ set -eu
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
 
-REPO="wwx0wwx/monitor"
+REPO="wwx0wwx/one-monitor"
+# Which hub release to install. The monorepo's releases also carry the agent
+# and the themes, so GitHub's "latest" no longer names a hub release; this
+# default does, and it moves with the repository: every hub release updates it
+# in the same change that cuts the tag -- forgetting leaves plain installs one
+# release behind, not broken. `--version latest` follows the redirect instead,
+# and `--version <tag>` installs any release by name.
+VERSION="v1.3.0"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
@@ -112,7 +119,17 @@ install_hub() {
 	*) die "不支持的架构：$(uname -m)（发布的是 x86_64 与 aarch64）" ;;
 	esac
 	asset="monitor-hub-$arch-unknown-linux-musl"
-	base="https://github.com/$REPO/releases/latest/download"
+	if [ "$VERSION" = "latest" ]; then
+		base="https://github.com/$REPO/releases/latest/download"
+	else
+		# The tag lands directly in the download URL, so anything that could
+		# open a path segment of its own would fetch from somewhere else in
+		# the repository's releases.
+		case "$VERSION" in
+		"" | *[!A-Za-z0-9._-]* | .* | *- | *..*) die "--version 只能是 release 的 tag：$VERSION" ;;
+		esac
+		base="https://github.com/$REPO/releases/download/$VERSION"
+	fi
 	ok "架构" "$arch"
 
 	# Whatever the command line did not specify is recovered from the old unit;
@@ -157,15 +174,20 @@ install_hub() {
 	first=""
 	[ -f "$DATA/monitor.db" ] || first=1
 
-	# The tag comes from GitHub's own redirect for "latest", so there is no API
-	# call to be rate-limited and no JSON to parse. Only the first hop carries it
-	# -- the chain ends on release-assets.githubusercontent.com, whose URL
-	# contains no tag -- so this must not follow redirects. A missing asset still
-	# redirects, so the download below is what catches an architecture that was
-	# never published.
-	tag="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$base/$asset" 2>/dev/null |
-		sed -n 's#.*/download/\([^/]*\)/.*#\1#p')" || true
-	[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或还没有任何发布"
+	# In latest mode the tag comes from GitHub's own redirect for it, so there
+	# is no API call to be rate-limited and no JSON to parse. Only the first
+	# hop carries it -- the chain ends on release-assets.githubusercontent.com,
+	# whose URL contains no tag -- so this must not follow redirects. A missing
+	# asset still redirects, so the download below is what catches an
+	# architecture that was never published. A pinned version already knows its
+	# tag; a wrong one fails at the download the same way.
+	if [ "$VERSION" = "latest" ]; then
+		tag="$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$base/$asset" 2>/dev/null |
+			sed -n 's#.*/download/\([^/]*\)/.*#\1#p')" || true
+		[ -n "$tag" ] || die "查不到最新发布版；GitHub 不可达，或还没有任何发布"
+	else
+		tag="$VERSION"
+	fi
 	ok "版本" "$tag"
 
 	tmp="$(mktemp -d)"
@@ -421,6 +443,8 @@ monitor hub 安装器
   sudo ./install-hub.sh --purge        卸载并删除数据库
 
   --port <n>     本机监听端口，默认 $PORT
+  --version <t>  装哪个 release，默认 $VERSION（随仓库更新）；
+                 传 latest 跟随 GitHub 的最新发布，传具体 tag 装指定版本
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
                  用域名访问就自动对了。只有两种情况要填：你进面板的地址
                  不是节点能用的地址（比如走 SSH 隧道），或反代不发
@@ -443,6 +467,7 @@ while [ $# -gt 0 ]; do
 	# fatal in dash, and the output would be the shell's diagnostic rather than
 	# this message.
 	--port) [ $# -ge 2 ] || die "--port 后面要跟端口号"; PORT="$2"; PORT_SET=1; shift 2 ;;
+	--version) [ $# -ge 2 ] || die "--version 后面要跟 tag（或 latest）"; VERSION="$2"; shift 2 ;;
 	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
