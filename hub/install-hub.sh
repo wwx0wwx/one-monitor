@@ -288,13 +288,16 @@ UNIT
 	printf '\n'
 	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
 	if [ -n "$first" ]; then
+		# The line the hub prints once on first run reads "  Password: <one
+		# time password>"; tail -1 guards against the odd second line a
+		# restart inside the window could add.
 		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
-			sed -n 's/.*Emergency password: //p' | tail -1)"
+			sed -n 's/.*Password: //p' | tail -1)"
 		if [ -n "$pw" ]; then
 			field "密码" "$pw"
 			field "    " "${D}只显示这一次，登录后到「设置」里改掉${N}"
 		else
-			field "密码" "journalctl -u $SERVICE | grep Emergency"
+			field "密码" "journalctl -u $SERVICE --no-pager | grep Password"
 		fi
 	fi
 	field "数据" "$DATA/monitor.db"
