@@ -11,6 +11,7 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 | [`hub/`](hub/) | monitor-hub | Rust + axum + SQLite。后台、API、公开页宿主，默认主题 vendor 内嵌 |
 | [`agent/`](agent/) | monitor-agent | Rust 单文件静态链接，直读 /proc 上报 hub |
 | [`themes/default/`](themes/default/) | 默认主题 | React + Vite，黑白配色；后续主题 a/b/c 各占 `themes/<short>/`，均为完整独立包 |
+| [`themes/komari-likely/`](themes/komari-likely/) | komari 风格主题 | 默认主题的完整独立副本改造：三色用量条、国旗与系统图标、即将到期/区域折叠分组、剩余价值（实时汇率）、访客 IP 胶囊等，详见其 README |
 
 ## tag 纪律
 

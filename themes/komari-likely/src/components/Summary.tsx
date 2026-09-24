@@ -1,15 +1,16 @@
-import { Activity, ArrowDown, ArrowDownUp, ArrowUp, Gauge, Server } from "lucide-react"
+import { useEffect, useState } from "react"
+import { Activity, ArrowDown, ArrowDownUp, ArrowUp, Clock, Gauge, Server } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
 import { speedHistory, type Node } from "@/lib/api"
-import { bytes, rate } from "@/lib/format"
+import { bytes, percent, rate } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
-function Tile({ icon: Icon, label, children }: {
-  icon: typeof Server; label: string; children: React.ReactNode
+function Tile({ icon: Icon, label, className, children }: {
+  icon: typeof Server; label: string; className?: string; children: React.ReactNode
 }) {
   return (
-    <Card className="gap-0 p-3">
+    <Card className={cn("gap-0 p-3", className)}>
       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
         <Icon className="size-3.5" />
         {label}
@@ -17,6 +18,16 @@ function Tile({ icon: Icon, label, children }: {
       {children}
     </Card>
   )
+}
+
+/** The clock komari's summary opens with, ticking once a second. */
+function ClockFace() {
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(timer)
+  }, [])
+  return <div className="tnum mt-1 text-xl font-semibold">{now.toLocaleString("zh-CN", { hour12: false })}</div>
 }
 
 /**
@@ -80,7 +91,12 @@ export function Summary({ nodes }: { nodes: Node[] }) {
   const now = speedHistory.at(-1) ?? { rx: 0, tx: 0 }
 
   return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+      {/* Full width on a phone: the row it opens would otherwise pair a clock
+          with half a grid and leave the last tile alone below. */}
+      <Tile icon={Clock} label="当前时间" className="col-span-2 lg:col-span-1">
+        <ClockFace />
+      </Tile>
       <Tile icon={Server} label="服务器">
         <div className="tnum mt-1 text-xl font-semibold">
           {online.length} / {nodes.length}
@@ -91,9 +107,21 @@ export function Summary({ nodes }: { nodes: Node[] }) {
       </Tile>
 
       <Tile icon={Activity} label="最忙服务器">
-        <div className="tnum mt-1 text-xl font-semibold">{busiest ? `${cpu.toFixed(1)}%` : "—"}</div>
+        {/* What "busiest" meant, spread two to a row like the traffic tile --
+            the two boards, then the disk and the wire (down and up summed) --
+            then who it was. */}
+        {busiest?.metrics ? (
+          <div className="tnum mt-1 grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
+            <span>CPU {busiest.metrics.cpu.toFixed(0)}%</span>
+            <span>内存 {percent(busiest.metrics.mem_used, busiest.mem_total).toFixed(0)}%</span>
+            <span>磁盘 {percent(busiest.metrics.disk_used, busiest.disk_total).toFixed(0)}%</span>
+            <span>↑↓{rate(busiest.metrics.net_rx + busiest.metrics.net_tx).replace(" ", "")}</span>
+          </div>
+        ) : (
+          <div className="mt-1 text-xs text-muted-foreground">无在线服务器</div>
+        )}
         <div className={cn("mt-auto truncate pt-1 text-xs", cpu >= 85 ? "font-medium text-foreground" : "text-muted-foreground")}>
-          {busiest ? busiest.name : "无在线服务器"}
+          {busiest?.name ?? "—"}
         </div>
       </Tile>
 

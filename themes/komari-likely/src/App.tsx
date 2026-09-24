@@ -3,9 +3,12 @@ import { Moon, Sun, Wrench } from "lucide-react"
 
 import { NodeCard } from "@/components/NodeCard"
 import { Summary } from "@/components/Summary"
+import { RegionPicker } from "@/components/RegionPicker"
+import { IpCapsule } from "@/components/IpCapsule"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, useNodes, type Node } from "@/lib/api"
+import { daysUntil } from "@/lib/format"
 
 type Me = { authed: boolean; site_name: string; site_description: string; public_page: boolean }
 
@@ -32,7 +35,9 @@ function useNodeRoute() {
   return [
     id,
     (next: number | null) => {
-      history.pushState({}, "", next === null ? "/" : `/node/${next}`)
+      // The query rides along, so a filtered list that opens a node returns to
+      // itself rather than to every machine again.
+      history.pushState({}, "", next === null ? `/${location.search}` : `/node/${next}${location.search}`)
       setId(next)
       scrollTo(0, 0)
     },
@@ -89,13 +94,67 @@ export default function App() {
     if (me && !me.public_page && !me.authed) location.href = "/admin/"
   }, [me])
 
-  const sorted = [...(nodes ?? [])].sort((a, b) => a.sort - b.sort || a.id - b.id)
+  // What is alive above what is not -- komari's order -- then the order the
+  // operator set in the panel.
+  const sorted = [...(nodes ?? [])].sort(
+    (a, b) => Number(b.online) - Number(a.online) || a.sort - b.sort || a.id - b.id,
+  )
   const selected = sorted.find((n) => n.id === open)
   // The group filter is a dimension the operator files servers under; the list
   // stays flat otherwise, as it always was.
-  const [group, setGroup] = useState("")
+  const [group, setGroup] = useState(() => new URLSearchParams(location.search).get("group") ?? "")
+  // The filter is part of the address: a shared link opens on the same slice.
+  // replaceState rather than push, so Back still leaves the site instead of
+  // unwinding every filter tried on the way.
+  const pick = (next: string) => {
+    setGroup(next)
+    const url = new URL(location.href)
+    if (next) url.searchParams.set("group", next)
+    else url.searchParams.delete("group")
+    history.replaceState({}, "", url)
+  }
+  useEffect(() => {
+    const sync = () => setGroup(new URLSearchParams(location.search).get("group") ?? "")
+    addEventListener("popstate", sync)
+    return () => removeEventListener("popstate", sync)
+  }, [])
+
+  // The keyboard way out of a node page, matching how its card opens: Tab to
+  // it, Enter in, Esc out.
+  useEffect(() => {
+    const back = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && open !== null) go(null)
+    }
+    addEventListener("keydown", back)
+    return () => removeEventListener("keydown", back)
+  }, [open, go])
   const groups = [...new Set(sorted.map((n) => n.group).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"))
-  const shown = group ? sorted.filter((n) => n.group === group) : sorted
+  // A group nobody files by hand: whatever expires within the week belongs to
+  // it, and leaves again on its own the day it stops being this week's problem.
+  // Already-expired stays in -- un-renewed is the extreme case of expiring.
+  const EXPIRING = "即将到期"
+  const expiring = sorted.filter((n) => {
+    const days = daysUntil(n.expires_at)
+    return days !== null && days <= 7
+  })
+  // Red once any machine has slipped past: the worse fact wins the colour.
+  const expired = expiring.some((n) => (daysUntil(n.expires_at) ?? 0) < 0)
+  // Regions file themselves: every country code on the page becomes a filter of
+  // its own, deduped against the operator's own groups so a name means one
+  // thing however it arrived.
+  const regions = [...new Set(sorted.map((n) => n.country).filter(Boolean))]
+    .filter((r) => !groups.includes(r))
+    .sort()
+  const inGroup = (n: Node) =>
+    group === EXPIRING
+      ? expiring.some((e) => e.id === n.id)
+      : groups.includes(group)
+        ? n.group === group
+        : n.country === group
+  const shown = group ? sorted.filter(inGroup) : sorted
+  const count = (name: string) => sorted.filter((n) => (name === EXPIRING ? expiring.some((e) => e.id === n.id) : groups.includes(name) ? n.group === name : n.country === name)).length
+  const pill = (active: boolean) =>
+    `inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${active ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`
 
   // `/node/{id}` is a page people bookmark and share, so the tab needs the node's
   // name. The site name rather than a fixed string, since the hub lets an operator
@@ -182,23 +241,32 @@ export default function App() {
         ) : (
           <>
             <Summary nodes={shown} />
-            {groups.length > 0 && (
+            {(groups.length > 0 || expiring.length > 0 || regions.length > 0) && (
               <div className="flex flex-wrap items-center gap-1.5">
-                <button
-                  onClick={() => setGroup("")}
-                  className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${group === "" ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`}
-                >
+                <button onClick={() => pick("")} className={pill(group === "")}>
                   全部 {sorted.length}
                 </button>
+                {expiring.length > 0 && (
+                  <button onClick={() => pick(group === EXPIRING ? "" : EXPIRING)} className={pill(group === EXPIRING)}>
+                    {EXPIRING} <span className={expired ? "text-red-600" : "text-orange-500"}>{expiring.length}</span>
+                  </button>
+                )}
                 {groups.map((g) => (
-                  <button
-                    key={g}
-                    onClick={() => setGroup(g === group ? "" : g)}
-                    className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${g === group ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`}
-                  >
-                    {g} {sorted.filter((n) => n.group === g).length}
+                  <button key={g} onClick={() => pick(g === group ? "" : g)} className={pill(g === group)}>
+                    {g} {count(g)}
                   </button>
                 ))}
+                {/* Many countries would swallow the row, so they wait behind one
+                    trigger: the globe, until a country is picked. */}
+                {regions.length > 0 && (
+                  <RegionPicker
+                    regions={regions}
+                    selected={regions.includes(group) ? group : ""}
+                    onSelect={(r) => pick(r === group ? "" : r)}
+                    countOf={count}
+                    trigger={pill(regions.includes(group))}
+                  />
+                )}
               </div>
             )}
             {shown.length === 0 ? (
@@ -213,6 +281,7 @@ export default function App() {
           </>
         )}
       </main>
+      <IpCapsule />
     </div>
   )
 }

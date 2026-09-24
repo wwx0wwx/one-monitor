@@ -1,7 +1,7 @@
 {
   "name": "komari-likely",
   "short": "komari-likely",
-  "description": "由默认主题复制而来，komari 风格改造中",
+  "description": "komari 风格状态面板：三色用量条、国旗与系统图标、到期/区域分组、访客 IP 问候",
   "version": "1.0.0",
   "author": "wwx0wwx",
   "url": "https://github.com/wwx0wwx/one-monitor"

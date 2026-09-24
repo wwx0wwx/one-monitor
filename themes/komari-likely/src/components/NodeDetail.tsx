@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from "react"
-import { median } from "d3-array"
 import {
   Area, AreaChart, Brush, CartesianGrid, ComposedChart, Line, LineChart, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from "recharts"
 
 import { Skeleton } from "@/components/ui/skeleton"
-import { Country, Status, Tags } from "@/components/NodeCard"
+import { Card } from "@/components/ui/card"
+import { Status, Tags, Uptime } from "@/components/NodeCard"
+import { Flag } from "@/components/Flag"
 import { api, type Node } from "@/lib/api"
+import { useCnyRate } from "@/lib/fx"
 import {
-  axisBytes, axisTop, bytes, clockFor, quarters, cpuName, CYCLES, FOREVER, money, osName, rate, timeTicks,
+  axisBytes, axisTop, bytes, clockFor, daysUntil, pair, quarters, cpuName, CYCLES, FOREVER, money, osName, rate, timeTicks,
 } from "@/lib/format"
 
 type Point = {
@@ -49,10 +51,17 @@ const RANGES = [
   { hours: 168, label: "7 天" },
 ]
 
-// Latency stops at a day. A week-wide bucket would still carry the spread and the
-// loss figure, but a week of probe history is outside this page's purpose, and
-// these are the windows in which every ping remains on the chart.
-const RANGES_FOR = { resources: RANGES, latency: RANGES.filter((r) => r.hours <= 24) }
+// Latency keeps its own ladder: a week is the widest window the hub answers
+// anonymously, and its retention holds exactly that by default.
+const RANGES_FOR = {
+  resources: RANGES,
+  latency: [
+    { hours: 1, label: "1 小时" },
+    { hours: 4, label: "4 小时" },
+    { hours: 24, label: "1 天" },
+    { hours: 168, label: "7 天" },
+  ],
+}
 
 const AXIS = { stroke: "currentColor", fontSize: 11, tickLine: false, axisLine: false }
 
@@ -66,19 +75,12 @@ const SERIES = { dot: false as const, strokeWidth: 1.5, isAnimationActive: false
 // 28px, placing a CPU spike and the network spike that caused it at different x.
 const Y_WIDTH = 68
 
-// The palette is greyscale, so lightness alone is exhausted after two or three
-// series and the dash pattern carries the rest.
-// ponytail: the dash period is shorter than the jitter once every ping in the
-// window is on the chart, so at the day range a dotted line and a dashed one both
-// read as texture and only lightness separates them. A muted colour palette was
-// built and measured but not adopted; restoring it means five oklch pairs and
-// dropping `dash`.
+// Six probes need six colours, not shades of one: lightness alone runs out at
+// three lines, and the dash patterns this chart once leaned on read as texture
+// once every ping in the window is drawn. Mid-brightness hues, readable on the
+// light card and the dark one alike.
 const PALETTE = [
-  { stroke: "var(--color-chart-1)", dash: undefined },
-  { stroke: "var(--color-chart-3)", dash: "6 3" },
-  { stroke: "var(--color-chart-2)", dash: "2 3" },
-  { stroke: "var(--color-chart-4)", dash: "10 4 2 4" },
-  { stroke: "var(--color-chart-5)", dash: "1 4" },
+  "#3b82f6", "#22c55e", "#f97316", "#8b5cf6", "#ef4444", "#06b6d4", "#ec4899", "#eab308",
 ]
 
 const TABS = [
@@ -86,12 +88,13 @@ const TABS = [
   { key: "latency", label: "网络延迟" },
 ] as const
 
+/** One chart as a card, the shape every panel on this page takes. */
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div>
+    <Card className="gap-0 p-4">
       <h4 className="mb-2 text-xs font-medium text-muted-foreground">{title}</h4>
-      <div className="h-40 w-full text-muted-foreground">{children}</div>
-    </div>
+      <div className="h-48 w-full text-muted-foreground">{children}</div>
+    </Card>
   )
 }
 
@@ -109,53 +112,70 @@ function Tab({ active, onClick, children }: { active: boolean; onClick: () => vo
 }
 
 /**
- * Hampel filter (Hampel 1974; MATLAB ships it as `hampel`). A point more than
- * `sigmas` robust deviations from its window's median is replaced by that median,
- * while everything else passes through unchanged, which is what distinguishes it
- * from a rolling median or a moving average.
- *
- * 1.4826 rescales the median absolute deviation to a standard deviation for
- * normally distributed data; 3 sigma is the conventional cut.
+ * A centred moving average over what answered, `window` buckets wide. Averaging
+ * the neighbours rather than passing through is what turns jitter into a
+ * readable trend; nulls stay null, so a timeout remains a gap and not a flat
+ * line drawn across it.
  */
-function despike(points: PingPoint[], window = 7, sigmas = 3): PingPoint[] {
+function smoothSeries(points: PingPoint[], window = 5): (number | null)[] {
   const half = window >> 1
-  // ponytail: recomputes the window per point. A few thousand samples is
-  // negligible; substitute a rolling structure if a chart ever needs 100k.
   return points.map((p, i) => {
-    // A timeout is a gap rather than a high reading: neither smoothed, nor counted
-    // towards what its neighbours are compared against.
-    if (p.latency === null) return p
+    if (p.latency === null) return null
     const near = points
       .slice(Math.max(0, i - half), i + half + 1)
-      .map((x) => x.latency)
-      .filter((v) => v !== null)
-    const mid = median(near) ?? p.latency
-    const mad = median(near.map((v) => Math.abs(v - mid))) ?? 0
-    const outlier = mad > 0 && Math.abs(p.latency - mid) > sigmas * 1.4826 * mad
-    return outlier ? { ...p, latency: mid } : p
+      .flatMap((x) => (x.latency === null ? [] : [x.latency]))
+    return near.length ? near.reduce((a, b) => a + b, 0) / near.length : p.latency
   })
 }
 
-function Fact({ label, value }: { label: string; value?: string | number | null }) {
+function Fact({ label, value, title }: { label: string; value?: string | number | null; title?: string }) {
   if (value === null || value === undefined || value === "") return null
   return (
     <div className="min-w-0">
       <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="truncate text-sm">{value}</dd>
+      <dd className="truncate text-sm" title={title}>{value}</dd>
     </div>
   )
 }
 
+/** What the machine has cost but not yet consumed: price spread over its
+ *  billing cycle, times the days left on it, converted at the day's published
+ *  rate. `fx` is CNY per unit of the node's currency; `undefined` means the
+ *  table is still on its way, `null` that no source answered -- in which case
+ *  the price shows in its own currency rather than an invented rate pretending
+ *  to be today's. */
+function remainingValue(node: Node, fx: number | null | undefined): string {
+  if (node.price <= 0) return "免费"
+  const days = daysUntil(node.expires_at)
+  if (days === null) return FOREVER
+  // A one-off payment buys no span to decay over, and an unknown cycle names
+  // none; neither has a daily rate to multiply.
+  const CYCLE_DAYS: Record<string, number> = {
+    monthly: 30, quarterly: 90, semiannual: 180, yearly: 365, biennial: 730, triennial: 1095,
+  }
+  const span = CYCLE_DAYS[node.billing_cycle]
+  if (!span) return "—"
+  const native = Math.max(0, node.price * (days / span))
+  if (node.currency === "CNY") return `¥${native.toFixed(2)}`
+  if (fx === undefined) return "…"
+  if (fx === null) return money(native, node.currency)
+  return `¥${(native * fx).toFixed(2)}`
+}
+
 export function NodeDetail({ node }: { node: Node }) {
+  const fx = useCnyRate(node.currency)
   const [tab, setTab] = useState<(typeof TABS)[number]["key"]>("resources")
   // Each tab keeps its own range: a 7-day trend and a 1-hour trace answer
   // different questions.
-  const [ranges, setRanges] = useState({ resources: 6, latency: 6 })
+  const [ranges, setRanges] = useState({ resources: 6, latency: 4 })
   const hours = ranges[tab]
   const [smooth, setSmooth] = useState(false)
   // Probes switched off. Hiding a slow one is what makes the fast ones readable,
   // as the axis rescales to what remains.
   const [hiddenProbes, setHiddenProbes] = useState<number[]>([])
+  // Whether a timeout reads as a gap in the line (off) or is bridged over (on),
+  // the two ways a lossy probe can honestly be drawn.
+  const [connect, setConnect] = useState(true)
   const [data, setData] = useState<{ metrics: Point[]; ping: PingPoint[]; probes: Probes; loss?: Loss } | null>(null)
   // Retained rather than folded into an empty result: a refused request and an
   // empty window are different answers, and the hub has reason to refuse this one
@@ -215,13 +235,18 @@ export function NodeDetail({ node }: { node: Node }) {
           // its packets as an unbroken line, and one that never answered not at
           // all.
           const points = (data?.ping ?? []).filter((p) => p.task_id === id)
+          // The window's mean of what answered -- the figure the label under
+          // the chart owes the reader. Null when every bucket timed out, which
+          // renders N/A rather than a false 0.
+          const answered = points.flatMap((p) => (p.latency === null ? [] : [p.latency]))
+          const avg = answered.length ? answered.reduce((a, b) => a + b, 0) / answered.length : null
           // Taken from the hub rather than summed from the buckets above, each of
           // which is already a percentage of its own bucket, so averaging them
           // would report one lost round in thirteen as 50%. Left unrounded, since
           // `Math.round` would render 0.28% and 0.00% as the same badge, and the
           // absence of a badge denotes no loss.
           const loss = data?.loss?.[id] ?? 0
-          return { id, name: data?.probes?.[id] ?? `探测 ${id}`, points, loss }
+          return { id, name: data?.probes?.[id] ?? `探测 ${id}`, points, loss, avg }
         })
         .filter((s) => s.points.length > 0),
     [data],
@@ -253,8 +278,8 @@ export function NodeDetail({ node }: { node: Node }) {
     () => pingSeries.filter((s) => !hiddenProbes.includes(s.id)),
     [pingSeries, hiddenProbes],
   )
-  // Keyed on the full list, so a line keeps its shade when others are hidden.
-  const style = (id: number) => PALETTE[pingSeries.findIndex((p) => p.id === id) % PALETTE.length]
+  // Keyed on the full list, so a line keeps its colour when others are hidden.
+  const probeColor = (id: number) => PALETTE[pingSeries.findIndex((p) => p.id === id) % PALETTE.length]
 
   // The hub stamps every sample with its bucket rather than the second the probe
   // finished, so probes reporting at the bucket's rate share rows instead of each
@@ -265,7 +290,7 @@ export function NodeDetail({ node }: { node: Node }) {
   // Every probe and both versions of every sample are held here whether or not
   // they are on screen: recharts resets the brush when the data array changes
   // identity, and re-reads a controlled selection only when the index props
-  // change, which they do not. Hiding a probe or enabling despiking therefore
+  // change, which they do not. Hiding a probe or enabling smoothing therefore
   // selects a `dataKey` rather than rebuilding the array.
   const pingRows = useMemo(() => {
     const rows = new Map<
@@ -273,11 +298,11 @@ export function NodeDetail({ node }: { node: Node }) {
       { ts: number } & Record<string, number | [number, number] | null>
     >()
     for (const s of pingSeries) {
-      const smoothed = despike(s.points)
+      const smoothed = smoothSeries(s.points)
       s.points.forEach((p, i) => {
         const row = rows.get(p.ts) ?? { ts: p.ts * 1_000 }
         row[`t${s.id}`] = p.latency
-        row[`s${s.id}`] = smoothed[i].latency
+        row[`s${s.id}`] = smoothed[i]
         row[`l${s.id}`] = p.loss ?? 0
         // Raw, never despiked: the band exists to show what the line omits, and
         // smoothing it would omit the same points.
@@ -303,12 +328,19 @@ export function NodeDetail({ node }: { node: Node }) {
     ...AXIS,
   })
 
+  // What the CNY figure stands on, for the hover: the day the table was
+  // published and the rate it quoted.
+  const fxNote = node.currency !== "CNY" && typeof fx.rate === "number"
+    ? `汇率 ${fx.date || "最近"} · 1 ${node.currency} = ${fx.rate.toFixed(4)} CNY`
+    : undefined
+
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
+        <Flag country={node.country} />
         <h2 className="truncate text-lg font-medium">{node.name}</h2>
-        <Country node={node} />
         <Status node={node} />
+        <Uptime node={node} />
       </div>
 
       {/* The operator's semicolon badges, one row under the name -- the same
@@ -323,26 +355,39 @@ export function NodeDetail({ node }: { node: Node }) {
       <dl className="grid gap-x-6 gap-y-3 md:grid-cols-2 lg:grid-cols-3">
         <Fact label="系统" value={[osName(node.os), node.kernel].filter(Boolean).join(" · ")} />
         <Fact
-          label="CPU"
-          value={node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores}` : `${node.cpu_cores} 核`}
-        />
-        <Fact label="内存 / 硬盘" value={`${bytes(node.mem_total)} / ${bytes(node.disk_total)}`} />
-        <Fact
           label="架构"
           value={[node.arch, node.virt !== "none" ? node.virt : "", m ? `${m.procs} 进程` : ""]
             .filter(Boolean)
             .join(" · ")}
         />
-        <Fact label="今日流量" value={`↓ ${bytes(node.day_rx)} · ↑ ${bytes(node.day_tx)}`} />
         <Fact
-          label="续费"
-          value={[
-            node.price > 0
-              ? `${money(node.price, node.currency)} / ${CYCLES[node.billing_cycle] ?? node.billing_cycle}`
-              : "免费",
-            node.expires_at ? `${node.expires_at} 到期` : FOREVER,
-          ].join(" · ")}
+          label="CPU"
+          value={node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores}` : `${node.cpu_cores} 核`}
         />
+        {/* The agent reports nothing here yet; the slot stays so every
+            machine's sheet reads the same, ready for the day it does. */}
+        <Fact label="GPU" value="未上报" />
+        <Fact label="RAM" value={bytes(node.mem_total)} />
+        {/* A machine without swap is stating a fact about itself, worth the row. */}
+        <Fact
+          label="SWAP"
+          value={node.swap_total > 0
+            ? m
+              ? pair(m.swap_used, node.swap_total)
+              : bytes(node.swap_total)
+            : "未启用"}
+        />
+        <Fact label="硬盘" value={bytes(node.disk_total)} />
+        <Fact label="今日流量" value={`↓ ${bytes(node.day_rx)} · ↑ ${bytes(node.day_tx)}`} />
+        <Fact label="总流量" value={`↓ ${bytes(node.total_rx)} · ↑ ${bytes(node.total_tx)}`} />
+        <Fact
+          label="价格"
+          value={node.price > 0
+            ? `${money(node.price, node.currency)} / ${CYCLES[node.billing_cycle] ?? node.billing_cycle}`
+            : "免费"}
+        />
+        <Fact label="剩余价值" value={remainingValue(node, fx.rate)} title={fxNote} />
+        <Fact label="到期时间" value={node.expires_at ?? FOREVER} />
       </dl>
 
       {node.remark && (
@@ -370,15 +415,14 @@ export function NodeDetail({ node }: { node: Node }) {
             ))}
           </div>
           {tab === "latency" && (
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={smooth}
-                onChange={(e) => setSmooth(e.target.checked)}
-                className="accent-foreground"
-              />
-              削峰
-            </label>
+            <>
+              <Tab active={smooth} onClick={() => setSmooth((s) => !s)}>
+                平滑
+              </Tab>
+              <Tab active={connect} onClick={() => setConnect((c) => !c)}>
+                连接断点
+              </Tab>
+            </>
           )}
         </div>
       </div>
@@ -457,7 +501,7 @@ export function NodeDetail({ node }: { node: Node }) {
                           key={`band${s.id}`}
                           dataKey={`b${s.id}`}
                           stroke="none"
-                          fill={style(s.id).stroke}
+                          fill={probeColor(s.id)}
                           fillOpacity={0.16}
                           isAnimationActive={false}
                           tooltipType="none"
@@ -470,10 +514,9 @@ export function NodeDetail({ node }: { node: Node }) {
                         key={s.id}
                         dataKey={`${smooth ? "s" : "t"}${s.id}`}
                         name={s.name}
-                        stroke={style(s.id).stroke}
-                        strokeDasharray={style(s.id).dash}
+                        stroke={probeColor(s.id)}
                         {...SERIES}
-                        connectNulls
+                        connectNulls={connect}
                       />
                     ))}
                     {/* Drag either handle to zoom into a stretch of the trend. */}
@@ -494,8 +537,9 @@ export function NodeDetail({ node }: { node: Node }) {
             {/* Under the chart: what it covers is picked at the top, what is
                 drawn in it is picked here. Recharts paints the brush into the
                 same SVG as the axis, so this is as close beneath as HTML
-                sits. */}
-            {(pingSeries.length > 1 || pingSeries.some((s) => s.loss > 0)) && (
+                sits. Every probe carries its label -- the mean of what it
+                answered and the share that never came back -- N/A standing in
+                for a probe the window never heard from. */}
             <div className="flex flex-wrap items-center justify-center gap-1.5">
               {pingSeries.map((s) => {
                 const shown = !hiddenProbes.includes(s.id)
@@ -509,37 +553,34 @@ export function NodeDetail({ node }: { node: Node }) {
                       shown ? "" : "opacity-40"
                     }`}
                   >
-                    {/* The swatch carries the same shade and dash as the line. */}
+                    {/* The swatch carries the same colour as the line. */}
                     <svg width="14" height="6" className="shrink-0" aria-hidden>
                       <line
                         x1="0"
                         y1="3"
                         x2="14"
                         y2="3"
-                        stroke={style(s.id).stroke}
-                        strokeDasharray={style(s.id).dash}
+                        stroke={probeColor(s.id)}
                         strokeWidth="2"
                       />
                     </svg>
                     {s.name}
-                    {/* The line is only what answered, so a probe dropping
-                        half its packets draws like a healthy one. */}
-                    {s.loss > 0 && (
-                      <span className="tabular-nums opacity-60">
-                        丢 {s.loss < 1 ? "<1" : Math.round(s.loss)}%
-                      </span>
-                    )}
+                    <span className="tnum text-muted-foreground">
+                      {s.avg === null ? "N/A" : `${s.avg.toFixed(1)} ms`} | {s.loss.toFixed(1)}%
+                    </span>
                   </button>
                 )
               })}
             </div>
-            )}
           </div>
         )
       ) : data.metrics.length === 0 ? (
         <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有历史数据</p>
       ) : (
-        <div className="space-y-5">
+        // Two across where the viewport allows: a half-width panel still holds
+        // a day of minutes legibly, and the page stops being four full-width
+        // stripes.
+        <div className="grid gap-4 md:grid-cols-2">
           <Panel title="CPU">
             <ResponsiveContainer>
               <AreaChart data={metricRows}>
