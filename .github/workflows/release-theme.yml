@@ -26,7 +26,10 @@ jobs:
       - id: route
         run: |
           short="${GITHUB_REF_NAME#theme-}"
-          short="${short%%-*}"
+          # A short may itself contain hyphens (komari-likely), so only the
+          # trailing -v<version> segment is the tag's suffix: strip from the
+          # last hyphen, not the first.
+          short="${short%-*}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
             short="${{ inputs.short }}"
           fi
