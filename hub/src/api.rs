@@ -524,6 +524,7 @@ fn theme_display(app: &App) -> Value {
         "bg_opacity": get("bg_opacity", "100"),
         "bg_blur": get("bg_blur", "0"),
         "bg_fit": get("bg_fit", "cover"),
+        "card_opacity": get("card_opacity", "70"),
         "cost_public": get("cost_public", "off"),
         "show_busiest": get("show_busiest", "on"),
         "show_swap": get("show_swap", "on"),
@@ -928,6 +929,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "bg_opacity",
     "bg_blur",
     "bg_fit",
+    "card_opacity",
     "cost_public",
     "show_busiest",
     "show_swap",
@@ -1650,6 +1652,12 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "bg_fit" if !matches!(value, "cover" | "contain") => {
             Some("bg_fit must be cover or contain".into())
+        }
+        // The frost slider's whole span is usable: below 40 the panel stops
+        // being a surface and the page behind it reads through the text, so
+        // the floor is the contract rather than the panel's own clamping.
+        "card_opacity" if !value.parse::<u8>().is_ok_and(|v| (40..=100).contains(&v)) => {
+            Some("card_opacity must be a number from 40 to 100".into())
         }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "geoip_license_key" => None,
