@@ -13,6 +13,24 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 | [`themes/default/`](themes/default/) | 默认主题 | React + Vite，黑白配色；后续主题 a/b/c 各占 `themes/<short>/`，均为完整独立包 |
 | [`themes/komari-likely/`](themes/komari-likely/) | komari 风格主题 | 默认主题的完整独立副本改造：三色用量条、国旗与系统图标、即将到期/区域折叠分组、剩余价值（实时汇率）、访客 IP 胶囊等，详见其 README |
 
+## 部署
+
+三步起一整套（详见 [hub/README.md](hub/README.md) 的「全新部署」，含反向代理与常见坑）：
+
+```bash
+# 1. hub：装在一台 VPS 上（只监听 127.0.0.1:28080，按安装器输出的说明配反代）
+curl -fsSL https://raw.githubusercontent.com/wwx0wwx/one-monitor/main/hub/install-hub.sh -o install-hub.sh
+sudo sh install-hub.sh
+journalctl -u monitor-hub --no-pager | grep Password   # 首启一次性密码
+
+# 2. 节点：面板「服务器」→ 添加，复制生成的命令到目标 VPS 执行
+curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --token <TOKEN>
+
+# 3. 主题：后台「主题」上传 release 里的 theme.tar.gz 并启用（也可命令行，见 hub/README）
+```
+
+升级同样一条命令：`sudo sh install-hub.sh --version vX.Y.Z --yes`（没写的参数沿用上一次的）。
+
 ## tag 纪律
 
 一个仓库的 release 列表混着三个组件，全靠 tag 前缀路由，谁也不许占别人的道：
