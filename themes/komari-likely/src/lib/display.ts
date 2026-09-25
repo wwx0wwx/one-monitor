@@ -13,6 +13,7 @@ export type Bg = {
 
 export type Display = {
   costPublic: boolean
+  busiest: boolean
   swap: boolean
   speed: boolean
   billing: boolean
@@ -38,6 +39,7 @@ export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings 
     },
     display: {
       costPublic: flag(raw, "cost_public", false),
+      busiest: flag(raw, "show_busiest", true),
       swap: flag(raw, "show_swap", true),
       speed: flag(raw, "show_speed", true),
       billing: flag(raw, "show_billing", true),

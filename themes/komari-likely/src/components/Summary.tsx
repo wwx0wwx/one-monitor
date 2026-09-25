@@ -76,7 +76,11 @@ function Spark({ series }: { series: { values: number[]; className: string }[] }
   )
 }
 
-export function Summary({ nodes, showCost }: { nodes: Node[]; showCost?: boolean }) {
+export function Summary({ nodes, showCost, showBusiest = true }: {
+  nodes: Node[]
+  showCost?: boolean
+  showBusiest?: boolean
+}) {
   const online = nodes.filter((n) => n.online)
   const sum = (pick: (n: Node) => number) => nodes.reduce((total, n) => total + pick(n), 0)
 
@@ -119,7 +123,14 @@ export function Summary({ nodes, showCost }: { nodes: Node[]; showCost?: boolean
   const now = speedHistory.at(-1) ?? { rx: 0, tx: 0 }
 
   return (
-    <div className={cn("grid grid-cols-2 gap-3", showCost ? "lg:grid-cols-6" : "lg:grid-cols-5")}>
+    // One desktop column per tile still on the page, so a fleet whose operator
+    // hid the money or the busiest machine still fills its row edge to edge.
+    <div
+      className={cn(
+        "grid grid-cols-2 gap-3",
+        showBusiest && showCost ? "lg:grid-cols-6" : showBusiest || showCost ? "lg:grid-cols-5" : "lg:grid-cols-4",
+      )}
+    >
       {/* Full width on a phone: the row it opens would otherwise pair a clock
           with half a grid and leave the last tile alone below. */}
       <Tile icon={Clock} label="当前时间" className="col-span-2 lg:col-span-1">
@@ -134,24 +145,26 @@ export function Summary({ nodes, showCost }: { nodes: Node[]; showCost?: boolean
         </div>
       </Tile>
 
-      <Tile icon={Activity} label="最忙服务器">
-        {/* What "busiest" meant, spread two to a row like the traffic tile --
-            the two boards, then the disk and the wire (down and up summed) --
-            then who it was. */}
-        {busiest?.metrics ? (
-          <div className="tnum mt-1 grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
-            <span>CPU {busiest.metrics.cpu.toFixed(0)}%</span>
-            <span>内存 {percent(busiest.metrics.mem_used, busiest.mem_total).toFixed(0)}%</span>
-            <span>磁盘 {percent(busiest.metrics.disk_used, busiest.disk_total).toFixed(0)}%</span>
-            <span>↑↓{rate(busiest.metrics.net_rx + busiest.metrics.net_tx).replace(" ", "")}</span>
+      {showBusiest && (
+        <Tile icon={Activity} label="最忙服务器">
+          {/* What "busiest" meant, spread two to a row like the traffic tile --
+              the two boards, then the disk and the wire (down and up summed) --
+              then who it was. */}
+          {busiest?.metrics ? (
+            <div className="tnum mt-1 grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
+              <span>CPU {busiest.metrics.cpu.toFixed(0)}%</span>
+              <span>内存 {percent(busiest.metrics.mem_used, busiest.mem_total).toFixed(0)}%</span>
+              <span>磁盘 {percent(busiest.metrics.disk_used, busiest.disk_total).toFixed(0)}%</span>
+              <span>↑↓{rate(busiest.metrics.net_rx + busiest.metrics.net_tx).replace(" ", "")}</span>
+            </div>
+          ) : (
+            <div className="mt-1 text-xs text-muted-foreground">无在线服务器</div>
+          )}
+          <div className={cn("mt-auto truncate pt-1 text-xs", cpu >= 85 ? "font-medium text-foreground" : "text-muted-foreground")}>
+            {busiest?.name ?? "—"}
           </div>
-        ) : (
-          <div className="mt-1 text-xs text-muted-foreground">无在线服务器</div>
-        )}
-        <div className={cn("mt-auto truncate pt-1 text-xs", cpu >= 85 ? "font-medium text-foreground" : "text-muted-foreground")}>
-          {busiest?.name ?? "—"}
-        </div>
-      </Tile>
+        </Tile>
+      )}
 
       <Tile icon={ArrowDownUp} label="今日流量">
         <Flow

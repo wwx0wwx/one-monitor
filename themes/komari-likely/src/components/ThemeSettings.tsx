@@ -158,6 +158,12 @@ export function ThemeSettingsButton({ settings, onSave }: {
               <div className="pt-1">
                 <UrlField label="桌面版" value={bg.desktop} onCommit={(desktop) => save({ bg_desktop: desktop })} />
                 <UrlField label="移动版" value={bg.mobile} onCommit={(mobile) => save({ bg_mobile: mobile })} />
+                {/* The links above open prefilled with whatever the panel's
+                    theme tab saved, because both entrances read and write the
+                    same hub keys -- fill them here and they appear there. */}
+                <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                  与后台「主题」栏共用同一份配置，两边互通。
+                </p>
                 <div className="mt-2 space-y-2">
                   <Slider
                     label="透明度"
@@ -205,6 +211,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
                 checked={display.costPublic}
                 onChange={(on) => save({ cost_public: on ? "on" : "off" })}
               />
+              <Toggle label="汇总区最忙服务器" checked={display.busiest} onChange={(on) => save({ show_busiest: on ? "on" : "off" })} />
               <Toggle label="卡片 SWAP" checked={display.swap} onChange={(on) => save({ show_swap: on ? "on" : "off" })} />
               <Toggle label="卡片网速" checked={display.speed} onChange={(on) => save({ show_speed: on ? "on" : "off" })} />
               <Toggle
@@ -237,7 +244,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
               onClick={() =>
                 save({
                   bg_enabled: "off", bg_desktop: "", bg_mobile: "", bg_opacity: "100", bg_blur: "0", bg_fit: "cover",
-                  cost_public: "off", show_swap: "on", show_speed: "on", show_billing: "on",
+                  cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
                   ip_capsule: "on", expiring_group: "on", region_group: "on",
                 })
               }

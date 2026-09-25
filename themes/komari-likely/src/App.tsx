@@ -227,10 +227,12 @@ export default function App() {
             )}
             <div className="flex-1" />
             {/* The panel is a separate app built into the hub, not part of this
-                theme, so this is a navigation rather than a route. */}
-            <Button variant="ghost" size="sm" asChild>
-              <a href="/admin/">
-                <Wrench /> {me.authed ? "进入后台" : "登录"}
+                theme, so this is a navigation rather than a route. The wording
+                lives in the hover text alone, the shape of an icon reading the
+                same signed in or out. */}
+            <Button variant="ghost" size="icon" asChild>
+              <a href="/admin/" title={me.authed ? "进入后台" : "登录"} aria-label={me.authed ? "进入后台" : "登录"}>
+                <Wrench />
               </a>
             </Button>
             {me.authed && <ThemeSettingsButton settings={ts} onSave={saveSettings} />}
@@ -264,7 +266,7 @@ export default function App() {
           </div>
         ) : (
           <>
-            <Summary nodes={shown} showCost={me.authed || ts.display.costPublic} />
+            <Summary nodes={shown} showCost={me.authed || ts.display.costPublic} showBusiest={ts.display.busiest} />
             {(groups.length > 0 || (ts.display.expiring && expiring.length > 0) || (ts.display.region && regions.length > 0)) && (
               <div className="flex flex-wrap items-center gap-1.5">
                 <button onClick={() => pick("")} className={pill(group === "")}>
