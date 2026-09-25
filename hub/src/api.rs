@@ -524,7 +524,11 @@ fn theme_display(app: &App) -> Value {
         "bg_opacity": get("bg_opacity", "100"),
         "bg_blur": get("bg_blur", "0"),
         "bg_fit": get("bg_fit", "cover"),
+        "bg_position": get("bg_position", "center"),
         "card_opacity": get("card_opacity", "70"),
+        "card_blur": get("card_blur", "64"),
+        "content_width": get("content_width", "1400"),
+        "logo_url": get("logo_url", ""),
         "cost_public": get("cost_public", "off"),
         "show_busiest": get("show_busiest", "on"),
         "show_swap": get("show_swap", "on"),
@@ -929,7 +933,11 @@ const READABLE_SETTINGS: &[&str] = &[
     "bg_opacity",
     "bg_blur",
     "bg_fit",
+    "bg_position",
     "card_opacity",
+    "card_blur",
+    "content_width",
+    "logo_url",
     "cost_public",
     "show_busiest",
     "show_swap",
@@ -1653,11 +1661,32 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "bg_fit" if !matches!(value, "cover" | "contain") => {
             Some("bg_fit must be cover or contain".into())
         }
-        // The frost slider's whole span is usable: below 40 the panel stops
-        // being a surface and the page behind it reads through the text, so
-        // the floor is the contract rather than the panel's own clamping.
-        "card_opacity" if !value.parse::<u8>().is_ok_and(|v| (40..=100).contains(&v)) => {
-            Some("card_opacity must be a number from 40 to 100".into())
+        // The object-position the picture is fitted from: `cover,top` keeps the
+        // top of a portrait the crop would otherwise take from the middle.
+        "bg_position" if !matches!(value, "center" | "top" | "bottom" | "left" | "right") => {
+            Some("bg_position must be one of center, top, bottom, left, right".into())
+        }
+        // A page narrower than the smallest laptop helps nobody, and wider than
+        // the largest common monitor cannot exist.
+        "content_width" if !value.parse::<u16>().is_ok_and(|v| (1000..=2560).contains(&v)) => {
+            Some("content_width must be a number from 1000 to 2560".into())
+        }
+        // Fetched by the visitor's browser like the background pictures.
+        "logo_url"
+            if !(value.is_empty() || (value.starts_with("https://") && value.chars().count() <= 500)) =>
+        {
+            Some("Logo 链接必须以 https:// 开头且不超过 500 字符".into())
+        }
+        // The frost sliders' whole span is the operator's call: taken together
+        // a near-zero opacity and blur leave the picture plainly visible
+        // through the cards, which is a look some operators want. The text
+        // still has to sit on something, so only the blur keeps no floor of
+        // its own beyond the panel's own 0.
+        "card_opacity" if !value.parse::<u8>().is_ok_and(|v| v <= 100) => {
+            Some("card_opacity must be a number from 0 to 100".into())
+        }
+        "card_blur" if !value.parse::<u8>().is_ok_and(|v| v <= 64) => {
+            Some("card_blur must be a number from 0 to 64".into())
         }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "geoip_license_key" => None,
