@@ -14,8 +14,9 @@ function Card({ className, ...props }: React.ComponentProps<"div">) {
         // The blur is the frosted half of the background-picture treatment:
         // under a solid card it smears a uniform colour and so changes
         // nothing, and only the translucent `--card` a picture switches in
-        // (index.css) gives it anything to work on.
-        "flex flex-col gap-6 rounded-xl border bg-card py-6 text-card-foreground shadow-sm backdrop-blur-[64px]",
+        // (index.css) gives it anything to work on. Its strength is the
+        // operator's slider, set on the root as `--card-blur`.
+        "flex flex-col gap-6 rounded-xl border bg-card py-6 text-card-foreground shadow-sm backdrop-blur-[var(--card-blur,64px)]",
         className
       )}
       {...props}

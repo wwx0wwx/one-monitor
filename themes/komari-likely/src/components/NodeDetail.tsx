@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react"
+import { ArrowLeft } from "lucide-react"
 import {
   Area, AreaChart, Brush, CartesianGrid, ComposedChart, Line, LineChart, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from "recharts"
 
 import { Skeleton } from "@/components/ui/skeleton"
+import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Status, Tags, Uptime } from "@/components/NodeCard"
 import { Flag } from "@/components/Flag"
@@ -159,7 +161,7 @@ function remainingValue(node: Node, fx: number | null | undefined): string {
   return `¥${(native * fx).toFixed(2)}`
 }
 
-export function NodeDetail({ node }: { node: Node }) {
+export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void }) {
   const fx = useCnyRate(node.currency)
   const [tab, setTab] = useState<(typeof TABS)[number]["key"]>("resources")
   // Each tab keeps its own range: a 7-day trend and a 1-hour trace answer
@@ -340,6 +342,12 @@ export function NodeDetail({ node }: { node: Node }) {
           it costs, before the charts below say how it is doing. */}
       <Card className="gap-4 p-4">
         <div className="flex items-center gap-2">
+          {/* The way back for a touch screen and a mouse alike: Esc already
+              leaves, but nothing on the page says so. The site name in the
+              header returns too, for readers who look there first. */}
+          <Button variant="ghost" size="icon" onClick={onBack} title="返回 (Esc)" aria-label="返回" className="-ml-2 shrink-0">
+            <ArrowLeft />
+          </Button>
           <Flag country={node.country} />
           <h2 className="truncate text-lg font-medium">{node.name}</h2>
           <Status node={node} />

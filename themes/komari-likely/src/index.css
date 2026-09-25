@@ -82,17 +82,20 @@
    page is pixel-for-pixel what it always was.
 
    How solid the frost is comes from `--card-opacity`, set by the page from
-   the operator's slider (40-100, default 70). Dark mode runs ten points
-   thinner -- the same number over the dark tint reads heavier than it does
-   over white -- and the popovers ten points denser, their smaller type
-   needing the sturdier ground. */
+   the operator's slider (0-100, default 70), and how smeared from
+   `--card-blur` (0-64px, default 64) -- taken to the bottom together the
+   picture reads plainly through the cards. Dark mode runs ten points
+   thinner, the same number over the dark tint reading heavier than it does
+   over white. The popovers never thin past half: their smaller type needs
+   the sturdier ground, and the settings panel itself is where the sliders
+   live. */
 .bg-on {
   --card: oklch(1 0 0 / var(--card-opacity, 70%));
-  --popover: oklch(1 0 0 / min(95%, calc(var(--card-opacity, 70%) + 10%)));
+  --popover: oklch(1 0 0 / clamp(50%, calc(var(--card-opacity, 70%) + 10%), 95%));
 }
 .dark.bg-on {
-  --card: oklch(0.2 0 0 / max(40%, calc(var(--card-opacity, 70%) - 10%)));
-  --popover: oklch(0.2 0 0 / var(--card-opacity, 70%));
+  --card: oklch(0.2 0 0 / max(0%, calc(var(--card-opacity, 70%) - 10%)));
+  --popover: oklch(0.2 0 0 / clamp(50%, calc(var(--card-opacity, 70%) + 5%), 85%));
 }
 
 @theme inline {
@@ -141,11 +144,14 @@
 /* The chips that rest directly on the page -- an unselected group pill, an
    unselected range tab -- carry no fill of their own, which the picture
    behind them makes loud. The blur rides along unconditionally: over the
-   bare page it has nothing to smear and so shows nothing. A selected chip
-   keeps its solid fill, hence the exclusions. */
+   bare page it has nothing to smear and so shows nothing. Their tint holds
+   at a fixed 30% of the card colour whatever the panels thinned to: a chip
+   is a few pixels of text, and the operator asking for see-through cards is
+   not asking for see-through controls. A selected chip keeps its solid
+   fill, hence the exclusions. */
 .frost-chip {
   backdrop-filter: blur(24px);
 }
 .bg-on .frost-chip:not(.bg-secondary):not(.bg-primary) {
-  background-color: color-mix(in oklab, var(--card) 60%, transparent);
+  background-color: oklch(from var(--card) l c h / 30%);
 }

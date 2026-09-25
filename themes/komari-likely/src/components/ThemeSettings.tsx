@@ -8,13 +8,20 @@ import { cn } from "@/lib/utils"
 /**
  * The picture behind the page: full-viewport, fixed, behind everything and
  * never in the way. Each size class gets its own source; an unset one falls
- * back to the other. A blur is oversize-scaled so its softened edges do not
- * show as a frame.
+ * back to the other. A source may itself carry two pictures, `light|dark`,
+ * so the modes can each get one that suits them -- a single segment serves
+ * both. A blur is oversize-scaled so its softened edges do not show as a
+ * frame.
  */
-export function BackgroundLayer({ bg }: { bg: Bg }) {
+function pickVariant(link: string, dark: boolean) {
+  const [light, darkPart] = link.split("|")
+  return (dark ? darkPart || light : light).trim()
+}
+
+export function BackgroundLayer({ bg, dark }: { bg: Bg; dark: boolean }) {
   if (!bg.enabled) return null
-  const desktop = bg.desktop || bg.mobile
-  const mobile = bg.mobile || bg.desktop
+  const desktop = pickVariant(bg.desktop, dark) || pickVariant(bg.mobile, dark)
+  const mobile = pickVariant(bg.mobile, dark) || pickVariant(bg.desktop, dark)
   if (!desktop) return null
   const painted = (src: string) => ({
     src,
@@ -24,6 +31,7 @@ export function BackgroundLayer({ bg }: { bg: Bg }) {
       filter: bg.blur ? `blur(${bg.blur}px)` : undefined,
       transform: bg.blur ? "scale(1.08)" : undefined,
       objectFit: bg.fit,
+      objectPosition: bg.position,
     },
   })
   return (
@@ -128,7 +136,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
   const save = (patch: Record<string, string>) =>
     onSave(patch).then(() => setError(""), (e: Error) => setError(e.message || "保存失败"))
 
-  const { bg, display } = settings
+  const { bg, display, layout } = settings
   return (
     <div
       className="relative"
@@ -160,9 +168,10 @@ export function ThemeSettingsButton({ settings, onSave }: {
                 <UrlField label="移动版" value={bg.mobile} onCommit={(mobile) => save({ bg_mobile: mobile })} />
                 {/* The links above open prefilled with whatever the panel's
                     theme tab saved, because both entrances read and write the
-                    same hub keys -- fill them here and they appear there. */}
+                    same hub keys -- fill them here and they appear there. A
+                    link may carry two pictures, light|dark, one per mode. */}
                 <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-                  与后台「主题」栏共用同一份配置，两边互通。
+                  与后台「主题」栏共用同一份配置；链接可用「亮|暗」两段区分明暗模式背景。
                 </p>
                 <div className="mt-2 space-y-2">
                   <Slider
@@ -200,18 +209,66 @@ export function ThemeSettingsButton({ settings, onSave }: {
                       ))}
                     </div>
                   </div>
+                  {/* Where the fit crops from -- a portrait's head is at the
+                      top, and `cover` alone would take it from the middle. */}
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">对齐方式</span>
+                    <div className="flex gap-1">
+                      {(["center", "top", "bottom", "left", "right"] as const).map((p) => (
+                        <button
+                          key={p}
+                          title={p}
+                          onClick={() => save({ bg_position: p })}
+                          className={cn(
+                            "size-6 rounded-md border text-xs transition-colors",
+                            bg.position === p
+                              ? "border-primary bg-secondary font-medium"
+                              : "text-muted-foreground hover:bg-muted",
+                          )}
+                        >
+                          {p === "center" ? "中" : p === "top" ? "上" : p === "bottom" ? "下" : p === "left" ? "左" : "右"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   {/* The frost half of the picture treatment: how solid the
-                      cards are over the blurred image. The image's own
-                      opacity above is a different knob and the two compose. */}
+                      cards are, and how smeared what shows through them is.
+                      Taken to the bottom together the picture reads plainly
+                      through the cards. The image's own opacity and blur
+                      above are different knobs and they compose. */}
                   <Slider
                     label="卡片浓度"
                     value={Math.round(bg.cardOpacity)}
-                    min={40}
+                    min={0}
                     max={100}
                     render={(v) => `${v}%`}
                     onPick={(v) => save({ card_opacity: String(v) })}
                   />
+                  <Slider
+                    label="卡片模糊"
+                    value={Math.round(bg.cardBlur)}
+                    min={0}
+                    max={64}
+                    render={(v) => `${v}px`}
+                    onPick={(v) => save({ card_blur: String(v) })}
+                  />
                 </div>
+              </div>
+            </Section>
+
+            <Section title="布局">
+              {/* How much of a wide screen the cards may spread across; small
+                  screens never reach the cap, so it changes nothing there. */}
+              <Slider
+                label="内容宽度"
+                value={Math.round(layout.contentWidth)}
+                min={1000}
+                max={2560}
+                render={(v) => `${v}px`}
+                onPick={(v) => save({ content_width: String(v) })}
+              />
+              <div className="pt-1">
+                <UrlField label="标题栏 Logo" value={layout.logo} onCommit={(logo) => save({ logo_url: logo })} />
               </div>
             </Section>
 
@@ -255,7 +312,8 @@ export function ThemeSettingsButton({ settings, onSave }: {
               onClick={() =>
                 save({
                   bg_enabled: "off", bg_desktop: "", bg_mobile: "", bg_opacity: "100", bg_blur: "0", bg_fit: "cover",
-                  card_opacity: "70",
+                  bg_position: "center", card_opacity: "70", card_blur: "64",
+                  content_width: "1400", logo_url: "",
                   cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
                   ip_capsule: "on", expiring_group: "on", region_group: "on",
                 })

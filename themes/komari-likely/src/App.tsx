@@ -191,7 +191,10 @@ export default function App() {
   useEffect(() => {
     const t = me?.theme
     document.documentElement.classList.toggle("bg-on", !!t && t.bg_enabled === "on" && !!(t.bg_desktop || t.bg_mobile))
-    document.documentElement.style.setProperty("--card-opacity", `${parseThemeSettings(t).bg.cardOpacity}%`)
+    const bg = parseThemeSettings(t).bg
+    document.documentElement.style.setProperty("--card-opacity", `${bg.cardOpacity}%`)
+    document.documentElement.style.setProperty("--card-blur", `${bg.cardBlur}px`)
+    document.documentElement.style.setProperty("--content-w", `${parseThemeSettings(t).layout.contentWidth}px`)
   }, [me?.theme])
 
   // The description the operator wrote is both page copy and the meta a crawler
@@ -225,12 +228,15 @@ export default function App() {
 
   return (
     <div className="min-h-svh">
-      <BackgroundLayer bg={ts.bg} />
+      <BackgroundLayer bg={ts.bg} dark={dark} />
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto max-w-[1400px] px-4 py-3 sm:px-6">
-          {/* The site name is the way back to the list, so a node page needs
-              no back button of its own. */}
+        <div className="mx-auto max-w-[var(--content-w,1400px)] px-4 py-3 sm:px-6">
+          {/* One way back to the list among the detail page's own; an
+              operator's logo sits beside the site name. */}
           <div className="flex items-center gap-3">
+            {ts.layout.logo && (
+              <img src={ts.layout.logo} alt="" className="h-6 w-auto shrink-0 rounded-sm" loading="lazy" />
+            )}
             <button className="font-semibold transition-opacity hover:opacity-70" onClick={() => go(null)}>
               {me.site_name || "Monitor"}
             </button>
@@ -255,7 +261,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1400px] space-y-5 px-4 py-4 sm:px-6">
+      <main className="mx-auto max-w-[var(--content-w,1400px)] space-y-5 px-4 py-4 sm:px-6">
         {error && <p className="text-sm text-destructive">{error}</p>}
 
         {open !== null ? (
@@ -263,7 +269,7 @@ export default function App() {
             <Skeleton className="h-96" />
           ) : selected ? (
             <Suspense fallback={<Skeleton className="h-96" />}>
-              <NodeDetail node={selected} />
+              <NodeDetail node={selected} onBack={() => go(null)} />
             </Suspense>
           ) : (
             <p className="py-16 text-center text-sm text-muted-foreground">
