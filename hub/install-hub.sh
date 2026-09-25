@@ -21,7 +21,7 @@ REPO="wwx0wwx/one-monitor"
 # in the same change that cuts the tag -- forgetting leaves plain installs one
 # release behind, not broken. `--version latest` follows the redirect instead,
 # and `--version <tag>` installs any release by name.
-VERSION="v1.5.3"
+VERSION="v1.5.4"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,

@@ -100,7 +100,7 @@ curl -s -b cj -X PUT -H 'content-type: application/json' \
 
 ```bash
 docker run -d --name monitor -p 28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.5.3
+  ghcr.io/wwx0wwx/one-monitor:1.5.4
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码看 `docker logs monitor`。
@@ -111,7 +111,7 @@ docker run -d --name monitor -p 28080:28080 -v monitor-data:/data \
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.5.3 --yes     # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.5.4 --yes     # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
