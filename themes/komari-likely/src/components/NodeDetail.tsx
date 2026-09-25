@@ -102,7 +102,7 @@ function Tab({ active, onClick, children }: { active: boolean; onClick: () => vo
   return (
     <button
       onClick={onClick}
-      className={`rounded-md px-2.5 py-1 text-xs transition-colors ${
+      className={`frost-chip rounded-md px-2.5 py-1 text-xs transition-colors ${
         active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
       }`}
     >
@@ -333,63 +333,70 @@ export function NodeDetail({ node }: { node: Node }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <Flag country={node.country} />
-        <h2 className="truncate text-lg font-medium">{node.name}</h2>
-        <Status node={node} />
-        <Uptime node={node} />
-      </div>
+      {/* The machine's whole spec sheet in one card. It started flat, which a
+          bare page carries fine -- but a background picture put these thirteen
+          facts straight onto the image, and a surface is the only honest fix.
+          It also reads the machine at a glance: who it is, what it runs, what
+          it costs, before the charts below say how it is doing. */}
+      <Card className="gap-4 p-4">
+        <div className="flex items-center gap-2">
+          <Flag country={node.country} />
+          <h2 className="truncate text-lg font-medium">{node.name}</h2>
+          <Status node={node} />
+          <Uptime node={node} />
+        </div>
 
-      {/* The operator's semicolon badges, one row under the name -- the same
-          blocks the card carries. Public by design, unlike the note below,
-          which only a signed-in panel ever receives. */}
-      <Tags node={node} className="" />
+        {/* The operator's semicolon badges, one row under the name -- the same
+            blocks the card carries. Public by design, unlike the note below,
+            which only a signed-in panel ever receives. */}
+        <Tags node={node} className="" />
 
-      {/* One flat row of facts: what is left after the traffic figures moved
-          out is one machine's spec sheet, and a box around a single topic is
-          just a box. Three across at lg, two at md, one on a phone -- a kernel
-          version or a CPU model needs about 270px to stay whole. */}
-      <dl className="grid gap-x-6 gap-y-3 md:grid-cols-2 lg:grid-cols-3">
-        <Fact label="系统" value={[osName(node.os), node.kernel].filter(Boolean).join(" · ")} />
-        <Fact
-          label="架构"
-          value={[node.arch, node.virt !== "none" ? node.virt : "", m ? `${m.procs} 进程` : ""]
-            .filter(Boolean)
-            .join(" · ")}
-        />
-        <Fact
-          label="CPU"
-          value={node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores}` : `${node.cpu_cores} 核`}
-        />
-        {/* The agent reports nothing here yet; the slot stays so every
-            machine's sheet reads the same, ready for the day it does. */}
-        <Fact label="GPU" value="未上报" />
-        <Fact label="RAM" value={bytes(node.mem_total)} />
-        {/* A machine without swap is stating a fact about itself, worth the row. */}
-        <Fact
-          label="SWAP"
-          value={node.swap_total > 0
-            ? m
-              ? pair(m.swap_used, node.swap_total)
-              : bytes(node.swap_total)
-            : "未启用"}
-        />
-        <Fact label="硬盘" value={bytes(node.disk_total)} />
-        <Fact label="今日流量" value={`↓ ${bytes(node.day_rx)} · ↑ ${bytes(node.day_tx)}`} />
-        <Fact label="总流量" value={`↓ ${bytes(node.total_rx)} · ↑ ${bytes(node.total_tx)}`} />
-        <Fact
-          label="价格"
-          value={node.price > 0
-            ? `${money(node.price, node.currency)} / ${CYCLES[node.billing_cycle] ?? node.billing_cycle}`
-            : "免费"}
-        />
-        <Fact label="剩余价值" value={remainingValue(node, fx.rate)} title={fxNote} />
-        <Fact label="到期时间" value={node.expires_at ?? FOREVER} />
-      </dl>
+        {/* One flat row of facts: what is left after the traffic figures moved
+            out is one machine's spec sheet. Three across at lg, two at md, one
+            on a phone -- a kernel version or a CPU model needs about 270px to
+            stay whole. */}
+        <dl className="grid gap-x-6 gap-y-3 md:grid-cols-2 lg:grid-cols-3">
+          <Fact label="系统" value={[osName(node.os), node.kernel].filter(Boolean).join(" · ")} />
+          <Fact
+            label="架构"
+            value={[node.arch, node.virt !== "none" ? node.virt : "", m ? `${m.procs} 进程` : ""]
+              .filter(Boolean)
+              .join(" · ")}
+          />
+          <Fact
+            label="CPU"
+            value={node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores}` : `${node.cpu_cores} 核`}
+          />
+          {/* The agent reports nothing here yet; the slot stays so every
+              machine's sheet reads the same, ready for the day it does. */}
+          <Fact label="GPU" value="未上报" />
+          <Fact label="RAM" value={bytes(node.mem_total)} />
+          {/* A machine without swap is stating a fact about itself, worth the row. */}
+          <Fact
+            label="SWAP"
+            value={node.swap_total > 0
+              ? m
+                ? pair(m.swap_used, node.swap_total)
+                : bytes(node.swap_total)
+              : "未启用"}
+          />
+          <Fact label="硬盘" value={bytes(node.disk_total)} />
+          <Fact label="今日流量" value={`↓ ${bytes(node.day_rx)} · ↑ ${bytes(node.day_tx)}`} />
+          <Fact label="总流量" value={`↓ ${bytes(node.total_rx)} · ↑ ${bytes(node.total_tx)}`} />
+          <Fact
+            label="价格"
+            value={node.price > 0
+              ? `${money(node.price, node.currency)} / ${CYCLES[node.billing_cycle] ?? node.billing_cycle}`
+              : "免费"}
+          />
+          <Fact label="剩余价值" value={remainingValue(node, fx.rate)} title={fxNote} />
+          <Fact label="到期时间" value={node.expires_at ?? FOREVER} />
+        </dl>
 
-      {node.remark && (
-        <p className="rounded-md bg-muted px-3 py-2 text-sm whitespace-pre-wrap">{node.remark}</p>
-      )}
+        {node.remark && (
+          <p className="rounded-md bg-muted px-3 py-2 text-sm whitespace-pre-wrap">{node.remark}</p>
+        )}
+      </Card>
 
       <div className="space-y-2 border-t pt-4">
         <div className="flex gap-1">

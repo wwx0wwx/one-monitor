@@ -28,7 +28,7 @@ export function RegionPicker({ regions, selected, onSelect, countOf, trigger }: 
         <>
           {/* Click anywhere else closes; the panel sits above this blanket. */}
           <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} aria-hidden />
-          <div className="absolute top-full left-0 z-30 mt-1 max-h-64 w-44 overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
+          <div className="absolute top-full left-0 z-30 mt-1 max-h-64 w-44 overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg backdrop-blur-xl">
             {regions.map((r) => (
               <button
                 key={r}

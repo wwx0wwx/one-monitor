@@ -72,6 +72,29 @@
   --warn: oklch(0.79 0 0);
 }
 
+/* A background picture turns a solid panel into something pasted on top of
+   it. The komari treatment is the opposite trade: the picture stays at full
+   strength and the panels frost -- a translucent tint over a heavy backdrop
+   blur, so text reads against a smeared field instead of the picture's own
+   detail. The switch is one class on the root element, present only while a
+   picture is actually painted: without one the variables are the solid
+   originals and the blur beneath an opaque panel shows nothing, so the bare
+   page is pixel-for-pixel what it always was.
+
+   How solid the frost is comes from `--card-opacity`, set by the page from
+   the operator's slider (40-100, default 70). Dark mode runs ten points
+   thinner -- the same number over the dark tint reads heavier than it does
+   over white -- and the popovers ten points denser, their smaller type
+   needing the sturdier ground. */
+.bg-on {
+  --card: oklch(1 0 0 / var(--card-opacity, 70%));
+  --popover: oklch(1 0 0 / min(95%, calc(var(--card-opacity, 70%) + 10%)));
+}
+.dark.bg-on {
+  --card: oklch(0.2 0 0 / max(40%, calc(var(--card-opacity, 70%) - 10%)));
+  --popover: oklch(0.2 0 0 / var(--card-opacity, 70%));
+}
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -114,3 +137,15 @@
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* The chips that rest directly on the page -- an unselected group pill, an
+   unselected range tab -- carry no fill of their own, which the picture
+   behind them makes loud. The blur rides along unconditionally: over the
+   bare page it has nothing to smear and so shows nothing. A selected chip
+   keeps its solid fill, hence the exclusions. */
+.frost-chip {
+  backdrop-filter: blur(24px);
+}
+.bg-on .frost-chip:not(.bg-secondary):not(.bg-primary) {
+  background-color: color-mix(in oklab, var(--card) 60%, transparent);
+}

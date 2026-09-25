@@ -9,6 +9,10 @@ export type Bg = {
   opacity: number
   blur: number
   fit: "cover" | "contain"
+  /** How solid the frosted panels are while the picture is on: 100 is an
+   *  opaque card, and the floor of 40 is where text starts competing with the
+   *  picture for the eye. */
+  cardOpacity: number
 }
 
 export type Display = {
@@ -36,6 +40,7 @@ export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings 
       opacity: Math.min(1, Math.max(0, Number(raw?.bg_opacity ?? 100) / 100 || 1)),
       blur: Math.min(20, Math.max(0, Number(raw?.bg_blur ?? 0) || 0)),
       fit: raw?.bg_fit === "contain" ? "contain" : "cover",
+      cardOpacity: Math.min(100, Math.max(40, Number(raw?.card_opacity ?? 70) || 70)),
     },
     display: {
       costPublic: flag(raw, "cost_public", false),

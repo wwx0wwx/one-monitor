@@ -69,7 +69,7 @@ export function IpCapsule() {
     <div
       role="status"
       className={cn(
-        "fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full border bg-background/80 px-4 py-2 text-xs shadow-lg backdrop-blur transition-all duration-700",
+        "fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full border bg-background/80 px-4 py-2 text-xs shadow-lg backdrop-blur-xl transition-all duration-700",
         shown ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-3 opacity-0",
       )}
     >

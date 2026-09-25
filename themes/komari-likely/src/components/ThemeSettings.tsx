@@ -141,7 +141,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
         <>
           {/* Click anywhere else closes; the panel sits above this blanket. */}
           <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} aria-hidden />
-          <div className="absolute right-0 top-full z-30 mt-2 max-h-[80svh] w-80 space-y-3 overflow-auto rounded-lg border bg-popover p-3 text-popover-foreground shadow-lg">
+          <div className="absolute right-0 top-full z-30 mt-2 max-h-[80svh] w-80 space-y-3 overflow-auto rounded-lg border bg-popover p-3 text-popover-foreground shadow-lg backdrop-blur-[64px]">
             <div>
               <p className="text-xs font-medium">主题设置</p>
               <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
@@ -200,6 +200,17 @@ export function ThemeSettingsButton({ settings, onSave }: {
                       ))}
                     </div>
                   </div>
+                  {/* The frost half of the picture treatment: how solid the
+                      cards are over the blurred image. The image's own
+                      opacity above is a different knob and the two compose. */}
+                  <Slider
+                    label="卡片浓度"
+                    value={Math.round(bg.cardOpacity)}
+                    min={40}
+                    max={100}
+                    render={(v) => `${v}%`}
+                    onPick={(v) => save({ card_opacity: String(v) })}
+                  />
                 </div>
               </div>
             </Section>
@@ -244,6 +255,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
               onClick={() =>
                 save({
                   bg_enabled: "off", bg_desktop: "", bg_mobile: "", bg_opacity: "100", bg_blur: "0", bg_fit: "cover",
+                  card_opacity: "70",
                   cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
                   ip_capsule: "on", expiring_group: "on", region_group: "on",
                 })

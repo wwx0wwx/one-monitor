@@ -173,7 +173,7 @@ export default function App() {
   const shown = group ? sorted.filter(inGroup) : sorted
   const count = (name: string) => sorted.filter((n) => (name === EXPIRING ? expiring.some((e) => e.id === n.id) : groups.includes(name) ? n.group === name : n.country === name)).length
   const pill = (active: boolean) =>
-    `inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${active ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`
+    `frost-chip inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${active ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`
 
   // `/node/{id}` is a page people bookmark and share, so the tab needs the node's
   // name. The site name rather than a fixed string, since the hub lets an operator
@@ -181,6 +181,18 @@ export default function App() {
   useEffect(() => {
     document.title = [selected?.name, me?.site_name || "Monitor"].filter(Boolean).join(" · ")
   }, [selected?.name, me?.site_name])
+
+  // One class on the root frosts every surface while a background picture is
+  // painted, and changes nothing while one is not; the picture itself is
+  // BackgroundLayer's business. The accompanying variable is how solid the
+  // frost is, as the operator set it -- a number the CSS in index.css turns
+  // into the card and popover alphas. This must run even on the error and
+  // loading shapes below.
+  useEffect(() => {
+    const t = me?.theme
+    document.documentElement.classList.toggle("bg-on", !!t && t.bg_enabled === "on" && !!(t.bg_desktop || t.bg_mobile))
+    document.documentElement.style.setProperty("--card-opacity", `${parseThemeSettings(t).bg.cardOpacity}%`)
+  }, [me?.theme])
 
   // The description the operator wrote is both page copy and the meta a crawler
   // reads; the page keeps its own copy current with whatever /me reported.
