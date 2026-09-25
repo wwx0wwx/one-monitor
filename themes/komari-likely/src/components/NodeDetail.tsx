@@ -11,7 +11,7 @@ import { Flag } from "@/components/Flag"
 import { api, type Node } from "@/lib/api"
 import { useCnyRate } from "@/lib/fx"
 import {
-  axisBytes, axisTop, bytes, clockFor, daysUntil, pair, quarters, cpuName, CYCLES, FOREVER, money, osName, rate, timeTicks,
+  axisBytes, axisTop, bytes, clockFor, CYCLE_DAYS, daysUntil, pair, quarters, cpuName, CYCLES, FOREVER, money, osName, rate, timeTicks,
 } from "@/lib/format"
 
 type Point = {
@@ -150,9 +150,6 @@ function remainingValue(node: Node, fx: number | null | undefined): string {
   if (days === null) return FOREVER
   // A one-off payment buys no span to decay over, and an unknown cycle names
   // none; neither has a daily rate to multiply.
-  const CYCLE_DAYS: Record<string, number> = {
-    monthly: 30, quarterly: 90, semiannual: 180, yearly: 365, biennial: 730, triennial: 1095,
-  }
   const span = CYCLE_DAYS[node.billing_cycle]
   if (!span) return "—"
   const native = Math.max(0, node.price * (days / span))

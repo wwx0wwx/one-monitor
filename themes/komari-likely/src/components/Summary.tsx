@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react"
-import { Activity, ArrowDown, ArrowDownUp, ArrowUp, Clock, Gauge, Server } from "lucide-react"
+import { Activity, ArrowDown, ArrowDownUp, ArrowUp, Clock, Coins, Gauge, Server } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
 import { speedHistory, type Node } from "@/lib/api"
-import { bytes, percent, rate } from "@/lib/format"
+import { bytes, CYCLE_DAYS, daysUntil, percent, rate } from "@/lib/format"
+import { cnyPer, useCnyTable } from "@/lib/fx"
 import { cn } from "@/lib/utils"
 
 function Tile({ icon: Icon, label, className, children }: {
@@ -75,9 +76,36 @@ function Spark({ series }: { series: { values: number[]; className: string }[] }
   )
 }
 
-export function Summary({ nodes }: { nodes: Node[] }) {
+export function Summary({ nodes, showCost }: { nodes: Node[]; showCost?: boolean }) {
   const online = nodes.filter((n) => n.online)
   const sum = (pick: (n: Node) => number) => nodes.reduce((total, n) => total + pick(n), 0)
+
+  // The fleet's running bill, for the operator's eyes only: each priced cycle
+  // spread over its own days and converted at the day's table, plus what the
+  // machines still hold -- price times the days left on it, the detail page's
+  // 剩余价值 summed. A machine with no expiry holds an unbounded amount, which
+  // cannot join a sum and is left out of it. A currency the table does not
+  // list is skipped rather than guessed at; ≈ marks a total that crossed a
+  // rate to get here.
+  const table = useCnyTable()
+  const bill = nodes.filter((n) => n.price > 0 && CYCLE_DAYS[n.billing_cycle])
+  const cost = (() => {
+    if (!table) return table === undefined ? undefined : null
+    let daily = 0
+    let value = 0
+    let approx = false
+    let known = 0
+    for (const n of bill) {
+      const fx = cnyPer(n.currency, table)
+      if (fx === null) continue
+      if (n.currency !== "CNY") approx = true
+      daily += (n.price * fx) / CYCLE_DAYS[n.billing_cycle]
+      const days = daysUntil(n.expires_at)
+      if (days !== null) value += (n.price * fx * Math.max(0, days)) / CYCLE_DAYS[n.billing_cycle]
+      known++
+    }
+    return { daily, value, approx, known }
+  })()
 
   // The busiest node rather than the average: one machine at 95% is what matters,
   // and a fleet of idle ones would average it away.
@@ -91,7 +119,7 @@ export function Summary({ nodes }: { nodes: Node[] }) {
   const now = speedHistory.at(-1) ?? { rx: 0, tx: 0 }
 
   return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+    <div className={cn("grid grid-cols-2 gap-3", showCost ? "lg:grid-cols-6" : "lg:grid-cols-5")}>
       {/* Full width on a phone: the row it opens would otherwise pair a clock
           with half a grid and leave the last tile alone below. */}
       <Tile icon={Clock} label="当前时间" className="col-span-2 lg:col-span-1">
@@ -146,6 +174,23 @@ export function Summary({ nodes }: { nodes: Node[] }) {
           />
         </div>
       </Tile>
+
+      {/* The money tile follows the operator's call: signed-in always, the
+          public page only when they chose to share it. */}
+      {showCost && (
+        <Tile icon={Coins} label="每日成本" className="col-span-2 lg:col-span-1">
+          <div className="tnum mt-1 text-xl font-semibold">
+            {cost === undefined || cost === null || cost.known === 0
+              ? cost === undefined ? "…" : "—"
+              : `${cost.approx ? "≈¥" : "¥"}${cost.daily.toFixed(2)}`}
+          </div>
+          {cost && cost.known > 0 && (
+            <div className="tnum mt-auto pt-1 text-xs">
+              总价值 {cost.approx ? "≈" : ""}¥{cost.value.toFixed(2)}
+            </div>
+          )}
+        </Tile>
+      )}
     </div>
   )
 }

@@ -72,12 +72,10 @@ async function load(): Promise<Table | null> {
 }
 
 /**
- * Units of CNY one unit of `code` buys, with the day the table was published.
- * `rate` is `undefined` while the table is still loading, `null` when no source
- * answered or the table does not list the currency, `1` for CNY itself without
- * touching the network.
+ * The whole table as a hook, for callers with more than one currency to
+ * convert. Same three states as [`useCnyRate`].
  */
-export function useCnyRate(code: string): { rate: number | null | undefined; date?: string } {
+export function useCnyTable(): Table | null | undefined {
   const [table, setTable] = useState<Table | null | undefined>(readCache)
   useEffect(() => {
     if (table !== undefined) return
@@ -89,11 +87,26 @@ export function useCnyRate(code: string): { rate: number | null | undefined; dat
       active = false
     }
   }, [table])
+  return table
+}
+
+/** CNY per one unit of `code` from a loaded table; null when the table does
+ *  not list the currency. */
+export function cnyPer(code: string, table: NonNullable<Table>): number | null {
+  if (code === "CNY") return 1
+  const perUsd = table.usd[code.toLowerCase()]
+  return perUsd && table.usd.cny ? table.usd.cny / perUsd : null
+}
+
+/**
+ * Units of CNY one unit of `code` buys, with the day the table was published.
+ * `rate` is `undefined` while the table is still loading, `null` when no source
+ * answered or the table does not list the currency, `1` for CNY itself without
+ * touching the network.
+ */
+export function useCnyRate(code: string): { rate: number | null | undefined; date?: string } {
+  const table = useCnyTable()
   if (code === "CNY") return { rate: 1 }
   if (!table) return { rate: table === undefined ? undefined : null }
-  const perUsd = table.usd[code.toLowerCase()]
-  return {
-    rate: perUsd && table.usd.cny ? table.usd.cny / perUsd : null,
-    date: table.date,
-  }
+  return { rate: cnyPer(code, table), date: table.date }
 }

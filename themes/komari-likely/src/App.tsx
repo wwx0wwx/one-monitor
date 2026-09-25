@@ -5,12 +5,21 @@ import { NodeCard } from "@/components/NodeCard"
 import { Summary } from "@/components/Summary"
 import { RegionPicker } from "@/components/RegionPicker"
 import { IpCapsule } from "@/components/IpCapsule"
+import { BackgroundLayer, ThemeSettingsButton } from "@/components/ThemeSettings"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, useNodes, type Node } from "@/lib/api"
+import { parseThemeSettings } from "@/lib/display"
 import { daysUntil } from "@/lib/format"
 
-type Me = { authed: boolean; site_name: string; site_description: string; public_page: boolean }
+type Me = {
+  authed: boolean
+  site_name: string
+  site_description: string
+  public_page: boolean
+  /** Display settings the hub hands every visitor, raw strings. */
+  theme?: Record<string, string>
+}
 
 // Split out because recharts is most of this bundle and the list page draws no
 // chart. The landing page is 242 kB rather than 629 kB (77 kB gzipped against
@@ -93,6 +102,16 @@ export default function App() {
   useEffect(() => {
     if (me && !me.public_page && !me.authed) location.href = "/admin/"
   }, [me])
+
+  // The operator's display settings, saved key by key: what the hub refuses
+  // shows in the panel rather than half-applying here.
+  const saveSettings = useCallback(
+    (patch: Record<string, string>) =>
+      api("/settings", { method: "PUT", body: JSON.stringify(patch) }).then(() => {
+        setMe((old) => (old ? { ...old, theme: { ...(old.theme ?? {}), ...patch } } : old))
+      }),
+    [],
+  )
 
   // What is alive above what is not -- komari's order -- then the order the
   // operator set in the panel.
@@ -189,8 +208,12 @@ export default function App() {
   // The status page is closed and nobody is signed in: redirect to the panel.
   if (!me.public_page && !me.authed) return null
 
+  // What this page shows, as the operator set it from the hub.
+  const ts = parseThemeSettings(me.theme)
+
   return (
     <div className="min-h-svh">
+      <BackgroundLayer bg={ts.bg} />
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto max-w-[1400px] px-4 py-3 sm:px-6">
           {/* The site name is the way back to the list, so a node page needs
@@ -210,6 +233,7 @@ export default function App() {
                 <Wrench /> {me.authed ? "进入后台" : "登录"}
               </a>
             </Button>
+            {me.authed && <ThemeSettingsButton settings={ts} onSave={saveSettings} />}
             <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
               {dark ? <Sun /> : <Moon />}
             </Button>
@@ -240,13 +264,13 @@ export default function App() {
           </div>
         ) : (
           <>
-            <Summary nodes={shown} />
-            {(groups.length > 0 || expiring.length > 0 || regions.length > 0) && (
+            <Summary nodes={shown} showCost={me.authed || ts.display.costPublic} />
+            {(groups.length > 0 || (ts.display.expiring && expiring.length > 0) || (ts.display.region && regions.length > 0)) && (
               <div className="flex flex-wrap items-center gap-1.5">
                 <button onClick={() => pick("")} className={pill(group === "")}>
                   全部 {sorted.length}
                 </button>
-                {expiring.length > 0 && (
+                {ts.display.expiring && expiring.length > 0 && (
                   <button onClick={() => pick(group === EXPIRING ? "" : EXPIRING)} className={pill(group === EXPIRING)}>
                     {EXPIRING} <span className={expired ? "text-red-600" : "text-orange-500"}>{expiring.length}</span>
                   </button>
@@ -258,7 +282,7 @@ export default function App() {
                 ))}
                 {/* Many countries would swallow the row, so they wait behind one
                     trigger: the globe, until a country is picked. */}
-                {regions.length > 0 && (
+                {ts.display.region && regions.length > 0 && (
                   <RegionPicker
                     regions={regions}
                     selected={regions.includes(group) ? group : ""}
@@ -274,14 +298,14 @@ export default function App() {
             ) : (
               <div className="grid items-start gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 {shown.map((n: Node) => (
-                  <NodeCard key={n.id} node={n} onOpen={() => go(n.id)} />
+                  <NodeCard key={n.id} node={n} onOpen={() => go(n.id)} show={ts.display} />
                 ))}
               </div>
             )}
           </>
         )}
       </main>
-      <IpCapsule />
+      {ts.display.ipCapsule && <IpCapsule />}
     </div>
   )
 }

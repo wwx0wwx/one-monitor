@@ -123,7 +123,16 @@ function Price({ node }: { node: Node }) {
   )
 }
 
-export function NodeCard({ node, onOpen }: { node: Node; onOpen: () => void }) {
+/** Which of the card's own entries the operator left on. */
+export type CardShow = { swap: boolean; speed: boolean; billing: boolean }
+
+const SHOW_ALL: CardShow = { swap: true, speed: true, billing: true }
+
+export function NodeCard({ node, onOpen, show = SHOW_ALL }: {
+  node: Node
+  onOpen: () => void
+  show?: CardShow
+}) {
   const m = node.metrics
 
   return (
@@ -181,11 +190,13 @@ export function NodeCard({ node, onOpen }: { node: Node; onOpen: () => void }) {
             />
             {/* A machine without swap is stating a fact, so its meter says so
                 rather than hiding the cell. */}
-            <Meter
-              label="SWAP"
-              pct={m && node.swap_total > 0 ? percent(m.swap_used, m.swap_total) : null}
-              foot={node.swap_total > 0 ? (m ? pair(m.swap_used, m.swap_total) : bytes(node.swap_total)) : "未启用"}
-            />
+            {show.swap && (
+              <Meter
+                label="SWAP"
+                pct={m && node.swap_total > 0 ? percent(m.swap_used, node.swap_total) : null}
+                foot={node.swap_total > 0 ? (m ? pair(m.swap_used, node.swap_total) : bytes(node.swap_total)) : "未启用"}
+              />
+            )}
             <Meter
               label="流量"
               pct={node.traffic_limit > 0 ? percent(monthUsage(node), node.traffic_limit) : null}
@@ -195,26 +206,30 @@ export function NodeCard({ node, onOpen }: { node: Node; onOpen: () => void }) {
             {/* A rate has no ceiling to fill a bar against, so no track: the
                 two directions stack under the word, down first, so neither
                 truncates in half a card. */}
-            <div className="grid min-w-0 grid-cols-[auto_1fr] items-baseline gap-x-2 gap-y-0.5 text-xs">
-              <span className="text-muted-foreground">网速</span>
-              <span className="tnum truncate font-medium">{m ? `↓ ${rate(m.net_rx)}` : "—"}</span>
-              {m && (
-                <>
-                  <span aria-hidden />
-                  <span className="tnum truncate text-muted-foreground">↑ {rate(m.net_tx)}</span>
-                </>
-              )}
-            </div>
+            {show.speed && (
+              <div className="grid min-w-0 grid-cols-[auto_1fr] items-baseline gap-x-2 gap-y-0.5 text-xs">
+                <span className="text-muted-foreground">网速</span>
+                <span className="tnum truncate font-medium">{m ? `↓ ${rate(m.net_rx)}` : "—"}</span>
+                {m && (
+                  <>
+                    <span aria-hidden />
+                    <span className="tnum truncate text-muted-foreground">↑ {rate(m.net_tx)}</span>
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           {/* How long it has run lower left, what it costs and when lower
               right. */}
           <div className="mt-4 flex items-end justify-between gap-3 border-t pt-3">
             <Uptime node={node} emph />
-            <div className="flex shrink-0 flex-col items-end gap-0.5">
-              <Expiry node={node} />
-              <Price node={node} />
-            </div>
+            {show.billing && (
+              <div className="flex shrink-0 flex-col items-end gap-0.5">
+                <Expiry node={node} />
+                <Price node={node} />
+              </div>
+            )}
           </div>
         </>
       ) : (

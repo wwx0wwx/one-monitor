@@ -10,9 +10,20 @@
 - **详情页**：Facts 按固定顺序（系统/架构/CPU/GPU/RAM/SWAP/硬盘/今日流量/总流量/价格/剩余价值/到期时间）；剩余价值 = 价格 × 剩余天数 ÷ 周期天数，按当日公开牌价折算人民币（jsdelivr currency-api 主源、ExchangeRate-API 备源，24h 缓存，悬停显示汇率日期与牌价；取不到汇率显示原币金额，不编造）；资源图表卡片化两列；延迟页六彩探测线、每条带 `平均延迟 | 丢包率` 标签（全超时显示 N/A）、平滑（5 桶滑动平均）与连接断点两个开关、1h/4h/1d/7d 时间档（7 天即 hub 匿名窗口上限，ping 默认保留也是 7 天）
 - **周边**：进站时底部胶囊短暂展示访客 IP（ip.sb，ipinfo.io 备源，失败静默不显示）；卡片可 Tab+Enter 打开、Esc 返回；深浅色跟随系统并可切换，`theme-color` meta 同步
 
+## 主题设置（v1.1.0，hub ≥ v1.4.0）
+
+状态页右上角的「主题设置」按钮（仅登录可见）与后台「主题」栏的背景图卡片，写的都是 hub
+的服务端设置（`/api/me` 的 `theme` 对象匿名下发，全站访客同一份）：
+
+- **背景图**：开关、桌面/移动图床链接（必须 https）、透明度、模糊、裁切铺满/完整显示
+- **显示**：每日成本卡对访客公开与否、卡片 SWAP / 网速 / 到期与价格开关
+- **功能**：访客 IP 提示、即将到期分组、区域分组开关
+
+hub 低于 v1.4.0 时这些键不存在，页面按默认值渲染、面板保存会被 hub 拒绝并提示。
+
 ## 相对默认主题的结构差异
 
-新增 `src/components/Flag.tsx`、`OsIcon.tsx`、`RegionPicker.tsx`、`IpCapsule.tsx` 与 `src/lib/fx.ts`（汇率 hook）；其余改造集中在 `App` / `NodeCard` / `NodeDetail` / `Summary` / `Meter`。`country` 字段为 ISO 3166-1 alpha-2，国旗由此映射。
+新增 `src/components/Flag.tsx`、`OsIcon.tsx`、`RegionPicker.tsx`、`IpCapsule.tsx`、`ThemeSettings.tsx` 与 `src/lib/fx.ts`（汇率 hook）、`src/lib/display.ts`（主题设置解析）；其余改造集中在 `App` / `NodeCard` / `NodeDetail` / `Summary` / `Meter`。`country` 字段为 ISO 3166-1 alpha-2，国旗由此映射。
 
 ## 开发
 

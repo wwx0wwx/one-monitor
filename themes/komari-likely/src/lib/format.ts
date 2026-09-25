@@ -94,6 +94,12 @@ export const CYCLES: Record<string, string> = {
   once: "一次性",
 }
 
+/** Days a billing cycle covers, for turning a cycle's price into a daily one.
+ *  一次性 buys no span and is absent: it has no daily rate to derive. */
+export const CYCLE_DAYS: Record<string, number> = {
+  monthly: 30, quarterly: 90, semiannual: 180, yearly: 365, biennial: 730, triennial: 1095,
+}
+
 // Hoisted out of `clock`: recharts calls a tickFormatter for every sample when
 // laying out an axis rather than once per tick drawn, and constructing an Intl
 // formatter per call was the largest single cost on the detail page -- 348 ms of
