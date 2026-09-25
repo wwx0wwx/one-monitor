@@ -1101,6 +1101,34 @@ function Themes() {
     api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
   useEffect(() => { load() }, [])
 
+  // 站点级的状态页背景：存在设置键里，所有访客看到同一张图。链接和开关在这里，
+  // 透明度、模糊、铺满这些观感细节在状态页右上角的「主题设置」（需登录）。
+  const [bg, setBg] = useState({ enabled: "off", desktop: "", mobile: "" })
+  useEffect(() => {
+    api<Settings>("/settings")
+      .then((s) =>
+        setBg({
+          enabled: s.bg_enabled === "on" ? "on" : "off",
+          desktop: String(s.bg_desktop ?? ""),
+          mobile: String(s.bg_mobile ?? ""),
+        }),
+      )
+      .catch(() => {})
+  }, [])
+
+  async function saveBg(patch: Partial<typeof bg>) {
+    setBg((old) => ({ ...old, ...patch }))
+    const body: Record<string, string> = {}
+    if (patch.enabled !== undefined) body.bg_enabled = patch.enabled
+    if (patch.desktop !== undefined) body.bg_desktop = patch.desktop
+    if (patch.mobile !== undefined) body.bg_mobile = patch.mobile
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify(body) })
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
   async function select(short: string) {
     try {
       await api("/settings", { method: "PUT", body: JSON.stringify({ theme: short }) })
@@ -1163,6 +1191,51 @@ function Themes() {
   if (!themes) return null
   return (
     <div className="space-y-4">
+      <Card className="gap-4 p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-sm font-medium">背景图</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              状态页整页背景，对全部访客生效。图床直链（必须 https://），桌面与移动可各设一张，缺一张时两端共用。
+              <br />
+              透明度、模糊、铺满方式在状态页右上角的「主题设置」里调整（需登录）。
+            </p>
+          </div>
+          <Switch
+            checked={bg.enabled === "on"}
+            onCheckedChange={(on) => saveBg({ enabled: on ? "on" : "off" })}
+            aria-label="背景图开关"
+          />
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label className="text-xs">桌面版链接</Label>
+            {/* key 随设置刷新，未保存的草稿在重新载入时让位 */}
+            <Input
+              key={bg.desktop}
+              defaultValue={bg.desktop}
+              placeholder="https://…"
+              onBlur={(e) => {
+                const next = e.currentTarget.value.trim()
+                if (next !== bg.desktop) saveBg({ desktop: next })
+              }}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">移动版链接</Label>
+            <Input
+              key={bg.mobile}
+              defaultValue={bg.mobile}
+              placeholder="https://…"
+              onBlur={(e) => {
+                const next = e.currentTarget.value.trim()
+                if (next !== bg.mobile) saveBg({ mobile: next })
+              }}
+            />
+          </div>
+        </div>
+      </Card>
+
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">安装主题</h3>

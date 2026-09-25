@@ -512,6 +512,28 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// The display settings a theme may read anonymously, defaulted: a key the
+/// operator never touched reads as the page the theme ships with, so an older
+/// theme meeting a newer hub simply never looks at what it does not know.
+fn theme_display(app: &App) -> Value {
+    let get = |key: &str, fallback: &str| app.db.get(key).unwrap_or_else(|| fallback.to_owned());
+    json!({
+        "bg_enabled": get("bg_enabled", "off"),
+        "bg_desktop": get("bg_desktop", ""),
+        "bg_mobile": get("bg_mobile", ""),
+        "bg_opacity": get("bg_opacity", "100"),
+        "bg_blur": get("bg_blur", "0"),
+        "bg_fit": get("bg_fit", "cover"),
+        "cost_public": get("cost_public", "off"),
+        "show_swap": get("show_swap", "on"),
+        "show_speed": get("show_speed", "on"),
+        "show_billing": get("show_billing", "on"),
+        "ip_capsule": get("ip_capsule", "on"),
+        "expiring_group": get("expiring_group", "on"),
+        "region_group": get("region_group", "on"),
+    })
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
@@ -521,6 +543,9 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "site_description": app.db.get("site_description").unwrap_or_default(),
         "public_page": app.public_page(),
         "can_provision": provisioning_allowed(&app, &headers),
+        // What the status page renders is the operator's call, kept here so
+        // every visitor sees the same picture rather than each browser its own.
+        "theme": theme_display(&app),
         // The hub's own public URL when one was given, which is what belongs in an
         // install command -- not whichever address this browser used, which
         // behind a proxy may be a loopback port. Empty by default, in which case
@@ -894,6 +919,21 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_ping_days",
     "theme",
     "github_proxy",
+    // What the status page shows. Kept beside the theme it decorates so the
+    // panel's theme section owns the whole picture.
+    "bg_enabled",
+    "bg_desktop",
+    "bg_mobile",
+    "bg_opacity",
+    "bg_blur",
+    "bg_fit",
+    "cost_public",
+    "show_swap",
+    "show_speed",
+    "show_billing",
+    "ip_capsule",
+    "expiring_group",
+    "region_group",
 ];
 
 // ---- the database itself ----
@@ -1586,6 +1626,29 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
             Some("emergency password must be at least 12 characters, or empty to clear".into())
         }
         "emergency_password" => None,
+        // ---- what the status page shows: the theme's display settings ----
+        "bg_enabled" | "cost_public" | "show_swap" | "show_speed" | "show_billing" | "ip_capsule"
+        | "expiring_group" | "region_group"
+            if !matches!(value, "on" | "off") =>
+        {
+            Some(format!("{key} must be on or off"))
+        }
+        // The visitor's browser fetches the picture, not the hub, so on an
+        // https page the link must itself be https or nothing renders at all.
+        "bg_desktop" | "bg_mobile"
+            if !(value.is_empty() || (value.starts_with("https://") && value.chars().count() <= 500)) =>
+        {
+            Some("背景图链接必须以 https:// 开头且不超过 500 字符".into())
+        }
+        "bg_opacity" if !value.parse::<u8>().is_ok_and(|v| v <= 100) => {
+            Some("bg_opacity must be a number from 0 to 100".into())
+        }
+        "bg_blur" if !value.parse::<u8>().is_ok_and(|v| v <= 20) => {
+            Some("bg_blur must be a number from 0 to 20".into())
+        }
+        "bg_fit" if !matches!(value, "cover" | "contain") => {
+            Some("bg_fit must be cover or contain".into())
+        }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "geoip_license_key" => None,
         _ => Some(format!("unknown setting: {key}")),
