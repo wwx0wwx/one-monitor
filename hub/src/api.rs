@@ -525,6 +525,7 @@ fn theme_display(app: &App) -> Value {
         "bg_blur": get("bg_blur", "0"),
         "bg_fit": get("bg_fit", "cover"),
         "cost_public": get("cost_public", "off"),
+        "show_busiest": get("show_busiest", "on"),
         "show_swap": get("show_swap", "on"),
         "show_speed": get("show_speed", "on"),
         "show_billing": get("show_billing", "on"),
@@ -928,6 +929,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "bg_blur",
     "bg_fit",
     "cost_public",
+    "show_busiest",
     "show_swap",
     "show_speed",
     "show_billing",
@@ -1627,8 +1629,8 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "emergency_password" => None,
         // ---- what the status page shows: the theme's display settings ----
-        "bg_enabled" | "cost_public" | "show_swap" | "show_speed" | "show_billing" | "ip_capsule"
-        | "expiring_group" | "region_group"
+        "bg_enabled" | "cost_public" | "show_busiest" | "show_swap" | "show_speed" | "show_billing"
+        | "ip_capsule" | "expiring_group" | "region_group"
             if !matches!(value, "on" | "off") =>
         {
             Some(format!("{key} must be on or off"))

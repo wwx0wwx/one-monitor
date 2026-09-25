@@ -1017,7 +1017,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 <Field label="名称">
                   {/* A new monitor starts empty, so the cursor belongs here;
                       editing an existing one starts with nothing selected. */}
-                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="Cloudflare" />
+                  <Input autoFocus={!editing.id} value={editing.name ?? ""} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="浙江移动v4" />
                 </Field>
                 <Field label="间隔（秒）" hint="5–3600">
                   {/* `|| 60`, as the three other number boxes on this page do:
@@ -1029,7 +1029,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
                 </Field>
               </div>
               <Field label="目标地址" hint="host:port">
-                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="1.1.1.1:443" />
+                <Input value={editing.target ?? ""} onChange={(e) => setEditing({ ...editing, target: e.target.value })} placeholder="112.13.210.86:443" />
               </Field>
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-3">

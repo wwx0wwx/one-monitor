@@ -29,7 +29,7 @@ use tower_http::compression::Predicate;
 use tracing::{info, warn};
 
 use agent_ws::Agent;
-use db::Db;
+use db::{Db, PingTask};
 
 pub type Shared = Arc<App>;
 
@@ -548,10 +548,31 @@ fn host_is_loopback(authority: &str) -> bool {
 }
 
 /// Prints a one-time admin password when the database is first created, since a
-/// fresh hub is otherwise inaccessible until GitHub is configured.
+/// fresh hub is otherwise inaccessible until GitHub is configured. That same
+/// first boot also opens with one latency probe per carrier, so the delay page
+/// has something to draw before its operator has touched anything. The three
+/// Zhejiang carrier addresses answer TCP on 443 while their DNS port 53 stays
+/// filtered, so the probe rides the port that connects; each is editable or
+/// deletable under 延迟检测 like any probe an operator added by hand.
 fn first_run(app: &App, url: &str) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
+    }
+    for (name, target) in [
+        ("浙江移动v4", "112.13.210.86:443"),
+        ("浙江联通v4", "124.160.144.214:443"),
+        ("浙江电信v4", "122.228.6.140:443"),
+    ] {
+        app.db.save_ping_task(&PingTask {
+            id: 0,
+            name: name.into(),
+            target: target.into(),
+            // The interval the one probe a fleet usually carries runs at.
+            interval: 60,
+            // No nodes exist yet on a first boot; auto-join assigns these to
+            // every server that arrives later.
+            nodes: Vec::new(),
+        })?;
     }
     let password = auth::random_token()[..24].to_owned();
     app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
@@ -869,5 +890,21 @@ mod tests {
         assert!(hash.starts_with("$argon2"));
         first_run(&app, "http://x").unwrap();
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
+    }
+
+    #[test]
+    fn first_run_opens_with_one_probe_per_carrier_and_never_touches_them_again() {
+        let app = app("http://x");
+        first_run(&app, "http://x").unwrap();
+        let probes = app.db.ping_tasks().unwrap();
+        assert_eq!(probes.len(), 3, "one per carrier");
+        assert!(probes.iter().all(|p| p.target.ends_with(":443")), "port 53 is filtered");
+        assert!(probes.iter().all(|p| p.nodes.is_empty()), "nodes arrive later, via auto-join");
+
+        // A restart returns before the seeding, so an operator who deleted the
+        // set keeps it deleted rather than finding it re-created underneath them.
+        app.db.delete_ping_task(probes[0].id).unwrap();
+        first_run(&app, "http://x").unwrap();
+        assert_eq!(app.db.ping_tasks().unwrap().len(), 2, "must not seed again on restart");
     }
 }
