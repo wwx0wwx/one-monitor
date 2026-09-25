@@ -447,11 +447,14 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
         pingSeries.length === 0 ? (
           <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有延迟数据</p>
         ) : (
-          // An explicit pixel height on the column, so the chart can be `flex-1`
-          // within it while the legend takes what it needs: four probes are one row
-          // of chips on a desktop and two on a phone, so any fixed reservation is
-          // wrong on one of them.
-          <div
+          // An explicit pixel height on the card, so the chart can be `flex-1`
+          // within it while the legend takes what it needs: four probes are one
+          // row of chips on a desktop and two on a phone, so any fixed
+          // reservation is wrong on one of them. The card is the same frosted
+          // surface the resource panels wear, so the lines read over a
+          // background picture too; the extra rem over the old bare column
+          // pays for the card's own bottom padding.
+          <Card
             // `+ scrollY`, because getBoundingClientRect is measured from the
             // viewport and this callback runs on every render; a live node
             // re-renders every two seconds, so a scrolled page would re-derive the
@@ -461,10 +464,10 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
             }}
             style={
               chartTop
-                ? { height: `calc(100svh - ${Math.round(chartTop)}px - 1rem)` }
+                ? { height: `calc(100svh - ${Math.round(chartTop)}px - 2rem)` }
                 : undefined
             }
-            className="flex min-h-72 flex-col gap-3">
+            className="min-h-72 gap-3 p-4">
             {/* `min-h-0` is what makes `flex-1` a real number rather than the
                 content's own height: ResponsiveContainer reads its parent, and
                 a flex child not told it may shrink reports whatever the SVG
@@ -584,7 +587,7 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
                 )
               })}
             </div>
-          </div>
+          </Card>
         )
       ) : data.metrics.length === 0 ? (
         <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有历史数据</p>
