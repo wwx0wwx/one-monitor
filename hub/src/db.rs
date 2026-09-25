@@ -622,7 +622,7 @@ impl Db {
 
     pub fn node(&self, id: i64) -> Result<Option<Node>> {
         Ok(self
-            .conn()
+            .read()
             .query_row("SELECT * FROM node WHERE id = ?1", [id], |r| Ok(row_to_node(r)))
             .optional()?)
     }
