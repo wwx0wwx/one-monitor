@@ -359,13 +359,16 @@ pub async fn totp_confirm(
 }
 
 /// Removes the second factor. An authenticated session stands behind this, as
-/// behind every panel write. The replay mark goes with it: a re-bound factor
-/// starts its bookkeeping over rather than inheriting a step from a secret that
-/// no longer exists.
+/// behind every panel write. The secret goes first and the replay mark second:
+/// between a failed second write the old secret would still be bound, and a
+/// zeroed mark would reopen the window for codes it had already spent. Left
+/// un-zeroed the stale mark can only refuse codes -- nothing is bound to it.
 pub async fn totp_disable(_: crate::api::Admin, State(app): State<crate::Shared>) -> Response {
-    let _ = app.db.set("totp_last_step", "0");
     match app.db.set("totp_secret", "") {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(()) => {
+            let _ = app.db.set("totp_last_step", "0");
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

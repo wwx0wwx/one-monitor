@@ -120,16 +120,18 @@ fn download_url(app: &App) -> (String, Option<(String, String)>) {
     }
 }
 
+/// Ceiling on one provider download, compressed or not. A real database is
+/// tens of MiB; the number exists so a hijacked or misbehaving endpoint cannot
+/// hold the hub's memory instead. The gzipped shape holds both the compressed
+/// answer and its expansion under the unit file's ceiling at once, so this is
+/// half the memory budget rather than all of it.
+const MAX_DATABASE_BYTES: u64 = 80 * 1024 * 1024;
+
 /// Fetches the selected provider's database onto disk, replacing whatever was
 /// there, and returns its size in bytes.
 ///
 /// Off the call path: the caller is the manual update button. The file lands
 /// whole under a temporary name first, so a half-downloaded database never
-/// Ceiling on one provider download, compressed or not. A real database is
-/// tens of MiB; the number exists so a hijacked or misbehaving endpoint cannot
-/// hold the hub's memory instead.
-const MAX_DATABASE_BYTES: u64 = 100 * 1024 * 1024;
-
 /// becomes the one lookups read.
 pub async fn download(app: &App) -> Result<(String, i64)> {
     let name = provider(app);
@@ -179,26 +181,34 @@ pub async fn download(app: &App) -> Result<(String, i64)> {
         };
         // db-ip ships gzip; MaxMind's update endpoint answers the raw mmdb.
         // Told apart by magic bytes rather than the URL, so a provider changing
-        // its mind about compression keeps working.
-        let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
+        // its mind about compression keeps working. The compressed answer is
+        // dropped as soon as the expansion exists, and the expansion is written
+        // to disk and dropped before parsing: the peak is one copy in memory
+        // rather than three, well under the unit file's ceiling.
+        let (raw, size) = if bytes.starts_with(&[0x1f, 0x8b]) {
             let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
             let mut out = Vec::new();
             // The same ceiling on the way out of the stream: a small gzip that
             // expands without end is the other shape an oversized answer takes.
             let mut limited = std::io::Read::take(&mut decoder, MAX_DATABASE_BYTES);
             std::io::Read::read_to_end(&mut limited, &mut out).context("gunzip")?;
-            out
+            let size = out.len();
+            (out, size)
         } else {
-            bytes.to_vec()
+            let size = bytes.len();
+            (bytes.to_vec(), size)
         };
+        drop(bytes);
         // Parsed before it replaces anything: a truncated or non-mmdb answer
-        // must not become the database lookups read.
-        Reader::from_source(raw.clone()).context("the download is not an mmdb database")?;
+        // must not become the database lookups read. Parsed from the file, so
+        // the in-memory copy is already gone by then.
         let tmp = dest.with_extension("tmp");
         std::fs::write(&tmp, &raw)?;
+        drop(raw);
+        Reader::open_readfile(&tmp).context("the download is not an mmdb database")?;
         std::fs::rename(&tmp, &dest)?;
         forget();
-        return Ok((name.to_owned(), raw.len() as i64));
+        return Ok((name.to_owned(), size as i64));
     }
     Err(last_err.context(format!("下载 {name} 数据库失败")))
 }

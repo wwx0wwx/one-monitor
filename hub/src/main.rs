@@ -240,9 +240,9 @@ fn pinned_sha(arch: &str) -> Option<&'static str> {
     })
 }
 
-/// An agent binary is under 2 MiB; anything past this is not one, and a
-/// hostile mirror answering with an endless stream is cut off here rather
-/// than filling the memory the unit file allows.
+/// An agent binary is under 2 MiB, and the cap allows four times that: what it
+/// rules out is a hostile mirror answering with an endless stream, which is
+/// cut off here rather than filling the memory the unit file allows.
 const MAX_AGENT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Reads a response body up to `cap` bytes and no further. `Response::bytes`
@@ -273,7 +273,8 @@ async fn install_script() -> Response {
 ///
 /// This URL is fetched on an anonymous request, so setting it redirects that
 /// path. It remains within the bounds `agent_binary` already enforces: four
-/// concurrent transfers, a 120-second timeout, and a streamed body.
+/// concurrent transfers, a deadline on the whole fetch, a capped body, and the
+/// pinned digest.
 fn release_url(app: &App, arch: &str) -> String {
     proxied(
         app,
@@ -531,17 +532,16 @@ async fn main() -> Result<()> {
         .route("/api/db/vacuum", post(api::db_vacuum))
         .route("/api/geoip/update", post(api::geoip_update))
         .fallback(frontend::serve)
-        // Cross-site writes are refused before any handler spends anything on
-        // them; reads, and requests without an Origin at all, pass through.
-        .layer(axum::middleware::from_fn(same_origin))
         // A report is a few hundred bytes; anything larger is not a report.
+        // Layered before the merge below so the chunked uploads keep their own,
+        // higher ceiling: layers only wrap the routes already in the router.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
-        // The two chunked uploads, merged after that layer rather than beneath
-        // it. They raise the ceiling on a single request -- one 4 MiB piece --
-        // not on the file behind it: a 256 MiB backup arrives as 64 such
-        // requests, so no reverse proxy needs to know the database size. The
-        // whole-file ceilings live on `total` and are checked before the first
-        // byte is sent.
+        // The two chunked uploads, merged beneath the origin gate rather than
+        // beside it. They raise the ceiling on a single request -- one 4 MiB
+        // piece -- not on the file behind it: a 256 MiB backup arrives as 64
+        // such requests, so no reverse proxy needs to know the database size.
+        // The whole-file ceilings live on `total` and are checked before the
+        // first byte is sent.
         .merge(
             Router::new()
                 .route("/api/db/restore", post(api::db_restore))
@@ -549,6 +549,11 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
                 .with_state(app.clone()),
         )
+        // Cross-site writes are refused before any handler spends anything on
+        // them -- layered after the merge so the two upload routes, the heaviest
+        // writes the panel makes, stand behind the same gate as every other.
+        // Reads, and requests without an Origin at all, pass through.
+        .layer(axum::middleware::from_fn(same_origin))
         // Excludes the agent binary and database backups: both are already
         // compressed and both are megabytes, so deflating them would consume the
         // cores argon2 and the SQLite writer share for no gain.

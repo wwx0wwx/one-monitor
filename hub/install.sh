@@ -197,6 +197,17 @@ if [ -z "$TOKEN" ]; then
 	}
 fi
 
+# The hub answers a registration with a bare hex token; anything else -- an
+# error page from a middlebox, a body with newlines -- would become extra
+# KEY=value lines in the environment file below, read by the root-run service.
+# The same shape check covers a token typed into the command line.
+case "$TOKEN" in
+"" | *[!A-Za-z0-9]*)
+	echo "the credential is not a bare token; refusing to write it to $ENV_FILE" >&2
+	exit 1
+	;;
+esac
+
 # Stop an agent already running here before replacing its binary. The service
 # name is fixed, so a reinstall could never start a second copy, but without this
 # the new binary lands beneath a live process and only the restart at the end
@@ -210,17 +221,6 @@ else
 fi
 install -d -m 0755 "$ROOT"
 install -m 0755 "$TMP" "$BIN"
-
-# The hub answers a registration with a bare hex token; anything else -- an
-# error page from a middlebox, a body with newlines -- would become extra
-# KEY=value lines in the environment file below, read by the root-run service.
-# The same shape check covers a token typed into the command line.
-case "$TOKEN" in
-"" | *[!A-Za-z0-9]*)
-	echo "the credential is not a bare token; refusing to write it to $ENV_FILE" >&2
-	exit 1
-	;;
-esac
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what

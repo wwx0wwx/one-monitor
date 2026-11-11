@@ -571,7 +571,12 @@ fn theme_display(app: &App) -> Value {
         "show_swap": get("show_swap", "on"),
         "show_speed": get("show_speed", "on"),
         "show_billing": get("show_billing", "on"),
-        "ip_capsule": get("ip_capsule", "on"),
+        // Off by default: on, the theme's IP capsule sends every visitor's
+        // address to api.ip.sb -- a disclosure the operator must choose to
+        // make, not one a fresh install makes for them. The value here, not
+        // the theme's fallback, is what decides: this map materialises every
+        // key, so a theme-side default never runs.
+        "ip_capsule": get("ip_capsule", "off"),
         "expiring_group": get("expiring_group", "on"),
         "region_group": get("region_group", "on"),
     })
@@ -828,9 +833,6 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     Json(json!({"ok": true})).into_response()
 }
 
-/// Issues a fresh token, invalidating the old one immediately.
-///
-/// Always an explicit action: rotate a token believed to have leaked, then
 /// The node's existing install token, for the dialog that assembles the
 /// command. A read, not a reissue: opening the install dialog must not retire
 /// the credential a running agent is using. This is the only place the token
@@ -839,7 +841,13 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 /// chosen, not ambient.
 pub async fn reveal_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     match app.db.node(id) {
-        Ok(Some(node)) => Json(json!({"token": node.token})).into_response(),
+        Ok(Some(node)) => (
+            // A live credential, cached by nothing: not the browser (which would
+            // keep it on disk past a sign-out) and not a shared proxy cache.
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({"token": node.token})),
+        )
+            .into_response(),
         Ok(None) => no_such_node(),
         Err(e) => fail(e),
     }

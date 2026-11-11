@@ -67,17 +67,18 @@ function Slider({ label, value, min, max, render, onPick }: {
 }) {
   // The drag previews locally and commits once, on release: firing per step
   // sent one PUT per value on the way past, and whichever of those landed
-  // last won -- not necessarily the one the handle ended on. A draft differs
-  // from the saved value exactly while the save is in flight, so that
-  // comparison -- read here, not reconciled in an effect -- decides whether
-  // one is held: once the saved value echoes the draft, the draft is
-  // ignored, and a refused save leaves the red line this panel already
-  // shows to say so.
+  // last won -- not necessarily the one the handle ended on. The draft is
+  // dropped the moment it is committed: a refused save then snaps the thumb
+  // back to the saved value with the red line this panel already shows, and
+  // no half-forgotten draft can resurface on a later blur to overwrite
+  // settings saved in the meantime.
   const [draft, setDraft] = useState<number | null>(null)
-  const held = draft !== null && draft !== value ? draft : null
-  const shown = held ?? value
+  const shown = draft ?? value
   const commit = () => {
-    if (held !== null) onPick(held)
+    if (draft !== null && draft !== value) {
+      onPick(draft)
+    }
+    setDraft(null)
   }
   return (
     <label className="block">

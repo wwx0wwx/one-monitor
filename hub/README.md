@@ -154,7 +154,10 @@ server {
         proxy_http_version 1.1;
         # 导入备份与上传主题是分片传的，单片 4 MiB；这个数不随数据库增长。
         client_max_body_size 8m;
-        proxy_set_header Host              $host;
+        # $http_host, not $host: nginx's $host drops the port, and behind a
+        # non-default port the panel's Origin carries it -- the mismatch would
+        # refuse every write, sign-in included.
+        proxy_set_header Host              $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         # /api/agent/ws 与 /api/ws 是长连接。

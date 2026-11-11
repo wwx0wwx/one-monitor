@@ -47,7 +47,7 @@
 | `show_swap` | 卡片 SWAP 用量条 | on |
 | `show_speed` | 卡片实时网速 | on |
 | `show_billing` | 卡片到期时间与续费价格 | on |
-| `ip_capsule` | 进站时底部访客 IP 胶囊 | on |
+| `ip_capsule` | 进站时底部访客 IP 胶囊；开启后访客浏览器会把其 IP 发往 api.ip.sb 查询，请知悉再开 | off |
 | `expiring_group` | 「即将到期」筛选分组（7 天窗口自动进出） | on |
 | `region_group` | 国家/区域折叠筛选器 | on |
 

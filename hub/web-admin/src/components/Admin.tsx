@@ -1604,7 +1604,7 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
     } catch {
       return (
         <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": {"{{title}}"}
+          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
         </p>
       )
     }
