@@ -382,9 +382,9 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
-// Built here rather than fetched: the node list already carries the token, so
-// viewing an install command is a read rather than an action. Reissuing one to
-// display it would take the running agent offline.
+// Built here from the token the dialog read on opening: the list and the
+// stream frames carry none, and displaying a command is a read rather than an
+// action. Reissuing one to display it would take the running agent offline.
 function installCommand(site: string, token: string, seconds: number) {
   site = provisioningSite(site)
   if (!site) return ""
@@ -499,7 +499,11 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onClose: () => void
   onRotated: () => void
 }) {
-  const [token, setToken] = useState(node.token ?? "")
+  // The list carries no token -- it left every list and stream frame -- so the
+  // command's credential is read when the dialog opens. A read, not the
+  // reissue: displaying the command must not retire what the running agent
+  // holds; the button below does that, deliberately.
+  const [token, setToken] = useState("")
   const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
@@ -509,6 +513,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   const [proxy, setProxy] = useState<string | null>(null)
   const [proxyOn, setProxyOn] = useState(false)
   useEffect(() => {
+    api<{ token: string }>(`/nodes/${node.id}/token`)
+      .then((t) => setToken(t.token))
+      .catch(() => setToken(""))
     api<Settings>("/settings")
       .then((s) => {
         const stored = String(s.github_proxy ?? "")
@@ -516,7 +523,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         setProxyOn(stored !== "")
       })
       .catch(() => setProxy(""))
-  }, [])
+  }, [node.id])
 
   const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
   const command = token ? installCommand(site, token, seconds) : ""
@@ -587,9 +594,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
-              {/* A node added before the hub kept tokens has nothing to show
-                  until one is reissued. */}
-              {command || "旧版本创建的凭证不可读取，换发后显示"}
+              {/* The token read failed, or the dialog is still reading it;
+                  reissuing is the operator's explicit choice below. */}
+              {command || "凭证读取中，或不可读取——可换发后显示"}
             </pre>
           </div>
           <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
@@ -758,14 +765,17 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
             </TableRow>
           </TableHeader>
           <TableBody>
-            {visible.map((n, index) => (
+            {visible.map((n) => (
               <TableRow
                 key={n.id}
                 style={{ viewTransitionName: `node-${n.id}` }}
                 data-dragging={dragging === n.id || undefined}
                 className="transition-opacity data-[dragging]:opacity-40"
                 onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" }}
-                onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
+                onDragEnter={() =>
+                  dragging !== null &&
+                  move(order.findIndex((node) => node.id === dragging), order.findIndex((node) => node.id === n.id))
+                }
                 onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
               >
                 <TableCell>
@@ -773,9 +783,12 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                     <button
                       type="button"
                       draggable={!needle}
-                      // A drop sends the order of every node, and a filtered list
-                      // offers only its own rows to drop onto, so the index below
-                      // is the full one exactly while nothing is filtered out.
+                      // Both indices below are positions in the full `order`,
+                      // never in the filtered `visible` list the rows render
+                      // from: a group capsule or a search leaves the two out of
+                      // step, and an index from one spliced into the other
+                      // moves whatever happens to sit there -- a hidden node,
+                      // typically -- and saves that as the new order.
                       disabled={!!needle}
                       className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
                       title={needle ? "清空搜索后可拖动排序" : "拖动排序"}
@@ -793,7 +806,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                         if (!delta) return
                         e.preventDefault()
                         orderBeforeDrag.current = order.map((node) => node.id)
-                        const ids = move(index, index + delta)
+                        const at = order.findIndex((node) => node.id === n.id)
+                        const ids = move(at, at + delta)
                         if (ids) save(ids)
                       }}
                     >
@@ -1590,7 +1604,7 @@ function TemplatePreview({ template, site, json = false }: { template: string; s
     } catch {
       return (
         <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
+          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": {"{{title}}"}
         </p>
       )
     }
@@ -1806,7 +1820,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
         <h3 className="text-sm font-medium">事件</h3>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–30">
-            <Input type="number" min={1} max={30}value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
+            <Input type="number" min={1} max={30} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
           </Field>
           <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
             <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />

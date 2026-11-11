@@ -14,6 +14,10 @@ concurrency:
   group: ci-theme-${{ github.ref }}
   cancel-in-progress: true
 
+# The least these jobs need: they only read the checkout and publish nothing.
+permissions:
+  contents: read
+
 jobs:
   # The hub embeds a released archive, never this repository's source:
   # release-theme.yml builds a tag here and publishes theme.tar.gz, while the
@@ -24,8 +28,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 24
           cache: npm

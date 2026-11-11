@@ -65,19 +65,36 @@ function UrlField({ label, value, onCommit }: { label: string; value: string; on
 function Slider({ label, value, min, max, render, onPick }: {
   label: string; value: number; min: number; max: number; render: (v: number) => string; onPick: (v: number) => void
 }) {
+  // The drag previews locally and commits once, on release: firing per step
+  // sent one PUT per value on the way past, and whichever of those landed
+  // last won -- not necessarily the one the handle ended on. A draft differs
+  // from the saved value exactly while the save is in flight, so that
+  // comparison -- read here, not reconciled in an effect -- decides whether
+  // one is held: once the saved value echoes the draft, the draft is
+  // ignored, and a refused save leaves the red line this panel already
+  // shows to say so.
+  const [draft, setDraft] = useState<number | null>(null)
+  const held = draft !== null && draft !== value ? draft : null
+  const shown = held ?? value
+  const commit = () => {
+    if (held !== null) onPick(held)
+  }
   return (
     <label className="block">
       <span className="flex justify-between text-xs text-muted-foreground">
         {label}
-        <span className="tnum">{render(value)}</span>
+        <span className="tnum">{render(shown)}</span>
       </span>
       <input
         type="range"
         min={min}
         max={max}
         step={1}
-        value={value}
-        onChange={(e) => onPick(e.target.valueAsNumber)}
+        value={shown}
+        onChange={(e) => setDraft(e.target.valueAsNumber)}
+        onPointerUp={commit}
+        onKeyUp={commit}
+        onBlur={commit}
         className="mt-1 w-full accent-foreground"
       />
     </label>
@@ -315,7 +332,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
                   bg_position: "center", card_opacity: "70", card_blur: "64",
                   content_width: "1400", logo_url: "",
                   cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
-                  ip_capsule: "on", expiring_group: "on", region_group: "on",
+                  ip_capsule: "off", expiring_group: "on", region_group: "on",
                 })
               }
               className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"

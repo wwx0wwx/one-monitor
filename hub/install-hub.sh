@@ -12,7 +12,11 @@ set -eu
 # useradd resides in sbin, which a root shell entered through `su` without `-`
 # lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH is set, and
 # Debian does not set it.
-PATH="$PATH:/usr/sbin:/sbin"
+# Reset rather than extend: this script runs as root, and the caller's PATH is
+# caller-controlled terrain when it arrives from `curl | sh`. The system
+# directories carry everything used here, including the sbin binaries a root
+# shell entered through `su` without `-` lacks on Debian.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 REPO="wwx0wwx/one-monitor"
 # Which hub release to install. The monorepo's releases also carry the agent
@@ -21,7 +25,7 @@ REPO="wwx0wwx/one-monitor"
 # in the same change that cuts the tag -- forgetting leaves plain installs one
 # release behind, not broken. `--version latest` follows the redirect instead,
 # and `--version <tag>` installs any release by name.
-VERSION="v1.5.4"
+VERSION="v1.6.0"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
@@ -497,6 +501,11 @@ if [ -n "$SITE" ]; then
 	*/*) die "--site 后面不能带路径，只要 https://域名[:端口]：$SITE" ;;
 	*@*) die "--site 里不能带用户名：$SITE" ;;
 	"["*) die "--site 必须是域名，不能是 IP 地址：$SITE" ;;
+	esac
+	# The value is written into the unit's ExecStart by heredoc: whitespace in
+	# it would become extra arguments there, and a newline a new unit line.
+	case "$SITE" in
+	*[[:space:]]*) die "--site 不能包含空白字符：$SITE" ;;
 	esac
 	# A port is permitted; what precedes it must be a name rather than an
 	# address.

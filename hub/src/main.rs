@@ -12,6 +12,8 @@ mod frontend;
 mod geo;
 mod notify;
 
+use sha2::Digest;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -96,14 +98,22 @@ impl App {
     /// header. Marking the cookie Secure over plain HTTP would cause the browser
     /// to discard the session.
     ///
-    /// The header is supplied by the trusted reverse proxy. Provisioning also
-    /// checks it along with the request's Host/Origin; the listener must remain
-    /// publicly unreachable so callers cannot bypass that proxy.
+    /// When no proxy header is present the browser's own `Origin` -- set on
+    /// every POST the panel makes, and not a header a plain-HTTP page can fake
+    /// for its https counterpart -- and Cloudflare's `CF-Visitor` are tried, in
+    /// that order: both name the scheme the browser actually used where a proxy
+    /// that forwards neither would leave it unknown.
+    ///
+    /// The proxy headers are supplied by the trusted reverse proxy. Provisioning
+    /// also checks them along with the request's Host/Origin; the listener must
+    /// remain publicly unreachable so callers cannot bypass that proxy.
     pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
         if !self.site.is_empty() {
             return !self.site.starts_with("http://");
         }
-        forwarded_proto(headers) == Some("https")
+        forwarded_proto(headers).is_some_and(|p| p == "https")
+            || origin_is_https(headers)
+            || cf_visitor_https(headers)
     }
 }
 
@@ -114,6 +124,95 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
     Some(chain.split(',').next()?.trim())
 }
 
+/// The scheme of the request's own `Origin`, which the browser sets on every
+/// cross-origin-capable write the panel issues. Unlike the proxy headers this
+/// one is minted by the browser from the address bar, so behind a proxy that
+/// forwards no `X-Forwarded-Proto` it is still the truth.
+fn origin_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|origin| reqwest::Url::parse(origin).ok())
+        .is_some_and(|url| url.scheme() == "https")
+}
+
+/// Cloudflare's own report of the scheme the browser used, present when the
+/// orange cloud fronts the hub. `{"scheme":"https"}` exactly; anything else is
+/// not a claim of https.
+fn cf_visitor_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("cf-visitor")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+        .is_some_and(|v| v.get("scheme") == Some(&serde_json::json!("https")))
+}
+
+/// Rejects a browser write that names a site other than this one.
+///
+/// SameSite=Lax already keeps the session cookie off a cross-site POST, and the
+/// JSON extractor refuses the content types a plain form can carry; this is the
+/// third lock, closing what neither covers: a cross-site request that carries no
+/// cookie at all, such as a sign-in CSRF that posts credentials from another
+/// page. Only a request that both carries `Origin` and names a different host
+/// is refused -- curl, the agent installer and the agents themselves send no
+/// Origin and pass untouched, and a read is never refused.
+pub async fn same_origin(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    if path.starts_with("/api/")
+        && !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS)
+    {
+        let headers = req.headers();
+        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        if let Some((origin, host)) = origin.zip(host) {
+            if !origin_names_host(origin, host) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "请求被拒绝：来源站点与面板地址不一致（反代需透传 Host 与 Origin）",
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// Whether `Origin` (an absolute URL) addresses the same host the request's
+/// `Host` header names. Hostnames match case-insensitively; an explicit port in
+/// `Origin` must appear in `Host` too, and a bracketed IPv6 literal compares by
+/// its address rather than its spelling with brackets.
+fn origin_names_host(origin: &str, host: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else { return false };
+    let Some(origin_host) = url.host_str() else { return false };
+    let host = host.split('/').next().unwrap_or("");
+    let (host_name, host_port) = match host.rsplit_once(':') {
+        // A port, not the colon inside an unbracketed IPv6 literal (which the
+        // Host header never carries) or a bracketed one (whose brackets keep
+        // the address intact for the strip below).
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            (name, Some(port))
+        }
+        _ => (host, None),
+    };
+    // Both sides may or may not carry the brackets of an IPv6 literal --
+    // `Host` writes them, `Url::host_str` keeps them -- so the comparison
+    // strips them from each rather than from one.
+    fn unbracketed(v: &str) -> &str {
+        v.trim_start_matches('[').trim_end_matches(']')
+    }
+    if !unbracketed(host_name).eq_ignore_ascii_case(unbracketed(origin_host)) {
+        return false;
+    }
+    match (url.port(), host_port) {
+        // The origin names the port the browser used; Host agreeing on the
+        // hostname is all a default port can say.
+        (None, _) => true,
+        (Some(port), Some(named)) => port.to_string() == named,
+        (Some(_), None) => false,
+    }
+}
+
 /// Where the agent binaries are published, and at which codename release. The
 /// repository also publishes the hub and the themes, so "latest" no longer
 /// names an agent release; the codename does, and moving to the next one (pio →
@@ -121,6 +220,46 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 /// settings: redirecting them implies a fork, which rebuilds these lines anyway.
 const AGENT_REPO: &str = "wwx0wwx/one-monitor";
 const AGENT_TAG: &str = "pio";
+
+/// The sha256 of every agent binary `AGENT_TAG` published, `<arch> <sha>` per
+/// line, beside `web-theme.pin` and held to the same discipline: the digest is
+/// committed in the same change that moves `AGENT_TAG`, so a release and the
+/// bytes it names cannot drift apart. This is what turns the relay below from
+/// "bytes as GitHub or the configured mirror serves them" into "bytes this
+/// build was pinned to": a `github_proxy` can no longer swap the binary that
+/// `install.sh` runs as root, because whatever arrives must hash to a value
+/// already in this repository.
+const AGENT_PIN: &str = include_str!("../agent.pin");
+
+/// The digest `AGENT_PIN` names for `arch`, if the pin file holds one. A pin
+/// without the architecture serves no bytes at all rather than unverified ones.
+fn pinned_sha(arch: &str) -> Option<&'static str> {
+    AGENT_PIN.lines().find_map(|line| {
+        let (name, sha) = line.trim().split_once(' ')?;
+        (name == arch && !sha.is_empty()).then_some(sha)
+    })
+}
+
+/// An agent binary is under 2 MiB; anything past this is not one, and a
+/// hostile mirror answering with an endless stream is cut off here rather
+/// than filling the memory the unit file allows.
+const MAX_AGENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Reads a response body up to `cap` bytes and no further. `Response::bytes`
+/// would buffer whatever arrives; the two places that fetch fixed-size
+/// artifacts from outside -- the agent release and a geoip database -- cap the
+/// answer instead, so a mirror that misbehaves costs one error, not the memory
+/// the unit file allows.
+pub(crate) async fn read_capped(res: &mut reqwest::Response, cap: u64) -> Result<Vec<u8>, anyhow::Error> {
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if out.len() as u64 + chunk.len() as u64 > cap {
+            anyhow::bail!("the answer is larger than the {cap} bytes this fetch allows");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -167,93 +306,65 @@ pub fn proxied(app: &App, url: String) -> String {
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
 
-/// Longest a relay may hold its permit.
-///
-/// Deliberately generous, since a node on a slow link must still transfer
-/// 1.8 MB; what it rules out is a transfer that never completes.
+/// Longest a relay may hold its permit: the fetch and the hash, not the send --
+/// the response body is a buffer already in memory, so a client that stops
+/// reading cannot stretch a permit past the download it paid for.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// Holds a relay permit until the last byte has been sent. The handler returns
-/// once the response head is built, so a permit dropped there would gate only
-/// the fetch and leave the transfer -- the expensive part -- unbounded.
-///
-/// The permit is not held here, because "until the last byte" has no upper bound
-/// of its own: a client that stops reading leaves hyper unable to flush, hyper
-/// then stops polling this stream, and a deadline checked in `poll_next` would
-/// never run -- nor would the upstream timeout on the reqwest body, which is
-/// equally poll-driven. Four connections that accept the response and never read
-/// it would hold all four slots for as long as they remained open, and
-/// `/agent/{arch}` is the path every node installs through. The permit therefore
-/// belongs to a task with its own timer, and this end of the channel -- dropped
-/// with the body, whether it completed or the connection died -- releases it
-/// early.
-struct Metered<S> {
-    inner: S,
-    _done: tokio::sync::oneshot::Sender<()>,
-}
-
-/// Wraps `inner` and parks `permit` on a task that releases it when the body is
-/// dropped or [`RELAY_DEADLINE`] elapses, whichever comes first.
-fn metered<S>(inner: S, permit: tokio::sync::SemaphorePermit<'static>) -> Metered<S> {
-    let (_done, body_gone) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        // Either arm ends the task, which drops the permit. `body_gone` resolves
-        // as an error the moment the sender is dropped, which is the signal.
-        let _permit = permit;
-        let _ = tokio::time::timeout(RELAY_DEADLINE, body_gone).await;
-    });
-    Metered { inner, _done }
-}
-
-impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
-    type Item = S::Item;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
 
 /// Serves the agent binary from the hub itself, so a node that can reach the hub
 /// can install without reaching GitHub: IPv6-only machines cannot resolve
 /// github.com, and neither can blocked networks.
 ///
-/// ponytail: these bytes are relayed unverified, and `install.sh` executes them
-/// as root on every node. Fetched directly from github.com that is TLS's
-/// concern; through the panel's `github_proxy` it rests on the mirror alone.
-/// Currently held by the setting accepting https:// only, and by stating so
-/// where it is entered. The upgrade path is a pinned digest -- `agent.pin`
-/// beside `web-theme.pin`, a fixed release tag, hashed after the fetch and
-/// before the relay (4 permits x 1.73 MiB against MemoryMax=256M, so buffering
-/// is free). Not a fetched checksum: whoever can replace the binary can replace
-/// that too. Deliberately deferred, as it couples agent releases to hub
-/// releases.
+/// The bytes are verified against `AGENT_PIN` after the fetch and before a byte
+/// is relayed, so what `install.sh` executes as root is what this repository
+/// was pinned to -- not what GitHub, or the `github_proxy` mirror the panel
+/// fronts it with, happens to serve today. A mismatch refuses the install
+/// loudly rather than passing it on quietly; an operator who sees it should
+/// suspect the mirror, not fix it by removing the pin.
+///
+/// Buffered rather than streamed for that check: four permits x 1.8 MiB against
+/// the unit file's MemoryMax=256M leaves the ceiling far away, and a hash needs
+/// the whole body anyway.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
     }
-    let Ok(permit) = RELAY_GATE.try_acquire() else {
+    let Some(pinned) = pinned_sha(&arch) else {
+        warn!("agent.pin holds no digest for {arch}; refusing to relay unverified bytes");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no pinned digest for this architecture").into_response();
+    };
+    let Ok(_permit) = RELAY_GATE.try_acquire() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
     };
     let url = release_url(&app, &arch);
     // The default client timeout is sized for API calls, not a 1.8 MB download.
-    let fetched = app.http.get(&url).timeout(std::time::Duration::from_secs(120)).send().await;
-    match fetched {
-        // Streamed rather than collected: holding each release in full would put
-        // a few hundred parallel requests within reach of the unit file's memory
-        // ceiling. Passing the bytes through costs one buffer per request.
-        Ok(res) if res.status().is_success() => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
-        )
-            .into_response(),
+    let fetched = app.http.get(&url).timeout(RELAY_DEADLINE).send().await;
+    let res = match fetched {
+        Ok(res) if res.status().is_success() => res,
         Ok(res) => {
-            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
+            return (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status()))
+                .into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+    };
+    let mut res = res;
+    let bytes = match read_capped(&mut res, MAX_AGENT_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
+    };
+    let got = hex::encode(sha2::Sha256::digest(&bytes));
+    if got != pinned {
+        // The pin, the tag, and the mirror disagree. Never the caller's fault,
+        // and never something to serve anyway: these bytes run as root.
+        warn!(
+            "agent binary {arch} hashes to {got}, not the {pinned} agent.pin names; \
+             refusing to relay. If AGENT_TAG moved without agent.pin, fix the pin; \
+             if it did not, the github_proxy mirror is serving something else"
+        );
+        return (StatusCode::BAD_GATEWAY, "release does not match the pinned digest; refusing")
+            .into_response();
     }
+    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
 // ---- startup ----
@@ -403,7 +514,7 @@ async fn main() -> Result<()> {
         .route("/api/register-window", post(api::open_register).delete(api::close_register))
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
-        .route("/api/nodes/{id}/token", post(api::reset_token))
+        .route("/api/nodes/{id}/token", get(api::reveal_token).post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
@@ -420,6 +531,9 @@ async fn main() -> Result<()> {
         .route("/api/db/vacuum", post(api::db_vacuum))
         .route("/api/geoip/update", post(api::geoip_update))
         .fallback(frontend::serve)
+        // Cross-site writes are refused before any handler spends anything on
+        // them; reads, and requests without an Origin at all, pass through.
+        .layer(axum::middleware::from_fn(same_origin))
         // A report is a few hundred bytes; anything larger is not a report.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         // The two chunked uploads, merged after that layer rather than beneath
@@ -813,49 +927,48 @@ mod tests {
         assert!(app.public_page());
     }
 
-    /// A stream that ends immediately, standing in for a release.
-    struct Nothing;
-
-    impl futures_core::Stream for Nothing {
-        type Item = ();
-
-        fn poll_next(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<()>> {
-            std::task::Poll::Ready(None)
+    /// The pin names both architectures the relay serves, in the one digest
+    /// format the check reads, and nothing for an architecture it does not.
+    /// A line of the wrong shape is skipped rather than half-parsed: the check
+    /// that consumes this refuses to serve without a digest, so a malformed pin
+    /// stops installs instead of weakening them.
+    #[test]
+    fn the_agent_pin_names_both_architectures_and_only_them() {
+        for arch in ["x86_64", "aarch64"] {
+            let sha = pinned_sha(arch).unwrap_or_else(|| panic!("{arch} must be pinned"));
+            assert_eq!(sha.len(), 64, "{arch}: a sha256 is 64 hex characters");
+            assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{arch}: hex only");
         }
+        assert!(pinned_sha("riscv64").is_none(), "an unpinned architecture has no digest");
     }
 
-    /// The gate is worthless if the permit is released when the handler returns:
-    /// the head is built in microseconds while the 1.8 MB behind it is the cost.
-    /// The permit therefore outlives the handler, and -- since "until the last
-    /// byte" is the client's decision -- no longer than RELAY_DEADLINE.
-    #[tokio::test(start_paused = true)]
-    async fn a_relay_permit_follows_the_body_but_not_past_the_deadline() {
-        let queued: Vec<_> =
-            (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
-        let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
-        tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
-
-        // A body that ends, or a connection that dies, returns the slot
-        // immediately rather than waiting out the deadline.
-        drop(body);
-        tokio::task::yield_now().await;
-        let finished = RELAY_GATE.try_acquire().expect("a finished download gives its slot back");
-        drop(finished);
-
-        // A client that accepts the response and then reads nothing never polls
-        // the body, so the body cannot time itself out. Only an independent timer
-        // can, which is why the permit does not travel with it.
-        let stalled = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
-        tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err());
-        tokio::time::advance(RELAY_DEADLINE + std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_ok(), "a transfer that never finishes still gives its slot back");
-        drop((stalled, queued));
+    /// What the cross-origin gate compares: an Origin naming the Host passes in
+    /// every spelling the panel and its proxies produce, and one naming anything
+    /// else does not. Ports are compared when the Origin carries one, and an
+    /// IPv6 literal compares by its address rather than its brackets.
+    #[test]
+    fn an_origin_is_judged_against_the_host_it_names() {
+        let ok = [
+            ("https://hub.example.com", "hub.example.com"),
+            ("https://hub.example.com", "hub.example.com:443"),
+            ("https://hub.example.com:8443", "hub.example.com:8443"),
+            ("http://127.0.0.1:28080", "127.0.0.1:28080"),
+            ("http://[::1]:28080", "[::1]:28080"),
+            ("https://HUB.Example.com", "hub.example.com"),
+        ];
+        for (origin, host) in ok {
+            assert!(origin_names_host(origin, host), "{origin} names {host}");
+        }
+        let refused = [
+            ("https://evil.example", "hub.example.com"),
+            ("https://hub.example.com:9999", "hub.example.com"),
+            ("https://hub.example.com:9999", "hub.example.com:8443"),
+            ("https://127.0.0.1:28080@evil.example", "127.0.0.1:28080"),
+            ("not a url", "hub.example.com"),
+        ];
+        for (origin, host) in refused {
+            assert!(!origin_names_host(origin, host), "{origin} must not pass for {host}");
+        }
     }
 
     /// The proxy is a hub setting rather than an install-command argument, so

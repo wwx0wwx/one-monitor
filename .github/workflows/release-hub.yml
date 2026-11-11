@@ -13,6 +13,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # The narrower of the two grants: this job only compiles and uploads
+    # artifacts, and the release below keeps the tag-push write it needs. A
+    # compromised build step (a dependency, an action) holds a read-only token
+    # rather than one that can rewrite releases.
+    permissions:
+      contents: read
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
@@ -20,7 +26,7 @@ jobs:
       run:
         working-directory: hub
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       # The default theme arrives as a published archive, verified against the
       # hash in web-theme.pin. Run on the runner rather than left to build.rs,
@@ -28,7 +34,7 @@ jobs:
       # finds the theme already unpacked.
       - run: ./scripts/theme.sh
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 24
           cache: npm
@@ -39,11 +45,11 @@ jobs:
       - run: npm ci && npm run build
         working-directory: hub/web-admin
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           targets: ${{ matrix.target }}
 
-      - run: cargo install --locked cross
+      - run: cargo install --locked --version 0.2.5 cross
       - run: cross build --release --locked --target ${{ matrix.target }}
 
       # collect from target/ (the defaults keep this step in hub/) to the
@@ -51,7 +57,7 @@ jobs:
       # the bare asset names.
       - run: cp "target/${{ matrix.target }}/release/monitor-hub" "../monitor-hub-${{ matrix.target }}"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: ${{ matrix.target }}
           path: monitor-hub-${{ matrix.target }}
@@ -64,8 +70,8 @@ jobs:
       packages: write
     steps:
       # The Dockerfile lives in the repo; the binaries it copies do not.
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           path: bin
           merge-multiple: true

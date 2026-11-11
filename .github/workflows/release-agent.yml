@@ -16,6 +16,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Read-only, as in release-hub: the publish job alone keeps the write.
+    permissions:
+      contents: read
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
@@ -23,18 +26,18 @@ jobs:
       run:
         working-directory: agent
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo install --locked cross
+      - run: cargo install --locked --version 0.2.5 cross
       - run: cross build --release --locked --target ${{ matrix.target }}
       # install.sh downloads exactly this name; changing it breaks every
       # install command the hub issues. Collected to the repository root
       # (this step runs in agent/ via the defaults), where the artifact
       # upload and the release job expect bare names.
       - run: cp "target/${{ matrix.target }}/release/monitor-agent" "../monitor-agent-${{ matrix.target }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: ${{ matrix.target }}
           path: monitor-agent-${{ matrix.target }}
@@ -43,7 +46,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           merge-multiple: true
       # A manual dispatch builds and collects the binaries; only a tag publishes,

@@ -74,6 +74,23 @@ fn verify_password(password: &str, stored: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The throttle key for an address: the address itself, except that IPv6
+/// counts by its /64. One subscriber holds a /64, so the addresses in it are
+/// one party as often as they are many -- and a caller who owns the prefix can
+/// mint a fresh address per attempt, which by exact address would give every
+/// attempt its own empty counter. Counted by prefix, those attempts pool into
+/// the lockout they are trying to escape.
+pub(crate) fn throttle_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let masked = [segments[0], segments[1], segments[2], segments[3], 0, 0, 0, 0];
+            IpAddr::V6(masked.into())
+        }
+    }
+}
+
 /// Per-address failure counter for the password endpoint.
 pub struct Throttle {
     seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -90,6 +107,7 @@ impl Default for Throttle {
 
 impl Throttle {
     pub(crate) fn locked(&self, ip: IpAddr) -> bool {
+        let ip = throttle_key(ip);
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         match map.get(&ip) {
             Some((n, since)) if since.elapsed() < self.window => *n >= MAX_ATTEMPTS,
@@ -102,6 +120,7 @@ impl Throttle {
     }
 
     pub(crate) fn record_failure(&self, ip: IpAddr) {
+        let ip = throttle_key(ip);
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         // Addresses past their window are dropped here rather than allowed to
         // accumulate, which also restarts the count for a returning address.
@@ -110,6 +129,7 @@ impl Throttle {
     }
 
     pub(crate) fn clear(&self, ip: IpAddr) {
+        let ip = throttle_key(ip);
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip);
     }
 }
@@ -187,18 +207,42 @@ fn totp_at(secret: &[u8], step: i64) -> String {
 /// The step a code is checked against, 30 seconds as every authenticator uses.
 const TOTP_STEP: i64 = 30;
 
-/// True when `code` is what an authenticator derived from `secret` shows now,
-/// one step ago, or one step ahead -- the drift a clock-skewed phone needs.
-fn totp_matches(secret: &str, code: &str) -> bool {
-    let Ok(secret) = BASE32_NOPAD.decode(secret.to_ascii_uppercase().as_bytes()) else { return false };
+/// The step `code` was derived from, if `secret` produces it now, one step ago,
+/// or one step ahead -- the drift a clock-skewed phone needs. The highest
+/// matching step is the answer, so replay bookkeeping never walks backwards.
+///
+/// The comparison is exact only, across all three steps, with no early return:
+/// constant-time enough for six digits compared as strings.
+fn totp_step_matched(secret: &str, code: &str) -> Option<i64> {
+    let Ok(secret) = BASE32_NOPAD.decode(secret.to_ascii_uppercase().as_bytes()) else { return None };
     let now = Utc::now().timestamp();
-    // Constant-time enough for six digits compared as strings, and exact
-    // comparison only: no early return on the first matching step.
-    let mut hit = false;
+    let mut hit = None;
     for drift in [-1, 0, 1] {
-        hit |= totp_at(&secret, (now + drift * TOTP_STEP) / TOTP_STEP) == code;
+        let step = (now + drift * TOTP_STEP) / TOTP_STEP;
+        if totp_at(&secret, step) == code {
+            hit = Some(hit.unwrap_or(step).max(step));
+        }
     }
     hit
+}
+
+/// The last time step whose code was accepted, from `setting`. Codes for steps
+/// at or before it are replays: six digits are guessable in a phished window,
+/// but only once. Absent on a hub that has never accepted a code, and on one
+/// whose second factor is unbound again.
+fn totp_last_step(app: &App) -> i64 {
+    app.db.get("totp_last_step").and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Refuses a code whose step was already spent, and records the step it accepts.
+/// A code verified here can still be typed into the sign-in page within its
+/// window without this -- the two halves of one credential, spent separately.
+fn totp_fresh(app: &App, secret: &str, code: &str) -> bool {
+    let Some(step) = totp_step_matched(secret, code) else { return false };
+    if step <= totp_last_step(app) {
+        return false;
+    }
+    app.db.set("totp_last_step", &step.to_string()).is_ok()
 }
 
 /// Whether a second factor is bound, the flag the sign-in page needs.
@@ -246,10 +290,12 @@ pub async fn login(
                 let Some(secret) = app.db.get("totp_secret").filter(|s| !s.is_empty()) else {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "second factor unreadable").into_response();
                 };
-                if !totp_matches(&secret, &code) {
+                if !totp_fresh(&app, &secret, &code) {
                     // Counted like a wrong password: the code is the other half
                     // of the credential, and an unlimited guessing room against
-                    // six digits would spend them all.
+                    // six digits would spend them all. A code already accepted
+                    // lands here too, whatever half of the credential it
+                    // completed.
                     app.throttle.record_failure(ip);
                     return (StatusCode::UNAUTHORIZED, "invalid authenticator code").into_response();
                 }
@@ -301,9 +347,11 @@ pub async fn totp_confirm(
     State(app): State<crate::Shared>,
     Json(body): Json<TotpConfirm>,
 ) -> Response {
-    if !totp_matches(&body.secret, body.code.trim()) {
+    if !totp_fresh(&app, &body.secret, body.code.trim()) {
         return (StatusCode::BAD_REQUEST, "验证码不正确，请确认时间同步后重试").into_response();
     }
+    // `totp_fresh` has spent the confirming code: it must not open the sign-in
+    // page as well, inside the same window, through the secret it just bound.
     match app.db.set("totp_secret", body.secret.trim()) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -311,8 +359,11 @@ pub async fn totp_confirm(
 }
 
 /// Removes the second factor. An authenticated session stands behind this, as
-/// behind every panel write.
+/// behind every panel write. The replay mark goes with it: a re-bound factor
+/// starts its bookkeeping over rather than inheriting a step from a secret that
+/// no longer exists.
 pub async fn totp_disable(_: crate::api::Admin, State(app): State<crate::Shared>) -> Response {
+    let _ = app.db.set("totp_last_step", "0");
     match app.db.set("totp_secret", "") {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -494,11 +545,11 @@ mod tests {
 
         // A secret no authenticator could hold decodes to nothing and matches
         // nothing, rather than passing every check.
-        assert!(!totp_matches("not base32!!", "000000"));
+        assert_eq!(totp_step_matched("not base32!!", "000000"), None::<i64>);
         // The code for a far-away step does not verify.
         let far = totp_at(&key, 0);
         if totp_at(&key, Utc::now().timestamp() / TOTP_STEP) != far {
-            assert!(!totp_matches(secret, &far));
+            assert_eq!(totp_step_matched(secret, &far), None::<i64>);
         }
     }
 
@@ -527,6 +578,42 @@ mod tests {
         assert_eq!(cookie_value(&h, COOKIE).as_deref(), Some("abc123"));
         assert_eq!(cookie_value(&h, "missing"), None);
         assert_eq!(cookie_value(&HeaderMap::new(), COOKIE), None);
+    }
+
+    /// IPv6 addresses inside one /64 share a lockout, and an address outside it
+    /// has its own. The prefix, not the exact address, is the party.
+    #[test]
+    fn ipv6_attempts_pool_into_their_slash_64() {
+        let t = Throttle::default();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let a1 = ip("2001:db8:1:2:3:4:5:6");
+        let a2 = ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd");
+        let outside = ip("2001:db8:1:3::1");
+
+        for _ in 0..MAX_ATTEMPTS {
+            t.record_failure(a1);
+        }
+        assert!(t.locked(a1), "the address that failed is locked");
+        assert!(t.locked(a2), "a neighbour in the same /64 shares the lockout");
+        assert!(!t.locked(outside), "the next /64 has its own count");
+
+        t.clear(a2);
+        assert!(!t.locked(a1), "clearing one address clears the shared bucket");
+    }
+
+    /// A code matches its step and its neighbours, and reports the highest step
+    /// it matched: replay bookkeeping that walked backwards would unlock a code
+    /// it had already spent.
+    #[test]
+    fn a_matching_code_reports_its_highest_step() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let key = BASE32_NOPAD.decode(secret.as_bytes()).unwrap();
+        let now = Utc::now().timestamp() / TOTP_STEP;
+        assert_eq!(totp_step_matched(secret, &totp_at(&key, now)), Some(now));
+        // The neighbour behind matches, and names its own step.
+        assert_eq!(totp_step_matched(secret, &totp_at(&key, now - 1)), Some(now - 1));
+        // Anything else is not a match at all.
+        assert_eq!(totp_step_matched(secret, "000000"), None::<i64>);
     }
 
     #[test]

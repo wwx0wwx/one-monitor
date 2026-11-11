@@ -125,6 +125,11 @@ fn download_url(app: &App) -> (String, Option<(String, String)>) {
 ///
 /// Off the call path: the caller is the manual update button. The file lands
 /// whole under a temporary name first, so a half-downloaded database never
+/// Ceiling on one provider download, compressed or not. A real database is
+/// tens of MiB; the number exists so a hijacked or misbehaving endpoint cannot
+/// hold the hub's memory instead.
+const MAX_DATABASE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// becomes the one lookups read.
 pub async fn download(app: &App) -> Result<(String, i64)> {
     let name = provider(app);
@@ -146,13 +151,27 @@ pub async fn download(app: &App) -> Result<(String, i64)> {
         }
         let fetched = request.send().await.and_then(|res| res.error_for_status());
         let bytes = match fetched {
-            Ok(res) => match res.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    last_err = e.into();
+            Ok(res) => {
+                // Both providers' databases are tens of MiB; anything larger is
+                // not one, and an answer that never ends would otherwise fill
+                // the memory the unit file allows before a byte of it reaches
+                // the mmdb parser.
+                if res.content_length().is_some_and(|len| len > MAX_DATABASE_BYTES) {
+                    last_err = anyhow::anyhow!(
+                        "the answer is {} bytes, larger than any database",
+                        res.content_length().unwrap_or_default()
+                    );
                     continue;
                 }
-            },
+                let mut res = res;
+                match crate::read_capped(&mut res, MAX_DATABASE_BYTES).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
+                }
+            }
             Err(e) => {
                 last_err = e.into();
                 continue;
@@ -164,7 +183,10 @@ pub async fn download(app: &App) -> Result<(String, i64)> {
         let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
             let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out).context("gunzip")?;
+            // The same ceiling on the way out of the stream: a small gzip that
+            // expands without end is the other shape an oversized answer takes.
+            let mut limited = std::io::Read::take(&mut decoder, MAX_DATABASE_BYTES);
+            std::io::Read::read_to_end(&mut limited, &mut out).context("gunzip")?;
             out
         } else {
             bytes.to_vec()

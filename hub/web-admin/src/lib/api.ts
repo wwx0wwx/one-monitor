@@ -59,8 +59,6 @@ export type Node = {
   ipv4?: string
   ipv6?: string
   remark?: string
-  /** Panel only. Empty for nodes created before the hub retained a copy. */
-  token?: string
   /** Panel only. Whether going offline and returning are announced. */
   notify?: boolean
   /** Panel only. Whether an expiry date past due rolls forward whole billing
