@@ -77,7 +77,7 @@ export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings 
       swap: flag(raw, "show_swap", true),
       speed: flag(raw, "show_speed", true),
       billing: flag(raw, "show_billing", true),
-      ipCapsule: flag(raw, "ip_capsule", true),
+      ipCapsule: flag(raw, "ip_capsule", false),
       expiring: flag(raw, "expiring_group", true),
       region: flag(raw, "region_group", true),
     },

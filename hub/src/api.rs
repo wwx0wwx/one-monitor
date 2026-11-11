@@ -40,6 +40,16 @@ fn fail(e: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
 }
 
+/// `fail` for a handler an anonymous caller can reach. The anyhow chain often
+/// names filesystem paths and SQLite details; behind `Admin` that is the
+/// operator's own hub, on a public route it is a free look inside. The detail
+/// goes to the log, where the operator reads it, and the caller gets the same
+/// sentence whatever went wrong.
+fn fail_public(e: impl std::fmt::Display) -> Response {
+    tracing::warn!("public route failed: {e:#}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error; see the hub's log").into_response()
+}
+
 fn bad(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
 }
@@ -146,15 +156,17 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
             m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
         }
     }
-    // Address, private notes and the token never leave the panel. The token is
-    // included so the install command can be displayed without reissuing it.
+    // Address and private notes never leave the panel. The token is no longer
+    // among them either: it left the list and the admin stream for a read of its
+    // own (`GET /nodes/{id}/token`), so a credential that installs software as
+    // root is handed to an open dialog rather than living in every frame and
+    // every list response, however short the panel's own session.
     if full {
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
-        view["token"] = json!(node.token);
         view["notify"] = json!(node.notify);
         view["auto_renew"] = json!(node.auto_renew);
     }
@@ -285,7 +297,7 @@ pub async fn metrics(
     .await;
     match built.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(body) => Json(body).into_response(),
-        Err(e) => fail(e),
+        Err(e) => fail_public(e),
     }
 }
 
@@ -402,6 +414,14 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
 /// Live stream for the browser. Each connection runs its own timer -- simpler to
 /// reason about than a fan-out channel -- over a shared snapshot, so a timer
 /// costs no more than a send.
+///
+/// Anonymous streams are capped: each costs a timer task and a socket held open
+/// indefinitely, and the public page is reachable by anyone. Past the cap the
+/// upgrade is refused with 503 and the browser falls back to the same polling
+/// it already uses when a stream dies -- a slower public page, not a dead one.
+/// Signed-in streams are not counted against the same gate: the panel is one
+/// operator, and an operator must not be locked out of the live view by
+/// visitors.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
@@ -409,13 +429,30 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     if session.is_none() && !app.public_page() {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
+    let slot = session.is_none().then(|| VIEWER_GATE.try_acquire().ok()).flatten();
+    if session.is_none() && slot.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many viewers, retry or poll /api/nodes")
+            .into_response();
+    }
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
         .max_message_size(MAX_FRAME)
-        .on_upgrade(move |socket| stream_live(app, socket, session))
+        .on_upgrade(move |socket| stream_live(app, socket, session, slot))
 }
 
-async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>) {
+/// How many anonymous live streams may run at once. A public page should carry
+/// far fewer viewers than this; the number exists so that "open ten thousand
+/// tabs" costs an attacker ten thousand refusals, not ten thousand tasks.
+const VIEWER_SLOTS: usize = 1000;
+static VIEWER_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VIEWER_SLOTS);
+
+async fn stream_live(
+    app: Shared,
+    mut socket: WebSocket,
+    session: Option<String>,
+    // Held until the stream ends; dropped with everything else in this frame.
+    _slot: Option<tokio::sync::SemaphorePermit<'static>>,
+) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     loop {
         ticker.tick().await;
@@ -668,21 +705,23 @@ pub async fn agent_register(
         Ok(n) if n >= REGISTER_LIMIT => {
             return (StatusCode::FORBIDDEN, "this window has registered enough nodes").into_response()
         }
-        Err(e) => return fail(e),
+        Err(e) => return fail_public(e),
         Ok(_) => {}
     }
 
-    // The name comes from a machine not yet vouched for: control characters would
-    // break the panel's rows, and the length must be bounded. `chars()` rather
-    // than bytes, so the cut falls on a character boundary.
-    let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
+    // The name comes from a machine not yet vouched for, and is shown to every
+    // visitor until the operator renames the node: control characters break the
+    // panel's rows and markup characters reach themes that render them as HTML,
+    // so `reported_text` drops both. Trimmed after: a name made only of what it
+    // drops must come out empty, not as a blank.
+    let name: String = crate::db::reported_text(name.trim(), 64).trim().to_owned();
     let name = if name.is_empty() { "unnamed".to_owned() } else { name };
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
     // and a node registered here must match one added through the panel.
     let node = match serde_json::from_value::<Node>(json!({ "name": name })) {
         Ok(node) => node,
-        Err(e) => return fail(e),
+        Err(e) => return fail_public(e),
     };
     let token = random_token();
     match app.db.create_node(&node, &token) {
@@ -692,7 +731,7 @@ pub async fn agent_register(
             invalidate_snapshot(&app);
             token.into_response()
         }
-        Err(e) => fail(e),
+        Err(e) => fail_public(e),
     }
 }
 
@@ -792,6 +831,23 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
 /// Issues a fresh token, invalidating the old one immediately.
 ///
 /// Always an explicit action: rotate a token believed to have leaked, then
+/// The node's existing install token, for the dialog that assembles the
+/// command. A read, not a reissue: opening the install dialog must not retire
+/// the credential a running agent is using. This is the only place the token
+/// leaves the database now -- the list and the admin stream carry none -- so
+/// what an open panel exposes to a shoulder-surfer or a stray screenshot is
+/// chosen, not ambient.
+pub async fn reveal_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.node(id) {
+        Ok(Some(node)) => Json(json!({"token": node.token})).into_response(),
+        Ok(None) => no_such_node(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Retires the token and returns the replacement, with the running agent
+/// dropped so it reconnects against the new one. The command the panel built
+/// with the old one is dead from here on; the operator must
 /// reinstall the agent. Reading the install command does not pass through here.
 pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
     let token = random_token();
@@ -805,8 +861,9 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // agent reconnects and is refused. Its own teardown leaves the entry
     // untouched, because the session tag no longer matches.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    // The token is part of the admin frame, which would otherwise continue to
-    // display an install command for the credential just retired.
+    // Frames no longer carry the token, but a dialog that already read it
+    // displays a working install command for the credential just retired; the
+    // snapshot changes so the panel re-renders from fresh state.
     invalidate_snapshot(&app);
     // The token alone: the panel builds the command, and one place needs to know
     // its form.
@@ -2362,10 +2419,10 @@ mod tests {
     }
 
     /// Deleting a node must reach the connection it opened, for the same reason
-    /// rotating its token does, and more urgently: SQLite reassigns the freed id
-    /// to the next node created. Left connected, the old machine reports under
-    /// that id, so an undeployed node appears online with another machine's
-    /// metrics, and its traffic and history are booked to it.
+    /// rotating its token does: left connected, the old machine keeps
+    /// reporting under an id the database no longer knows. Its teardown also
+    /// costs nothing to the next node, which now receives a fresh id rather
+    /// than the freed one.
     #[tokio::test]
     async fn deleting_a_node_closes_its_session_so_the_next_id_does_not_inherit_it() {
         let app = std::sync::Arc::new(app());
@@ -2381,9 +2438,10 @@ mod tests {
             "the deleted node's agent must be told to go"
         );
 
-        // SQLite reuses the id; nothing of the old machine may accompany it.
+        // The freed id is not handed out again; nothing of the old machine can
+        // accompany the next one, whoever wears the id later.
         let fresh = node(&app, "fresh", true);
-        assert_eq!(fresh, old, "the fixture only means anything if the id is reused");
+        assert_ne!(fresh, old, "a deleted node's id is not reused");
         let nodes = visible_nodes(&app, true).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["online"], json!(false), "a node nobody deployed is not online");
@@ -2424,9 +2482,9 @@ mod tests {
 
     /// A stream outlives the request that opened it, so everything the handshake
     /// tested must be re-read rather than captured -- both answers, not one. The
-    /// admin frame carries every node's token in the clear, and the public frame
-    /// is what switching the status page off is meant to withdraw; a socket
-    /// surviving either decision would continue sending what was withdrawn.
+    /// public frame is what switching the status page off is meant to withdraw;
+    /// a socket surviving either decision would continue sending what was
+    /// withdrawn.
     #[test]
     fn a_stream_re_reads_both_answers_its_handshake_tested() {
         let app = app();
@@ -2468,6 +2526,53 @@ mod tests {
         // same bytes, so the data is modified first.
         node(&app, "late", true);
         assert_eq!(live_snapshot(&app, false), public, "the frame is reused, not rebuilt per viewer");
+    }
+
+    /// The token left the list and both stream frames: a credential that
+    /// installs software as root no longer sits in every response a signed-in
+    /// panel makes. Reading it is a request of its own, which the next test
+    /// covers; this one holds the withdrawal itself against regression.
+    #[test]
+    fn neither_frame_nor_list_carries_a_node_token_anymore() {
+        let app = app();
+        let id = node(&app, "open", true);
+        let stored = app.db.node(id).unwrap().unwrap().token;
+
+        let admin = live_snapshot(&app, true);
+        assert!(!admin.as_str().contains(&stored), "the admin frame carries no token");
+        let public = live_snapshot(&app, false);
+        assert!(!public.as_str().contains(&stored), "and neither does the public one");
+        for view in visible_nodes(&app, true).unwrap() {
+            assert!(view.get("token").is_none(), "the admin list row carries no token");
+        }
+    }
+
+    /// The token a dialog needs is read on demand and reissued on demand, and
+    /// the two are separate: displaying the install command must not retire the
+    /// credential the running agent holds.
+    #[tokio::test]
+    async fn the_token_is_revealed_by_reading_and_retired_only_by_reissuing() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let id = node(&app, "n", true);
+        let stored = app.db.node(id).unwrap().unwrap().token;
+
+        let shown = reveal_token(Admin, state(), Path(id)).await;
+        let body = axum::body::to_bytes(shown.into_body(), usize::MAX).await.unwrap().to_vec();
+        let shown: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(shown["token"], json!(stored), "a read shows the token the node has");
+        assert_eq!(
+            app.db.node(id).unwrap().unwrap().token,
+            stored,
+            "and leaves it in place -- the agent keeps reporting"
+        );
+
+        let reissued = reset_token(Admin, state(), Path(id)).await;
+        let body = axum::body::to_bytes(reissued.into_body(), usize::MAX).await.unwrap().to_vec();
+        let reissued: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let fresh = reissued["token"].as_str().unwrap().to_owned();
+        assert_ne!(fresh, stored, "a reissue mints a new one");
+        assert_eq!(app.db.node(id).unwrap().unwrap().token, fresh, "which the node now holds");
     }
 
     #[test]
@@ -2564,6 +2669,34 @@ mod tests {
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    /// The name comes from an unvouched machine: markup characters are dropped,
+    /// and what that leaves is trimmed, so a name made only of them is
+    /// `unnamed`. A theme that renders the name as HTML would otherwise run a
+    /// node's script in the hub's origin, beside the administrator's session.
+    #[tokio::test]
+    async fn a_registered_name_loses_markup_and_is_never_blank() {
+        let app = std::sync::Arc::new(app());
+        open_register(Admin, State(app.clone()), domain_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        for (sent, stored) in [("< >", "unnamed"), ("<b>web</b>", "bweb/b"), ("Tom's \"VPS\"", "Toms VPS")] {
+            let mut headers = domain_headers();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            let reply = agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                sent.to_owned(),
+            )
+            .await;
+            let token = String::from_utf8(
+                axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap().to_vec(),
+            )
+            .unwrap();
+            let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+            assert_eq!(app.db.node(id).unwrap().unwrap().name, stored, "sent {sent:?}");
+        }
     }
 
     /// The ceiling on the anonymous route: a leaked key cannot fill the table.

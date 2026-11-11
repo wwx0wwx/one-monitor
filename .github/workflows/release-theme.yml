@@ -20,10 +20,20 @@ jobs:
   # so the input names it instead.
   route:
     runs-on: ubuntu-latest
+    # Reads the tag and emits a short; no write needed until publish below.
+    permissions:
+      contents: read
     outputs:
       short: ${{ steps.route.outputs.short }}
     steps:
       - id: route
+        # The dispatch input travels by environment variable rather than
+        # template expansion: an interpolated ${{ }} lands inside the script's
+        # quotes before the shell sees it, so a crafted input could close them
+        # and run as code inside a job that publishes releases. The env is
+        # assigned by the runner, never parsed as script.
+        env:
+          INPUT_SHORT: ${{ inputs.short }}
         run: |
           short="${GITHUB_REF_NAME#theme-}"
           # A short may itself contain hyphens (komari-likely), so only the
@@ -31,7 +41,7 @@ jobs:
           # last hyphen, not the first.
           short="${short%-*}"
           if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            short="${{ inputs.short }}"
+            short="$INPUT_SHORT"
           fi
           case "$short" in
             "" | *[!A-Za-z0-9-]*) echo "tag 里读不出主题的 short：$GITHUB_REF_NAME" >&2; exit 1 ;;
@@ -44,8 +54,8 @@ jobs:
     env:
       SHORT: ${{ needs.route.outputs.short }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 24
           cache: npm

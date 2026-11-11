@@ -3,10 +3,12 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --token TOKEN [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 set -eu
-# useradd and rc-update reside in sbin, which a root shell entered through `su`
-# without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
-# is set, and Debian does not set it.
-PATH="$PATH:/usr/sbin:/sbin"
+# Reset rather than extend: this script runs as root from `curl | sh`, and the
+# caller's PATH is caller-controlled terrain -- an inherited directory ahead of
+# the system ones would decide which `curl`, `install` and `systemctl` run
+# below. The system directories carry everything used here, including the
+# sbin binaries a root shell entered through `su` without `-` lacks on Debian.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # Binary and token in one directory, the same one the hub uses, giving a node a
 # single path to inspect and a single path to remove.
@@ -49,6 +51,19 @@ case "$INTERVAL" in "" | *[!0-9]*) echo "interval must be an integer from 1 to 3
 # to run as root.
 if [ -n "$INSECURE" ]; then SCHEME=http; else SCHEME=https; fi
 case "$SERVER" in *://*) ;; *) SERVER="$SCHEME://$SERVER" ;; esac
+# The scheme is now present; only http and https are schemes curl can be
+# asked to fetch the root-run binary over, and the case-insensitive match
+# keeps HTTPs:// -- which the plaintext check below would otherwise read as
+# neither -- from slipping through as an unknown scheme curl might still
+# recognise.
+GIVEN="${SERVER%%://*}"
+REST="${SERVER#*://}"
+GIVEN=$(printf '%s' "$GIVEN" | tr 'A-Z' 'a-z')
+case "$GIVEN" in
+http | https) ;;
+*) echo "server URL must begin with http:// or https://" >&2; exit 2 ;;
+esac
+SERVER="$GIVEN://$REST"
 # The agent already refuses plaintext ws:// to a remote hub, since the token
 # would travel in the clear. The same address fetches the binary about to run as
 # root here, so the same rule applies: over plain HTTP anyone on the path can
@@ -195,6 +210,17 @@ else
 fi
 install -d -m 0755 "$ROOT"
 install -m 0755 "$TMP" "$BIN"
+
+# The hub answers a registration with a bare hex token; anything else -- an
+# error page from a middlebox, a body with newlines -- would become extra
+# KEY=value lines in the environment file below, read by the root-run service.
+# The same shape check covers a token typed into the command line.
+case "$TOKEN" in
+"" | *[!A-Za-z0-9]*)
+	echo "the credential is not a bare token; refusing to write it to $ENV_FILE" >&2
+	exit 1
+	;;
+esac
 
 # The token lives in a root-only environment file rather than the unit, keeping
 # it out of `systemctl cat` and the world-readable journal. 0600 root is what

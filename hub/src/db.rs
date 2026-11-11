@@ -14,6 +14,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+/// A string an agent reported, cut down to what may be shown. Control
+/// characters break the panel's rows, and the characters markup is made of are
+/// dropped because the value reaches a theme from a machine nobody has vouched
+/// for: a theme that sets it as HTML would otherwise run a node's script in the
+/// hub's origin, beside the administrator's session. No real OS name, kernel,
+/// CPU model or host name contains any of them. `chars()` rather than bytes, so
+/// the cut falls on a character boundary.
+pub fn reported_text(raw: &str, max: usize) -> String {
+    raw.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'')).take(max).collect()
+}
+
 /// How many read connections the pool holds. Chart windows are the widest
 /// queries the panel makes; four keep several of them from queueing behind one
 /// another, without spending a per-connection page cache on more.
@@ -611,6 +622,45 @@ impl Db {
         Ok(())
     }
 
+    /// The id for a new row of `table`: one past every id this hub has ever
+    /// issued, deleted rows included. SQLite's default reissues the highest id
+    /// once its row is deleted, and state the hub keeps by id -- the offline
+    /// sweep's absence and return times, a traffic tier, an editor opened
+    /// before the delete -- would silently pass to whatever row lands there
+    /// next. The high mark lives in `setting`, so a backup carries it; without
+    /// one, as after an upgrade from a build that kept none, the table's own
+    /// highest id stands in.
+    ///
+    /// `table` reaches SQL by interpolation, which the rest of this file
+    /// avoids: it is compiled in at the two call sites and validated against
+    /// `ID_TABLES` below, never caller-supplied data.
+    fn next_id(tx: &rusqlite::Transaction<'_>, table: &str) -> Result<i64> {
+        let id = Self::issued(tx, table)? + 1;
+        tx.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!("{table}_id_issued"), id.to_string()],
+        )?;
+        Ok(id)
+    }
+
+    /// The highest id `table` has issued, by its high mark or its rows.
+    fn issued(conn: &rusqlite::Connection, table: &str) -> Result<i64> {
+        debug_assert!(Self::ID_TABLES.contains(&table), "an interpolated table name must be one of the two");
+        Ok(conn.query_row(
+            &format!(
+                "SELECT MAX(COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = ?1), 0),
+                              (SELECT COALESCE(MAX(id), 0) FROM {table}))"
+            ),
+            [format!("{table}_id_issued")],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The tables whose ids come from [`Self::next_id`]; the closed set an
+    /// interpolated table name is allowed to name.
+    const ID_TABLES: [&str; 2] = ["node", "ping_task"];
+
     // ---- nodes ----
 
     pub fn nodes(&self) -> Result<Vec<Node>> {
@@ -634,14 +684,18 @@ impl Db {
     pub fn create_node(&self, n: &Node, token: &str) -> Result<i64> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        // Named rather than rowid-assigned: a fresh id must not be one a deleted
+        // node wore, since in-memory state is keyed by it.
+        let id = Self::next_id(&tx, "node")?;
         tx.execute(
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
-            "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
+            "INSERT INTO node (id, name, token, sort, public, price, currency, billing_cycle,
                                expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day,
                                tag, node_group, notify, auto_renew, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             VALUES (?1,?2,?3,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
+                id,
                 n.name,
                 token,
                 n.public,
@@ -660,7 +714,6 @@ impl Db {
                 Utc::now().timestamp()
             ],
         )?;
-        let id = tx.last_insert_rowid();
         tx.execute("INSERT INTO traffic (node_id) VALUES (?1)", [id])?;
         tx.commit()?;
         Ok(id)
@@ -776,21 +829,14 @@ impl Db {
     pub fn save_facts(&self, id: i64, f: &serde_json::Value, ip: &str) -> Result<bool> {
         // The same rule `api::agent_register` applies to the name it receives:
         // these values come from an unvouched machine, control characters break
-        // the panel's rows, and the length must be bounded. Six of them -- os,
+        // the panel's rows, markup characters reach themes that render them as
+        // HTML, and the length must be bounded. Six of them -- os,
         // kernel, arch, virt, cpu_name, agent_version -- go straight into the
         // anonymous public frame, which is rebuilt and pushed to every viewer
         // every two seconds, so without a ceiling one node would determine that
         // frame's size. 128 rather than 64: a real PRETTY_NAME runs to about 60
         // characters and a CPU model to about 50.
-        let s = |k: &str| {
-            f.get(k)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(128)
-                .collect::<String>()
-        };
+        let s = |k: &str| reported_text(f.get(k).and_then(|v| v.as_str()).unwrap_or(""), 128);
         let n = |k: &str| f.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let conn = self.conn();
         conn.execute(
@@ -1151,11 +1197,14 @@ impl Db {
             )?;
             t.id
         } else {
+            // Same reasoning as a node: a probe's id carries in-memory state, and
+            // must not be one a deleted probe wore.
+            let id = Self::next_id(&tx, "ping_task")?;
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval) VALUES (?1,?2,?3)",
-                params![t.name, t.target, t.interval],
+                "INSERT INTO ping_task (id, name, target, interval) VALUES (?1,?2,?3,?4)",
+                params![id, t.name, t.target, t.interval],
             )?;
-            tx.last_insert_rowid()
+            id
         };
         tx.execute("DELETE FROM ping_node WHERE task_id=?1", [id])?;
         for node in &t.nodes {
@@ -1578,7 +1627,25 @@ impl Db {
     /// off the runtime.
     pub fn restore_from(&self, src: &str) -> Result<()> {
         let mut conn = self.conn();
+        // The ids this database has already issued, read before the backup's
+        // setting table replaces it: an id handed out after the backup was
+        // taken may still be named by in-memory state, and the restored
+        // high mark must not fall behind it.
+        let current: Vec<(&'static str, i64)> = Self::ID_TABLES
+            .iter()
+            .map(|&table| Ok((table, Self::issued(&conn, table)?)))
+            .collect::<Result<_>>()?;
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
+        for (table, mark) in current {
+            let kept = Self::issued(&conn, table)?.max(mark);
+            if kept != mark {
+                conn.execute(
+                    "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![format!("{table}_id_issued"), kept.to_string()],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1655,7 +1722,10 @@ fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>,
         let middle = match answered.len() {
             0 => None,
             n if n % 2 == 1 => Some(answered[n / 2]),
-            n => Some((answered[n / 2 - 1] + answered[n / 2]) / 2),
+            // saturating rather than plain addition: two near-i64::MAX latencies
+            // from a lying agent would wrap in release builds, which have overflow
+            // checks off, and name a middle that is lower than both ends.
+            n => Some(answered[n / 2 - 1].saturating_add(answered[n / 2]) / 2),
         };
         let mut row = serde_json::json!({"task_id": task, "ts": ts, "latency": middle});
         // Only when the bucket actually varied. At the hour and six-hour windows a
@@ -2127,19 +2197,24 @@ mod tests {
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 0);
         assert!(!db.all_traffic().contains_key(&id));
 
-        // `ping_record` has no foreign key to cascade through, and SQLite reassigns
-        // the deleted id to the next node created: without the sweep in
-        // `delete_node` the new machine would draw the old one's chart.
+        // `ping_record` has no foreign key to cascade through, so the sweep in
+        // `delete_node` is what clears it. A fresh node now receives a fresh id
+        // rather than the deleted one -- see `next_id` -- but the sweep must
+        // hold regardless: whatever lands on this id later starts with no
+        // history of the machine before it.
         let fresh = node(&db, 1);
-        assert_eq!(fresh, id, "the id is reused, which is what makes this reachable");
+        assert_ne!(fresh, id, "a deleted node's id is not handed to the next one");
         db.save_ping_task(&PingTask { id: task, nodes: vec![fresh], ..probe(vec![]) }).unwrap();
         assert!(db.ping_records(fresh, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
+        // The sweep is also what keeps the deleted node's own rows gone.
+        assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "the deleted node keeps no history");
     }
 
-    /// The mirror of the sweep above, on the other key of the same table. SQLite
-    /// reuses a deleted probe's id as well, and the chart selects on a node's
-    /// assignments, so the removed probe's samples would reappear under the new
-    /// probe's name with its timeouts folded into the new loss figure.
+    /// The mirror of the sweep above, on the other key of the same table. The
+    /// chart selects on a node's assignments, so a removed probe's samples left
+    /// behind would reappear under a later probe's name with its timeouts
+    /// folded into the new loss figure. Ids are no longer reused, but the
+    /// sweep must hold regardless.
     #[test]
     fn deleting_a_probe_takes_its_history_with_it() {
         let db = db();
@@ -2156,7 +2231,7 @@ mod tests {
         db.delete_ping_task(old).unwrap();
 
         let fresh = db.save_ping_task(&probe("singapore")).unwrap();
-        assert_eq!(fresh, old, "the id is reused, which is what makes this reachable");
+        assert_ne!(fresh, old, "a deleted probe's id is not handed to the next one");
         assert!(db.ping_records(id, 0, 60).unwrap().0.is_empty(), "and it starts with no history");
     }
 

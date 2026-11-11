@@ -44,13 +44,13 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 因此 `releases/latest` 不再属于任何组件，所有下载都走定向 tag：
 
 - `install-hub.sh` 默认装 `VERSION` 常量指名的 tag（发版同 PR 内更新它），`--version` 可指定或传 `latest`
-- hub 中转 agent 二进制走 `AGENT_TAG` 常量（agent 发新代号时同 PR bump）
+- hub 中转 agent 二进制走 `AGENT_TAG` 常量（agent 发新代号时同 PR bump），且中继前按 `hub/agent.pin` 的 sha256 验签——镜像（`github_proxy`）换不了会装到节点上的字节；发新代号时同一提交里挪 `AGENT_TAG` 与 `agent.pin`
 - hub 的主题更新按钮列 releases、按 `theme-<short>-` 前缀过滤取最新；tag 尾部与 theme.json 的 `version` 对齐（`theme-default-v1.2.3` ↔ `1.2.3`）
 
 ## 发版节奏
 
 - **hub**：`hub/` 有实质变更时发 `vX.Y.Z`。切 tag 的同一个提交里：bump `hub/Cargo.toml` 版本、bump `hub/install-hub.sh` 的 `VERSION`；若默认主题发了新版，还要挪 `hub/web-theme.pin`（tag + sha256）并刷新 `hub/vendor/theme/`
-- **agent**：`agent/` 有实质变更时发下一个代号（pio → voy → cas → new），hub 侧同 PR bump `AGENT_TAG`
+- **agent**：`agent/` 有实质变更时发下一个代号（pio → voy → cas → new），hub 侧同 PR bump `AGENT_TAG` 并重算 `hub/agent.pin`（两个架构各一行 `<arch> <sha256>`，从 release 的 sha256sums.txt 抄）
 - **主题**：`themes/<short>/` 有实质变更时发 `theme-<short>-v<版本>`，版本号与 theme.json 对齐；hub 通过 vendor pin 内嵌，升级 hub 即更新内置主题
 - 顺序约束：主题先发（hub 的 pin 指向它的 release 资产 sha），再发 hub
 

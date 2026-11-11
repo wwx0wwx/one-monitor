@@ -819,9 +819,11 @@ mod tests {
         assert_eq!(at(t + 11_180), ["offline"], "the next absence keeps the ordinary grace period");
     }
 
-    /// A deleted node's id goes to the next node created, and a node's first
-    /// connection is not a return from an outage: either would put a new node on
-    /// the flapping grace period or suppress its first traffic alert.
+    /// A node's first connection is not a return from an outage, and a new
+    /// node carries no inherited state: either would put it on the flapping
+    /// grace period or suppress its first traffic alert. Ids are no longer
+    /// reused, but a restored backup can still name an id this process has
+    /// state for, so the sweep's own bookkeeping must stay per-id clean.
     #[test]
     fn a_new_node_starts_with_no_absence_return_or_traffic_step() {
         let app = app();
@@ -846,7 +848,10 @@ mod tests {
         assert!(at(t + 30).is_empty());
 
         let new = node(&app, "new", true, 0);
-        assert_eq!(new, old, "the id is reused");
+        assert_ne!(
+            new, old,
+            "a deleted node's id is not reused; the new node's state must be clean on its own"
+        );
         metered(new);
         assert_eq!(at(t + 60), ["traffic"]);
         connect(&app, new);
