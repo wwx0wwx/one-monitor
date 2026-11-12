@@ -218,7 +218,7 @@ install_hub() {
 	# catches a truncated transfer for versions this script does not pin.
 	pin=""
 	if [ "$VERSION_REQ" = "$PIN_VERSION" ]; then
-		case "$ARCH" in
+		case "$arch" in
 		x86_64) pin="$PIN_amd64" ;;
 		aarch64) pin="$PIN_arm64" ;;
 		esac
