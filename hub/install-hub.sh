@@ -37,8 +37,8 @@ VERSION_REQ="v1.6.3"
 # release's own sums file is the check, as it always was. Bumping VERSION in a
 # release PR resets both to empty; the workflow refills them after publishing.
 PIN_VERSION="$VERSION"
-PIN_amd64=51ccb3f3ab4f1b990f84c6901c97c8f2bcc3ddb9149b585b3797679a7e7ef4f8
-PIN_arm64=7fccdcfc43964ee2278740b897e04c8b0d555f41d983aab20eb1ef5d95eac928
+PIN_amd64=1957bafa0067d5869a2cd17d8be140cdeebc7bb8d9b9c07240602de13dde65fc
+PIN_arm64=f4561acc8af509689424cd0e7f8bf2a77a692f701abb3d8659b9ad18bb777db4
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
