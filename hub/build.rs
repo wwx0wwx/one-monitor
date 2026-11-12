@@ -15,6 +15,18 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/theme/.pin");
     println!("cargo:rerun-if-changed=scripts/theme.sh");
 
+    // The panel's build output is embedded by rust-embed, whose answer to a
+    // missing folder names neither the panel nor the command that builds it.
+    // Said here instead, before anything else runs: on a clean checkout this
+    // is the one step the cargo flow cannot do for itself. (The theme below
+    // needs no equivalent -- scripts/theme.sh materialises it.)
+    if !std::path::Path::new("web-admin/dist/index.html").exists() {
+        panic!(
+            "web-admin/dist is missing: run `npm ci && npm run build` in web-admin/ \
+             before building or testing the hub (see hub/README.md, 构建)"
+        );
+    }
+
     match Command::new("sh").arg("scripts/theme.sh").status() {
         Ok(status) if status.success() => {}
         Ok(status) => panic!("scripts/theme.sh failed ({status}); see the message above"),

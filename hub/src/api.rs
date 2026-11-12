@@ -15,7 +15,7 @@ use tracing::debug;
 use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, trust_cf_ip,
-    trusted_proxies, trust_private_xff, with_cookies,
+    trust_private_xff, trusted_proxies, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
@@ -737,7 +737,13 @@ pub async fn agent_register(
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
-    let ip = client_ip(trust_cf_ip(&app), crate::auth::trust_private_xff(&app), &crate::auth::trusted_proxies(&app), &headers, peer.ip());
+    let ip = client_ip(
+        trust_cf_ip(&app),
+        crate::auth::trust_private_xff(&app),
+        &crate::auth::trusted_proxies(&app),
+        &headers,
+        peer.ip(),
+    );
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -1108,6 +1114,13 @@ pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
 pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 
+/// The two chunked uploads, one lock each: the two routes name different files
+/// and never contend with each other, while two callers on the same route
+/// splice on the one fixed name below. Held across the whole request, so the
+/// loser of the race is told to restart rather than interleaving its pieces.
+static RESTORE_UPLOAD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+static THEME_UPLOAD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 /// One request of an upload: `total` is the whole file, `offset` where this piece
 /// belongs within it.
 ///
@@ -1277,10 +1290,13 @@ pub async fn db_restore(
 ) -> Response {
     // One fixed path, which is what allows the file's own length to constitute
     // the entire protocol.
-    // ponytail: one upload in flight per hub. Two started simultaneously land on
+    //
+    // One upload in flight per route: two started simultaneously would land on
     // this same name, and equal-sized chunks align their offsets, so they splice
-    // rather than collide. The cost is a failed upload; distinguishing them would
-    // require the upload id the protocol deliberately omits.
+    // rather than collide. The lock is held across the whole exchange, so a
+    // second caller waits and then finds its offsets answered by the wrong
+    // length -- the same "restart the upload" error a vanished one gets.
+    let _upload = RESTORE_UPLOAD.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     let path = format!("{}.upload", app.db.file());
     let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
         Ok(received) => received,
@@ -1334,11 +1350,10 @@ pub async fn db_restore(
                 &headers,
                 peer.ip(),
             );
-            let cookie =
-                match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers, ip)) {
-                    Ok(cookie) => cookie,
-                    Err(e) => return fail(e),
-                };
+            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers, ip)) {
+                Ok(cookie) => cookie,
+                Err(e) => return fail(e),
+            };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
         Err(e) => bad(&format!("{e:#}")),
@@ -1388,6 +1403,8 @@ pub async fn upload_theme(
     Query(chunk): Query<Chunk>,
     body: axum::body::Body,
 ) -> Response {
+    // As in `db_restore`: one theme upload at a time, for the same reason.
+    let _upload = THEME_UPLOAD.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     let path = app.themes.join(".upload.tar.gz");
     let name = path.to_string_lossy().into_owned();
     let received = match receive(&name, &chunk, MAX_THEME, body).await {
@@ -1866,27 +1883,22 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-        // Set when the password changed, so the caller receives a fresh session rather
-        // than being logged out by their own change.
-        let mut reissued = String::new();
-        // The replacement session records where it was issued, like every other.
-        let ip = client_ip(
-            trust_cf_ip(&app),
-            trust_private_xff(&app),
-            &trusted_proxies(&app),
-            &headers,
-            peer.ip(),
-        );
-        for (key, value) in map {
-            let value = value.as_str().unwrap_or_default();
-            // Changing the password logs out every existing session; the caller
-            // receives a replacement.
-            if key == "admin_password" {
-                match hash_password(value).and_then(|h| {
-                    app.db.set("admin_password_hash", &h)?;
-                    app.db.drop_all_sessions()?;
-                    issue_session(&app, &headers, ip)
-                }) {
+    // Set when the password changed, so the caller receives a fresh session rather
+    // than being logged out by their own change.
+    let mut reissued = String::new();
+    // The replacement session records where it was issued, like every other.
+    let ip =
+        client_ip(trust_cf_ip(&app), trust_private_xff(&app), &trusted_proxies(&app), &headers, peer.ip());
+    for (key, value) in map {
+        let value = value.as_str().unwrap_or_default();
+        // Changing the password logs out every existing session; the caller
+        // receives a replacement.
+        if key == "admin_password" {
+            match hash_password(value).and_then(|h| {
+                app.db.set("admin_password_hash", &h)?;
+                app.db.drop_all_sessions()?;
+                issue_session(&app, &headers, ip)
+            }) {
                 Ok(cookie) => reissued = cookie,
                 Err(e) => return fail(e),
             }
@@ -2963,7 +2975,8 @@ mod tests {
     async fn a_settings_write_is_all_or_nothing() {
         let app = std::sync::Arc::new(app());
         app.db.set("admin_password_hash", "the-old-hash").unwrap();
-        let save = |body: Value| save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(body));
+        let save =
+            |body: Value| save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(body));
 
         // BTreeMap order places the password first, which is the failing case.
         let refused =
@@ -3064,7 +3077,9 @@ mod tests {
         app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600, "").unwrap();
 
         let body = Json(json!({"admin_password": "a-long-enough-password"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body).await;
+        let response =
+            save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body)
+                .await;
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 
@@ -3120,7 +3135,9 @@ mod tests {
         app.db.create_session(&sha256(&live), Utc::now().timestamp() + 3_600, "").unwrap();
 
         let body = Json(json!({"admin_password": "short"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body).await;
+        let response =
+            save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body)
+                .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(app.db.get("admin_password_hash").is_none(), "the password must not have changed");
@@ -3181,7 +3198,9 @@ mod tests {
             "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
-            save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(echoed)).await.status(),
+            save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(echoed))
+                .await
+                .status(),
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );

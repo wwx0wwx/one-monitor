@@ -202,6 +202,18 @@ ingress:
 - **一次性密码**只在数据库首次创建时写一次（`data/initial-password`，0600，首次登录即删），改密入口在后台「安全」。
 - **延迟探测**：首启不预置任何任务（v1.6.2 起不再默认建浙江运营商探测），在后台「延迟」里按需添加；「设置」里的「新添加的服务器自动加入全部延迟检测任务」默认关。
 
+## 构建
+
+后台前端内嵌进二进制，必须先于 cargo 完成（默认主题不用管，`build.rs` 会按
+`web-theme.pin` 从 vendor 自动落地）：
+
+```bash
+cd hub/web-admin && npm ci && npm run build && cd ..
+cargo build --release    # 或 cargo test；干净 checkout 直接跑 cargo 会缺 web-admin/dist
+```
+
+`npm test` 用 vitest（Node ≥22.18）。
+
 ## 命令行参数
 
 `install-hub.sh` 覆盖了绝大多数场景；直接跑二进制时（`monitor-hub --help`）：
