@@ -170,10 +170,23 @@ pub fn setting_error(key: &str, value: &str) -> Option<String> {
             (!valid).then_some("Telegram chat must be a numeric id or an @username")
         }
         // Plain http is accepted: a relay on the hub's own host or network is a
-        // common target, and only an admin can set this.
-        "notify_webhook_url" => (!reqwest::Url::parse(value)
-            .is_ok_and(|u| matches!(u.scheme(), "http" | "https")))
-        .then_some("webhook URL must start with http:// or https://"),
+        // common target, and only an admin can set this. Link-local literals are
+        // the one host a webhook never runs on: that space holds the cloud
+        // metadata services, and refusing a literal here is immediate where the
+        // resolution check at send time only names a hostname once it answers.
+        "notify_webhook_url" => {
+            let url = reqwest::Url::parse(value).ok();
+            if !url.as_ref().is_some_and(|u| matches!(u.scheme(), "http" | "https")) {
+                return Some("webhook URL must start with http:// or https://".into());
+            }
+            let literal = url.as_ref().and_then(|u| u.host_str()).is_some_and(|host| {
+                host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_ok_and(link_local)
+            });
+            (literal).then_some(
+                "the webhook host is a link-local address, where nothing receives \
+                 notifications -- only the cloud metadata services answer there",
+            )
+        }
         "notify_webhook_body" => serde_json::from_str::<Value>(&render(value, &sample(), r#"s"i\te"#, true))
             .is_err()
             .then_some("webhook body must be valid JSON once filled in; keep each placeholder inside quotes"),
@@ -321,6 +334,44 @@ fn client() -> Result<&'static reqwest::Client, Failure> {
         .map_err(|reason| Failure { retry: false, wait: None, reason: reason.clone() })
 }
 
+/// Link-local space in either family: 169.254.0.0/16 and fe80::/10.
+///
+/// This is where the cloud metadata services live -- 169.254.169.254 and its
+/// equivalents answer there on every provider -- and nothing else routable. A
+/// webhook has no business in it: a relay on the hub's own host is 127.0.0.1,
+/// one on its network is RFC1918 or ULA, and both stay allowed. An admin
+/// session turned hostile -- a stolen cookie, a cross-site write -- would
+/// otherwise read the instance's identity credentials out of the metadata
+/// endpoint through this channel, which sends whatever the URL's owner asks.
+fn link_local(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        // The stable library has no predicate for IPv6 link-local (fe80::/10).
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
+/// Whether a webhook URL names a link-local target, by literal or by
+/// resolution at the moment of sending.
+///
+/// Resolved here rather than trusted to the connection: reqwest resolves
+/// independently when it connects, so a name that flips between answers can
+/// still reach the address it hands the client rather than the one checked.
+/// Redirects are already refused outright, which is the other way a forbidden
+/// address hides behind an innocent one; this closes the door a plain URL
+/// walks through. Resolution errors are left to the fetch, which reports them
+/// as it always did.
+async fn link_local_target(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    let Some(host) = parsed.host_str() else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return link_local(ip);
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    tokio::net::lookup_host((host, port)).await.is_ok_and(|mut addrs| addrs.any(|a| link_local(a.ip())))
+}
+
 async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> {
     let site = site_name(app);
     let request = match channel {
@@ -330,13 +381,24 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
             .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
             .json(&json!({"chat_id": chat, "text": render(text, note, &site, false)})),
         Channel::Webhook { url, headers, body } => {
+            // Refused before the request is built, whatever form the address
+            // takes; see `link_local_target`.
+            if link_local_target(url).await {
+                return Err(Failure {
+                    retry: false,
+                    wait: None,
+                    reason: "the webhook host is link-local, where nothing receives \
+                             notifications -- only the cloud metadata services answer there"
+                        .into(),
+                });
+            }
             // `insert` into one map: `RequestBuilder::header` and `HeaderMap::extend`
             // both append, which would send a configured Content-Type alongside the
             // default instead of in its place.
             let mut map = HeaderMap::new();
             map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            for (name, value) in parse_headers(headers)
-                .map_err(|reason| Failure { retry: false, wait: None, reason })?
+            for (name, value) in
+                parse_headers(headers).map_err(|reason| Failure { retry: false, wait: None, reason })?
             {
                 map.insert(name, value);
             }
@@ -363,10 +425,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     // `message`) without reading an error page of arbitrary length.
     let head = response.chunk().await.ok().flatten().unwrap_or_default();
     let body = String::from_utf8_lossy(&head);
-    let reason = format!(
-        "{status}: {}",
-        body.chars().take(300).collect::<String>().trim()
-    );
+    let reason = format!("{status}: {}", body.chars().take(300).collect::<String>().trim());
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(Failure { retry: true, wait: retry_wait(&body), reason });
     }
@@ -379,11 +438,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
 /// Capped, so a hostile or misbehaving endpoint cannot park the queue with a
 /// number it made up.
 fn retry_wait(body: &str) -> Option<Duration> {
-    let secs = serde_json::from_str::<Value>(body)
-        .ok()?
-        .get("parameters")?
-        .get("retry_after")?
-        .as_i64()?;
+    let secs = serde_json::from_str::<Value>(body).ok()?.get("parameters")?.get("retry_after")?.as_i64()?;
     Some(Duration::from_secs(secs.clamp(1, 60) as u64))
 }
 
@@ -834,10 +889,52 @@ mod tests {
 
         // Telegram's 429 names its window; anything else falls back to the
         // fixed pause, and a window the endpoint made up is capped.
-        assert_eq!(retry_wait(r#"{"ok":false,"parameters":{"retry_after":25}}"#), Some(Duration::from_secs(25)));
+        assert_eq!(
+            retry_wait(r#"{"ok":false,"parameters":{"retry_after":25}}"#),
+            Some(Duration::from_secs(25))
+        );
         assert_eq!(retry_wait(r#"{"parameters":{"retry_after":9000}}"#), Some(Duration::from_secs(60)));
         assert_eq!(retry_wait(r#"{"ok":false,"description":"Too Many Requests"}"#), None);
         assert_eq!(retry_wait("not json"), None);
+    }
+
+    /// Link-local is refused and everything a relay actually runs on is not:
+    /// the same-host relay (127.0.0.1) and the network one (RFC1918, ULA) are
+    /// documented targets, the metadata space is not. A v4-mapped address is
+    /// the same address.
+    #[test]
+    fn a_webhook_belongs_nowhere_in_link_local_space_and_anywhere_a_relay_runs() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for refused in ["169.254.169.254", "169.254.0.1", "fe80::1", "::ffff:169.254.169.254"] {
+            assert!(link_local(ip(refused)), "{refused}");
+        }
+        for allowed in
+            ["127.0.0.1", "::1", "10.0.0.5", "172.18.0.4", "192.168.1.6", "fd00::1", "203.0.113.10"]
+        {
+            assert!(!link_local(ip(allowed)), "{allowed}");
+        }
+
+        // The settings gate refuses the literal form immediately; the send-time
+        // check covers names that resolve there.
+        assert!(setting_error("notify_webhook_url", "http://169.254.169.254/hook").is_some());
+        assert!(setting_error("notify_webhook_url", "http://[fe80::1]/hook").is_some());
+        // A hostname in link-local space is caught by resolution at send time;
+        // the ones that matter here answer without leaving the host.
+        assert_eq!(setting_error("notify_webhook_url", "http://127.0.0.1:8080/hook"), None);
+        assert_eq!(setting_error("notify_webhook_url", "http://10.0.0.5:8080/hook"), None);
+    }
+
+    /// The send-time check on literals, and on a name that resolves without
+    /// leaving the host: `localhost` answers loopback, which a same-host relay
+    /// is, so it stays allowed end to end.
+    #[tokio::test]
+    async fn a_webhook_url_names_its_link_local_target_however_it_is_spelled() {
+        assert!(link_local_target("http://169.254.169.254/latest/meta-data/").await);
+        assert!(link_local_target("https://[fe80::1]:8443/hook").await);
+        assert!(!link_local_target("http://127.0.0.1:9099/hook").await);
+        assert!(!link_local_target("http://localhost:9099/hook").await);
+        // Unparsable is the fetch's error to report, not this check's.
+        assert!(!link_local_target("not a url").await);
     }
 
     #[test]
