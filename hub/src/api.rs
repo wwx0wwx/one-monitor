@@ -15,7 +15,7 @@ use tracing::debug;
 use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, trust_cf_ip,
-    with_cookies,
+    trusted_proxies, trust_private_xff, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
@@ -652,7 +652,11 @@ pub async fn create_node(
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if node.name.trim().is_empty() {
+    // The same filter a machine registering itself passes: a theme that renders
+    // names as HTML would otherwise run the operator's own markup in the hub's
+    // origin, beside the administrator's session.
+    node.name = crate::db::reported_text(node.name.trim(), 64).trim().to_owned();
+    if node.name.is_empty() {
         return bad("name is required");
     }
     if let Some(message) =
@@ -660,7 +664,11 @@ pub async fn create_node(
     {
         return bad(message);
     }
-    node.name = node.name.trim().to_owned();
+    // Names identify a row the operator edits and reinstalls against; two rows
+    // sharing one read as one machine reporting inconsistently.
+    if name_taken(&app, &node.name, None) {
+        return bad("a server with this name already exists");
+    }
     let token = random_token();
     match app.db.create_node(&node, &token) {
         // Usable immediately: the install command is readable from the node list,
@@ -672,6 +680,12 @@ pub async fn create_node(
         }
         Err(e) => fail(e),
     }
+}
+
+/// Whether some other node already carries `name`. `except` names the node
+/// being renamed, which is allowed to keep its own name.
+fn name_taken(app: &App, name: &str, except: Option<i64>) -> bool {
+    app.db.nodes().is_ok_and(|nodes| nodes.iter().any(|n| n.name == name && Some(n.id) != except))
 }
 
 /// Adds a freshly created server to every existing probe when the setting asks
@@ -723,7 +737,7 @@ pub async fn agent_register(
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
-    let ip = client_ip(trust_cf_ip(&app), crate::auth::trust_private_xff(&app), &headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), crate::auth::trust_private_xff(&app), &crate::auth::trusted_proxies(&app), &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -760,6 +774,17 @@ pub async fn agent_register(
     // drops must come out empty, not as a blank.
     let name: String = crate::db::reported_text(name.trim(), 64).trim().to_owned();
     let name = if name.is_empty() { "unnamed".to_owned() } else { name };
+    // A batch of machines from one template often shares a hostname. The panel
+    // refuses a duplicate, so the suffix keeps the second machine of the batch
+    // registering rather than being told a name it never chose is taken.
+    let name = if name_taken(&app, &name, None) {
+        (2..100)
+            .map(|n| format!("{name}-{n}"))
+            .find(|candidate| !name_taken(&app, candidate, None))
+            .unwrap_or_else(|| format!("unnamed-{}", &random_token()[..8]))
+    } else {
+        name
+    };
     // Field defaults live in `Node`'s serde attributes and nowhere else.
     // `Node::default()` is a different set of values -- private, reset day 0 --
     // and a node registered here must match one added through the panel.
@@ -809,9 +834,14 @@ pub async fn update_node(
 ) -> Response {
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
     if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
+        // As in `create_node`: the panel's own input gets the filter a
+        // registering machine's does, and may not take a name already in use.
+        *name = crate::db::reported_text(name.trim(), 64).trim().to_owned();
         if name.is_empty() {
             return bad("name is required");
+        }
+        if name_taken(&app, name, Some(id)) {
+            return bad("a server with this name already exists");
         }
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
@@ -1026,6 +1056,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "geoip_account_id",
     "cf_connecting_ip",
     "trust_private_xff",
+    "trusted_proxies",
     "retention_metrics_days",
     "retention_ping_days",
     "theme",
@@ -1239,6 +1270,7 @@ pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
 pub async fn db_restore(
     _: Admin,
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Query(chunk): Query<Chunk>,
     headers: HeaderMap,
     body: axum::body::Body,
@@ -1293,10 +1325,20 @@ pub async fn db_restore(
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
-            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
-                Ok(cookie) => cookie,
-                Err(e) => return fail(e),
-            };
+            // The replacement session records where it was issued, like every
+            // other, so the session list still answers for a restored hub.
+            let ip = client_ip(
+                trust_cf_ip(&app),
+                trust_private_xff(&app),
+                &trusted_proxies(&app),
+                &headers,
+                peer.ip(),
+            );
+            let cookie =
+                match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers, ip)) {
+                    Ok(cookie) => cookie,
+                    Err(e) => return fail(e),
+                };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
         Err(e) => bad(&format!("{e:#}")),
@@ -1615,17 +1657,19 @@ pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
 /// Every live session, with the caller's own marked.
 ///
 /// `id` is the stored SHA-256 of the session token rather than the token itself:
-/// it identifies a row without being presentable as a cookie.
+/// it identifies a row without being presentable as a cookie. `ip` is the
+/// address the sign-in came from, empty where it was not recorded.
 pub async fn sessions(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
     let mine = current_session(&headers);
     match app.db.sessions() {
         Ok(rows) => Json(
             rows.into_iter()
-                .map(|(hash, expires_at)| {
+                .map(|(hash, expires_at, ip)| {
                     json!({
                         "current": mine.as_deref() == Some(hash.as_str()),
                         "created_at": issued_at(expires_at),
                         "id": hash,
+                        "ip": ip,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1718,6 +1762,12 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "cf_connecting_ip" if !matches!(value, "on" | "off") => {
             Some("cf_connecting_ip must be on or off".into())
         }
+        // Addresses and networks whose X-Forwarded-For the hub reads, checked
+        // entry by entry: each one grants a slice of the trust the per-address
+        // lockout stands on, so a half-parsed entry must not stand at all.
+        "trusted_proxies" if !crate::auth::trusted_proxies_valid(value) => {
+            Some("trusted proxies must be addresses or networks, like 172.18.0.4 or 10.0.0.0/24, comma-separated".into())
+        }
         "geoip_provider" if !matches!(value, "ipinfo" | "maxmind" | "dbip") => {
             Some("geoip provider must be ipinfo, maxmind or dbip".into())
         }
@@ -1806,6 +1856,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
 pub async fn save_settings(
     _: Admin,
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1815,19 +1866,27 @@ pub async fn save_settings(
             return bad(&message);
         }
     }
-    // Set when the password changed, so the caller receives a fresh session rather
-    // than being logged out by their own change.
-    let mut reissued = String::new();
-    for (key, value) in map {
-        let value = value.as_str().unwrap_or_default();
-        // Changing the password logs out every existing session; the caller
-        // receives a replacement.
-        if key == "admin_password" {
-            match hash_password(value).and_then(|h| {
-                app.db.set("admin_password_hash", &h)?;
-                app.db.drop_all_sessions()?;
-                issue_session(&app, &headers)
-            }) {
+        // Set when the password changed, so the caller receives a fresh session rather
+        // than being logged out by their own change.
+        let mut reissued = String::new();
+        // The replacement session records where it was issued, like every other.
+        let ip = client_ip(
+            trust_cf_ip(&app),
+            trust_private_xff(&app),
+            &trusted_proxies(&app),
+            &headers,
+            peer.ip(),
+        );
+        for (key, value) in map {
+            let value = value.as_str().unwrap_or_default();
+            // Changing the password logs out every existing session; the caller
+            // receives a replacement.
+            if key == "admin_password" {
+                match hash_password(value).and_then(|h| {
+                    app.db.set("admin_password_hash", &h)?;
+                    app.db.drop_all_sessions()?;
+                    issue_session(&app, &headers, ip)
+                }) {
                 Ok(cookie) => reissued = cookie,
                 Err(e) => return fail(e),
             }
@@ -1887,6 +1946,12 @@ mod tests {
             (header::HOST, "monitor.example.com".parse().unwrap()),
             (header::HeaderName::from_static("x-forwarded-proto"), "https".parse().unwrap()),
         ])
+    }
+
+    /// The local peer every write test signs in from, as the reverse proxy the
+    /// installer puts beside the hub would present it.
+    fn test_peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("127.0.0.1:40000".parse().unwrap())
     }
 
     fn app() -> App {
@@ -2181,6 +2246,7 @@ mod tests {
         let done = db_restore(
             Admin,
             State(app.clone()),
+            test_peer(),
             Query(Chunk { offset: 0, total: bytes.len() as u64 }),
             HeaderMap::new(),
             axum::body::Body::from(bytes),
@@ -2567,7 +2633,7 @@ mod tests {
     fn a_stream_re_reads_both_answers_its_handshake_tested() {
         let app = app();
         let hash = sha256("live-token");
-        app.db.create_session(&hash, Utc::now().timestamp() + 3_600).unwrap();
+        app.db.create_session(&hash, Utc::now().timestamp() + 3_600, "").unwrap();
 
         assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a live session gets the admin frame");
         assert_eq!(stream_audience(&app, None), Some(false), "an anonymous stream gets the public one");
@@ -2580,7 +2646,7 @@ mod tests {
         // The other half. `live_ws` refuses a new anonymous connection from here
         // and `nodes` answers 401, so a stream that continued was the only
         // remaining route, for as long as the tab stayed open.
-        app.db.create_session(&hash, Utc::now().timestamp() + 3_600).unwrap();
+        app.db.create_session(&hash, Utc::now().timestamp() + 3_600, "").unwrap();
         app.db.set("public_page", "off").unwrap();
         assert_eq!(stream_audience(&app, None), None, "closing the status page must end anonymous streams");
         assert_eq!(stream_audience(&app, Some(&hash)), Some(true), "a signed-in operator still gets theirs");
@@ -2897,7 +2963,7 @@ mod tests {
     async fn a_settings_write_is_all_or_nothing() {
         let app = std::sync::Arc::new(app());
         app.db.set("admin_password_hash", "the-old-hash").unwrap();
-        let save = |body: Value| save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(body));
+        let save = |body: Value| save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(body));
 
         // BTreeMap order places the password first, which is the failing case.
         let refused =
@@ -2995,10 +3061,10 @@ mod tests {
     async fn changing_the_password_kills_other_sessions_but_not_the_caller() {
         let app = std::sync::Arc::new(app());
         let stale = random_token();
-        app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600).unwrap();
+        app.db.create_session(&sha256(&stale), Utc::now().timestamp() + 3_600, "").unwrap();
 
         let body = Json(json!({"admin_password": "a-long-enough-password"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
+        let response = save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body).await;
 
         assert!(!app.db.session_valid(&sha256(&stale)), "sessions must not outlive the old password");
 
@@ -3021,9 +3087,9 @@ mod tests {
         let app = std::sync::Arc::new(app());
         let (mine, theirs, stale) = (random_token(), random_token(), random_token());
         let now = Utc::now().timestamp();
-        app.db.create_session(&sha256(&mine), now + 3_600).unwrap();
-        app.db.create_session(&sha256(&theirs), now + 7_200).unwrap();
-        app.db.create_session(&sha256(&stale), now - 1).unwrap();
+        app.db.create_session(&sha256(&mine), now + 3_600, "").unwrap();
+        app.db.create_session(&sha256(&theirs), now + 7_200, "").unwrap();
+        app.db.create_session(&sha256(&stale), now - 1, "").unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, format!("monitor_session={mine}").parse().unwrap());
@@ -3051,10 +3117,10 @@ mod tests {
     async fn a_short_password_is_refused_and_changes_nothing() {
         let app = std::sync::Arc::new(app());
         let live = random_token();
-        app.db.create_session(&sha256(&live), Utc::now().timestamp() + 3_600).unwrap();
+        app.db.create_session(&sha256(&live), Utc::now().timestamp() + 3_600, "").unwrap();
 
         let body = Json(json!({"admin_password": "short"}));
-        let response = save_settings(Admin, axum::extract::State(app.clone()), HeaderMap::new(), body).await;
+        let response = save_settings(Admin, axum::extract::State(app.clone()), test_peer(), HeaderMap::new(), body).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(app.db.get("admin_password_hash").is_none(), "the password must not have changed");
@@ -3071,6 +3137,7 @@ mod tests {
             save_settings(
                 Admin,
                 State(app.clone()),
+                test_peer(),
                 HeaderMap::new(),
                 Json(json!({"retention_metrics_days": v.to_owned()})),
             )
@@ -3114,7 +3181,7 @@ mod tests {
             "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
-            save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
+            save_settings(Admin, State(app.clone()), test_peer(), HeaderMap::new(), Json(echoed)).await.status(),
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
