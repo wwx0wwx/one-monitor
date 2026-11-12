@@ -49,14 +49,20 @@ function UrlField({ label, value, onCommit }: { label: string; value: string; on
   const [draft, setDraft] = useState(value)
   // `value` is controlled by the caller and moves under the field -- 「恢复默认」
   // emptying every link, a save from the hub's theme tab -- and the draft must
-  // follow (followCommitted) or the box keeps showing the old value and the
-  // next blur quietly PUTs it back. Reconciled here in render rather than an
-  // effect or a caller-side key: an effect paints one stale frame first, and a
-  // key would remount the input, dropping focus and undo history on every
+  // follow when it moves, or the box keeps showing the old value while the next
+  // blur quietly PUTs it back. Reconciled here in render rather than an effect
+  // or a caller-side key: an effect paints one stale frame first, and a key
+  // would remount the input, dropping focus and undo history on every
   // server-side change.
+  //
+  // The condition is `saved !== value`, not `draft has drifted`: when the typed
+  // draft happens to equal what the server just confirmed, `saved` must still
+  // move -- otherwise it holds a value from before the edit, the next change
+  // back to that old value reads as "no movement", and the draft survives it.
+  // Exactly the shape of typing a link, committing it, then hitting 恢复默认.
   const [saved, setSaved] = useState(value)
   const shown = followCommitted(draft, saved, value)
-  if (shown !== draft) {
+  if (saved !== value) {
     setSaved(value)
     setDraft(shown)
   }

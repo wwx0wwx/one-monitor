@@ -9,7 +9,10 @@
  *
  * Returns what the field should display: the fresh value once it has moved,
  * the draft otherwise, so typing in progress survives a save that changed
- * nothing.
+ * nothing. The caller must re-run this whenever `value` differs from the
+ * `saved` it last acknowledged -- including when the draft happens to equal
+ * the fresh value, or the acknowledgment falls behind and a later move back
+ * to the stale spot reads as "no movement".
  */
 export function followCommitted(draft: string, saved: string, value: string): string {
   return saved === value ? draft : value
