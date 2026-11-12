@@ -231,7 +231,11 @@ pub fn issued_at(expires_at: i64) -> i64 {
 /// someone else's.
 pub fn issue_session(app: &App, headers: &HeaderMap, ip: IpAddr) -> Result<String> {
     let token = random_token();
-    app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400, &ip.to_string())?;
+    app.db.create_session(
+        &sha256(&token),
+        Utc::now().timestamp() + SESSION_DAYS * 86_400,
+        &ip.to_string(),
+    )?;
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
@@ -313,7 +317,8 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(trust_cf_ip(&app), trust_private_xff(&app), &trusted_proxies(&app), &headers, peer.ip());
+    let ip =
+        client_ip(trust_cf_ip(&app), trust_private_xff(&app), &trusted_proxies(&app), &headers, peer.ip());
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，请稍后再试").into_response();
     }
@@ -844,7 +849,10 @@ mod tests {
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(false, true, "", &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(
+            client_ip(false, true, "", &xff("198.51.100.9"), ip("127.0.0.1")).to_string(),
+            "198.51.100.9"
+        );
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
@@ -858,7 +866,10 @@ mod tests {
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
         // which is the same local peer.
         assert_eq!(client_ip(false, true, "", &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(false, true, "", &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(
+            client_ip(false, true, "", &HeaderMap::new(), ip("::ffff:203.0.113.5")),
+            ip("203.0.113.5")
+        );
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
@@ -903,8 +914,14 @@ mod tests {
 
         // On and unparseable: same fallback.
         assert_eq!(
-            client_ip(true, true, "", &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
-                .to_string(),
+            client_ip(
+                true,
+                true,
+                "",
+                &headers(Some("not-an-address"), Some("198.51.100.9")),
+                ip("127.0.0.1")
+            )
+            .to_string(),
             "198.51.100.9"
         );
 
@@ -937,12 +954,18 @@ mod tests {
         // Its neighbour on the same bridge is not the proxy, and a public peer
         // is never trusted however the setting reads.
         assert_eq!(client_ip(false, false, named, &xff("198.51.100.9"), ip("172.18.0.5")), ip("172.18.0.5"));
-        assert_eq!(client_ip(false, false, named, &xff("198.51.100.9"), ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(
+            client_ip(false, false, named, &xff("198.51.100.9"), ip("203.0.113.5")),
+            ip("203.0.113.5")
+        );
 
         // A network names several proxies at once, in either family; a
         // v4-mapped peer of a v4 entry is the same proxy.
         let net = "10.0.0.0/24, 2001:db8:1::/64";
-        assert_eq!(client_ip(false, false, net, &xff("198.51.100.9"), ip("10.0.0.199")).to_string(), "198.51.100.9");
+        assert_eq!(
+            client_ip(false, false, net, &xff("198.51.100.9"), ip("10.0.0.199")).to_string(),
+            "198.51.100.9"
+        );
         assert_eq!(
             client_ip(false, false, net, &xff("198.51.100.9"), ip("::ffff:10.0.0.7")).to_string(),
             "198.51.100.9"

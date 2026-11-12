@@ -150,8 +150,14 @@ pub async fn handler(
         // The same response whether the token is malformed or merely unknown.
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
-    let ip =
-        client_ip(trust_cf_ip(&app), crate::auth::trust_private_xff(&app), &crate::auth::trusted_proxies(&app), &headers, peer.ip()).to_string();
+    let ip = client_ip(
+        trust_cf_ip(&app),
+        crate::auth::trust_private_xff(&app),
+        &crate::auth::trusted_proxies(&app),
+        &headers,
+        peer.ip(),
+    )
+    .to_string();
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
