@@ -51,10 +51,12 @@ export function Login({ totp, onDone }: { totp: boolean; onDone: () => void }) {
               autoComplete="current-password"
               autoFocus
             />
-            {/* 首次部署的入口：初始密码只存在服务器文件里，登录页无从知道它
-                是否还在用，这行指引常驻而不是仅首次显示。 */}
+            {/* 首次部署的入口：初始密码只显示在安装器完成的输出里，登录页
+                无从知道它是否还在用，这行指引常驻而不是仅首次显示。不含
+                服务器路径——这个 bundle 公开可取，文件布局不该跟着出门，
+                找回方法留在部署文档里。 */}
             <p className="text-xs text-muted-foreground">
-              初始密码在服务器上：sudo cat /opt/monitor/data/initial-password（首次登录后自动删除）
+              初始密码显示在安装完成时的输出里，只显示一次；错过了请查阅部署文档（hub/README）找回
             </p>
           </div>
           {totp && (
