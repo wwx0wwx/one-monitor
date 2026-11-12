@@ -45,6 +45,12 @@ monitor-agent --server https://your-hub --token <token>
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
 
+**请在宿主机上运行，不要装进容器**（除非容器挂了 lxcfs）。没有 lxcfs 时，
+`/proc/stat`、`/proc/meminfo`、`/proc/loadavg`、`/proc/uptime` 读到的是**宿主机的全局值**，
+而 `/proc/net/dev` 与挂载表又是容器 namespace 内的值：CPU、内存、负载是宿机的，
+网卡与磁盘是容器的，两套口径混在一起且页面上没有任何标注。`Facts.cpu_cores` 统计的是
+逻辑核（含超线程），与 `nproc` 一致。
+
 协议说明见 [hub 源码](https://github.com/wwx0wwx/one-monitor/tree/main/hub)。
 
 ## 构建

@@ -287,7 +287,12 @@ fn cpu_jiffies() -> Option<(u64, u64)> {
 
 fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
     let line = text.lines().next()?.strip_prefix("cpu ")?;
-    let v: Vec<u64> = line.split_whitespace().filter_map(|f| f.parse().ok()).collect();
+    // A field that fails to parse fails the line. Dropping it silently, as a
+    // filter_map would, shifts every later field one place left: idle and
+    // iowait would read the values of their neighbours, and the length check
+    // below could not tell -- a kernel that ever emitted such a line would be
+    // reported as busy or idle by fields that are not those things.
+    let v: Vec<u64> = line.split_whitespace().map(|f| f.parse::<u64>().ok()).collect::<Option<Vec<_>>>()?;
     if v.len() < 5 {
         return None;
     }
@@ -348,7 +353,12 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
         if skip_iface(name) || is_stacked(name) {
             continue;
         }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+        // As in `parse_cpu_jiffies`: a field that fails to parse fails the
+        // line, rather than shifting rx bytes and tx bytes into each other's
+        // columns.
+        let Some(f) = rest.split_whitespace().map(|v| v.parse::<u64>().ok()).collect::<Option<Vec<_>>>() else {
+            continue;
+        };
         if f.len() >= 9 {
             rx = rx.saturating_add(f[0]);
             tx = tx.saturating_add(f[8]);
@@ -529,6 +539,13 @@ fn cpuinfo() -> (String, u32) {
     (name, cores)
 }
 
+// `cores` above counts logical processors, hyperthreads included, because that
+// is all /proc/cpuinfo names. A physical-core count needs the sysfs topology
+// (`thread_siblings_list`), which guests and containers routinely hide; a
+// 4-core/8-thread host therefore reports `cpu_cores: 8`. The panel's "核"
+// reads as the same thing `nproc` prints, which is what an operator comparing
+// the two expects.
+
 fn os_pretty_name() -> String {
     fs::read_to_string("/etc/os-release")
         .ok()
@@ -611,6 +628,10 @@ mod tests {
         // user and nice: 80 busy jiffies, not 1080.
         assert_eq!(parse_cpu_jiffies("cpu  10 10 10 10 10 10 10 10 500 500\n"), Some((80, 20)));
         assert!(parse_cpu_jiffies("garbage").is_none());
+        // A malformed field fails the line rather than silently shifting the
+        // columns: with the middle field dropped, idle would read 35 -- the
+        // value of the column before it -- and the reading would look sound.
+        assert!(parse_cpu_jiffies("cpu  40 0 x 35 925 0 0 0 0 0").is_none());
 
         // 100 more jiffies since the baseline, 25 idle => 75% busy. Asserted
         // against the function the binary runs rather than a copy of the
@@ -656,6 +677,18 @@ mod tests {
              eth0.100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
               vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
         assert_eq!(parse_net_dev(dev), (1000, 2000));
+    }
+
+    /// A malformed field skips its own interface rather than shifting every
+    /// later column one place left -- with the shift, tx would read the value
+    /// of the errs column beside it and the lifetime total would climb by
+    /// numbers that belong to no counter.
+    #[test]
+    fn a_malformed_net_dev_line_counts_nothing_rather_than_the_wrong_columns() {
+        let head = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n";
+        let good = "  eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        let bad = "  eth1: 1000 x 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(&format!("{head}{good}{bad}")), (1000, 2000), "only the well-formed line counts");
     }
 
     /// The two questions asked of an interface name, and why one list cannot

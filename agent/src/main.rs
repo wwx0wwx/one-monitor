@@ -194,12 +194,57 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
+        let mut rejected = false;
         if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
             eprintln!("session ended: {e:#}");
+            rejected = token_rejected(&e);
+            if rejected {
+                eprintln!(
+                    "the hub refused this node's token; it was probably rotated in the panel. \
+                     Reinstall the agent, or put the new token in /opt/monitor/agent.env and \
+                     restart monitor-agent. Retrying slowly in case the hub is wrong"
+                );
+            }
         }
-        wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+        wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()), rejected);
+        // A fleet that shared a hub restart is released by the same backoff
+        // expiry; the jitter spreads the reconnects over the two seconds that
+        // follow rather than landing every handshake on the same one.
+        tokio::time::sleep(Duration::from_millis(wait * 1_000 + jitter_millis())).await;
     }
+}
+
+/// Whether the failure names a refusal of this node's token rather than a
+/// transport problem: the handshake completed and was answered, with HTTP 401
+/// or 403.
+///
+/// The panel retires tokens from its own page, and a retired token is refused
+/// this way forever. Without telling the two apart, the agent retries the
+/// refused handshake on the ordinary backoff for as long as it runs -- a crash
+/// loop a few bytes quieter than a crash.
+fn token_rejected(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<WsError>().is_some_and(|ws| {
+            matches!(ws, WsError::Http(response) if response.status().as_u16() == 401 || response.status().as_u16() == 403)
+        })
+    })
+}
+
+/// Somewhere inside [0, 2) seconds, different on every call.
+///
+/// `RandomState` is seeded from the OS, so two of its hashers answer
+/// differently even in the same process at the same nanosecond; a dedicated
+/// RNG crate is not worth a dependency for one small number.
+fn jitter_millis() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
+    );
+    hasher.finish() % 2_000
 }
 
 /// Backoff before the next connection attempt, derived from the previous wait
@@ -210,8 +255,16 @@ async fn main() -> Result<()> {
 /// A session that reported for a while proves the hub reachable and the token
 /// valid, so the wait resets to one second. Only short-lived sessions keep
 /// doubling, which keeps an agent off a hub in a crash loop.
-fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
-    if lasted >= Duration::from_secs(30) {
+///
+/// A refused token holds at [`TOKEN_RETRY`] instead: the answer will be the
+/// same until a human intervenes, and an interval measured in minutes rather
+/// than seconds keeps the journal readable while the agent still picks up a
+/// corrected token (or a hub that was wrong about the refusal) on its own.
+const TOKEN_RETRY: u64 = 600;
+fn reconnect_wait(previous: u64, lasted: Duration, rejected: bool) -> u64 {
+    if rejected {
+        TOKEN_RETRY.max(previous)
+    } else if lasted >= Duration::from_secs(30) {
         1
     } else {
         (previous * 2).clamp(1, 60)
@@ -298,15 +351,24 @@ async fn session(
                 // heartbeat ping -- the only one on an otherwise idle link.
                 last_frame = Instant::now();
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                            if rpc.method == "ping.tasks" {
-                                if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
-                                }
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<Rpc>(&text) {
+                        Ok(rpc) if rpc.method == "ping.tasks" => {
+                            match serde_json::from_value::<Vec<PingTask>>(rpc.params) {
+                                Ok(tasks) => respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx),
+                                // Named rather than silent: a hub and an agent
+                                // that disagree on the task list otherwise show
+                                // nothing anywhere -- probes stop running with
+                                // no line in any log to say why.
+                                Err(e) => eprintln!("hub sent a ping.tasks list this agent cannot read: {e}"),
                             }
                         }
-                    }
+                        Ok(rpc) => {
+                            eprintln!("hub sent an unknown method {:?}; ignored", rpc.method);
+                        }
+                        Err(e) => {
+                            eprintln!("hub sent a frame this agent cannot parse: {e}");
+                        }
+                    },
                     // Ping included: tungstenite queues the pong itself and
                     // sends it on the next read; a manual reply would duplicate it.
                     Some(Ok(_)) => {}
@@ -474,7 +536,7 @@ mod tests {
         let mut wait = 0;
         let climb: Vec<u64> = (0..8)
             .map(|_| {
-                wait = reconnect_wait(wait, Duration::ZERO);
+                wait = reconnect_wait(wait, Duration::ZERO, false);
                 wait
             })
             .collect();
@@ -482,9 +544,37 @@ mod tests {
 
         // A session that ran resets the wait however high it had climbed:
         // the hub-restart case.
-        assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
+        assert_eq!(reconnect_wait(60, Duration::from_secs(3600), false), 1);
         // Connected but dropped too early to prove anything: still a retreat.
-        assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+        assert_eq!(reconnect_wait(4, Duration::from_secs(29), false), 8);
+        // A refused token holds at TOKEN_RETRY and never shortens below it,
+        // however long the (failed) handshake appeared to last.
+        assert_eq!(reconnect_wait(1, Duration::ZERO, true), TOKEN_RETRY);
+        assert_eq!(reconnect_wait(TOKEN_RETRY, Duration::from_secs(3600), true), TOKEN_RETRY);
+    }
+
+    /// The refusal the agent must distinguish from a network problem: the
+    /// handshake reached the hub, the hub answered, and the answer was 401.
+    /// Anything else -- transport errors, a successful upgrade wrapped in an
+    /// error, a 502 from a proxy -- is a transport problem and must not park
+    /// the agent on the ten-minute wait.
+    #[test]
+    fn only_an_http_refusal_of_the_token_counts_as_one() {
+        use tokio_tungstenite::tungstenite::http::Response;
+
+        let refused =
+            |code| anyhow::Error::new(WsError::Http(Box::new(Response::builder().status(code).body(None).unwrap())));
+        assert!(token_rejected(&refused(401)));
+        assert!(token_rejected(&refused(403)));
+        assert!(!token_rejected(&refused(500)));
+        assert!(!token_rejected(&refused(502)));
+        // Wrapped the way `session` returns it: the context must not hide the
+        // cause from the chain.
+        let wrapped = refused(401).context("connect");
+        assert!(token_rejected(&wrapped));
+        // A transport failure is not a refusal, whatever its flavour.
+        assert!(!token_rejected(&anyhow::Error::new(WsError::ConnectionClosed)));
+        assert!(!token_rejected(&anyhow::anyhow!("no connection after 120s")));
     }
 
     #[test]
