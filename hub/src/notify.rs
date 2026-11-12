@@ -52,6 +52,19 @@ const RETRY: Duration = Duration::from_secs(10);
 /// within both.
 const LISTED: usize = 20;
 
+/// Ceiling on a rendered message, in bytes of UTF-8. `LISTED` alone does not
+/// bound it: node names come from the operator, and a list of twenty long ones
+/// -- or a single detail line from a template -- still crosses the 2000-odd
+/// characters the stricter channels reject, and a rejection is a 4xx the
+/// delivery does not retry, so the alert is lost outright. Chars are counted on
+/// a boundary, keeping the message valid UTF-8 however it was cut.
+const MESSAGE_BYTES: usize = 1_800;
+
+/// Ceiling on the comma-separated `node` field, in characters. Telegram allows
+/// 4096 in a message and a template that interpolates `{{node}}` places this
+/// field inside it; a fleet of long names would otherwise silently exceed it.
+const NODE_CHARS: usize = 300;
+
 /// How often connectivity and traffic are examined. An offline alert therefore
 /// trails the grace period by at most this interval.
 const SWEEP: Duration = Duration::from_secs(30);
@@ -273,6 +286,11 @@ fn channels(app: &App) -> Vec<Channel> {
 /// retrying it would hold the queue for 20 s per alert.
 struct Failure {
     retry: bool,
+    /// How long to wait before the next attempt, when `retry` is set. Absent
+    /// means the fixed `RETRY`; a Telegram 429 names its own window in
+    /// `retry_after`, and waiting less than that only spends another attempt
+    /// inside the window the service asked the hub to stay out of.
+    wait: Option<Duration>,
     reason: String,
 }
 
@@ -283,15 +301,24 @@ struct Failure {
 /// `Authorization` and cookies, so a credential header such as `X-Gotify-Key`
 /// would follow it. Built on first use, so a hub without channels never
 /// allocates it.
-fn client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("http client")
-    })
+///
+/// The build failure that `expect` would turn into a panic is returned instead:
+/// `deliver` runs as its own spawned task with nobody to unwind into, and a
+/// panic there would end deliveries for the life of the process while the queue
+/// silently filled and dropped. A hub that cannot build a client at all fails
+/// each alert, loudly, on its own merits.
+fn client() -> Result<&'static reqwest::Client, Failure> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|reason| Failure { retry: false, wait: None, reason: reason.clone() })
 }
 
 async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> {
@@ -299,7 +326,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     let request = match channel {
         // Plain text: under a parse mode Telegram rejects a message whose node
         // name happens to contain markup.
-        Channel::Telegram { token, chat, text } => client()
+        Channel::Telegram { token, chat, text } => client()?
             .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
             .json(&json!({"chat_id": chat, "text": render(text, note, &site, false)})),
         Channel::Webhook { url, headers, body } => {
@@ -308,10 +335,12 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
             // default instead of in its place.
             let mut map = HeaderMap::new();
             map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            for (name, value) in parse_headers(headers).map_err(|reason| Failure { retry: false, reason })? {
+            for (name, value) in parse_headers(headers)
+                .map_err(|reason| Failure { retry: false, wait: None, reason })?
+            {
                 map.insert(name, value);
             }
-            client().post(url).headers(map).body(render(body, note, &site, true))
+            client()?.post(url).headers(map).body(render(body, note, &site, true))
         }
     };
     // The URL is stripped from the error: Telegram's carries the bot token and a
@@ -319,6 +348,7 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     // and the panel.
     let mut response = request.send().await.map_err(|e| Failure {
         retry: true,
+        wait: None,
         reason: format!("{:#}", anyhow::Error::from(e.without_url())),
     })?;
     let status = response.status();
@@ -327,18 +357,34 @@ async fn post(app: &App, channel: &Channel, note: &Note) -> Result<(), Failure> 
     }
     if status.is_redirection() {
         let reason = format!("{status}: the URL redirects; enter the address it redirects to");
-        return Err(Failure { retry: false, reason });
+        return Err(Failure { retry: false, wait: None, reason });
     }
     // The first chunk carries the reason (Telegram's `description`, Discord's
     // `message`) without reading an error page of arbitrary length.
     let head = response.chunk().await.ok().flatten().unwrap_or_default();
-    Err(Failure {
-        retry: status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
-        reason: format!(
-            "{status}: {}",
-            String::from_utf8_lossy(&head).chars().take(300).collect::<String>().trim()
-        ),
-    })
+    let body = String::from_utf8_lossy(&head);
+    let reason = format!(
+        "{status}: {}",
+        body.chars().take(300).collect::<String>().trim()
+    );
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(Failure { retry: true, wait: retry_wait(&body), reason });
+    }
+    Err(Failure { retry: status.is_server_error(), wait: None, reason })
+}
+
+/// The pause a Telegram 429 asks for, from its `parameters.retry_after`
+/// seconds. Absent when the body names none -- any other rate-limiting endpoint,
+/// or a body that failed to parse -- and the fixed `RETRY` applies instead.
+/// Capped, so a hostile or misbehaving endpoint cannot park the queue with a
+/// number it made up.
+fn retry_wait(body: &str) -> Option<Duration> {
+    let secs = serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("parameters")?
+        .get("retry_after")?
+        .as_i64()?;
+    Some(Duration::from_secs(secs.clamp(1, 60) as u64))
 }
 
 /// Queues an alert without waiting, so that sign-in and housekeeping never
@@ -350,26 +396,46 @@ pub fn send(app: &App, mut note: Note) {
     }
 }
 
-/// Delivers queued alerts one at a time, each channel retried independently.
+/// Delivers queued alerts one at a time, every channel in parallel.
 ///
 /// At most once: an alert that exhausts its attempts is dropped, and the state
 /// that produced it (`down_since`, the traffic step, the digest date) already
 /// records it as sent, so it is not raised again.
+///
+/// The channels run concurrently because their failures are independent: a
+/// webhook that hangs to its timeout would otherwise hold Telegram's copy of
+/// the same alert -- and every alert behind it -- for the retries it alone
+/// needs, and a queue filled during such an outage drops what it was holding
+/// them for.
 pub async fn deliver(app: Shared, mut inbox: mpsc::Receiver<Note>) {
     while let Some(note) = inbox.recv().await {
-        for channel in channels(&app) {
-            for attempt in 1..=ATTEMPTS {
-                match post(&app, &channel, &note).await {
-                    Ok(()) => break,
-                    Err(f) if !f.retry || attempt == ATTEMPTS => {
-                        warn!("{} alert {:?} not delivered: {}", channel.name(), note.title, f.reason);
-                        break;
-                    }
-                    Err(f) => {
-                        debug!("{} alert {:?}, attempt {attempt}: {}", channel.name(), note.title, f.reason);
-                        tokio::time::sleep(RETRY).await;
-                    }
-                }
+        let deliveries: Vec<_> = channels(&app)
+            .into_iter()
+            .map(|channel| {
+                let (app, note) = (app.clone(), note.clone());
+                tokio::spawn(async move { deliver_through(&app, channel, &note).await })
+            })
+            .collect();
+        for delivery in deliveries {
+            // Nothing to observe: the task logs its own outcome, and a join
+            // error is itself a panic this loop must not inherit.
+            let _ = delivery.await;
+        }
+    }
+}
+
+/// One alert through one channel, to its own retries and its own conclusion.
+async fn deliver_through(app: &App, channel: Channel, note: &Note) {
+    for attempt in 1..=ATTEMPTS {
+        match post(app, &channel, note).await {
+            Ok(()) => return,
+            Err(f) if !f.retry || attempt == ATTEMPTS => {
+                warn!("{} alert {:?} not delivered: {}", channel.name(), note.title, f.reason);
+                return;
+            }
+            Err(f) => {
+                debug!("{} alert {:?}, attempt {attempt}: {}", channel.name(), note.title, f.reason);
+                tokio::time::sleep(f.wait.unwrap_or(RETRY)).await;
             }
         }
     }
@@ -461,18 +527,50 @@ pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
 fn batch(event: &'static str, mark: &str, what: &str, items: Vec<(&str, String)>) -> Option<Note> {
     let (title, message) = match items.as_slice() {
         [] => return None,
-        [(name, detail)] => (format!("{mark} {name} {what}"), detail.clone()),
+        [(name, detail)] => (format!("{mark} {name} {what}"), truncate_chars(detail, MESSAGE_BYTES)),
         _ => {
-            let mut lines: Vec<String> =
-                items.iter().take(LISTED).map(|(name, detail)| format!("{name} · {detail}")).collect();
-            if items.len() > LISTED {
-                lines.push(format!("……另外 {} 台", items.len() - LISTED));
+            // Both ceilings: the item count bounds the work, and the byte
+            // budget the rendered length -- names come from the operator, and
+            // twenty long ones cross the limit twenty short ones sit far from.
+            let mut lines: Vec<String> = Vec::new();
+            let mut spent = 0usize;
+            let mut listed = 0usize;
+            for (name, detail) in items.iter() {
+                if listed >= LISTED {
+                    break;
+                }
+                let line = format!("{name} · {detail}");
+                // Plus one for the newline that joins it to the rest.
+                if spent + line.len() + 1 > MESSAGE_BYTES {
+                    break;
+                }
+                spent += line.len() + 1;
+                listed += 1;
+                lines.push(line);
+            }
+            if items.len() > listed {
+                lines.push(format!("……另外 {} 台", items.len() - listed));
             }
             (format!("{mark} {} 台节点{what}", items.len()), lines.join("\n"))
         }
     };
     let node = items.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
+    let node = truncate_chars(&node, NODE_CHARS);
     Some(Note { event, node, title, message, ..Default::default() })
+}
+
+/// `text` cut to at most `max` characters, on a character boundary, with an
+/// ellipsis wherever something was cut. Lengths in this module are budgets
+/// against character limits the far ends state in characters (Discord) or
+/// bytes (WeCom, Telegram); counting characters bounds both from above for
+/// the text involved, and never splits what it cuts.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// Sweep state that need not outlive the process.
@@ -711,6 +809,35 @@ mod tests {
         assert_eq!(note.message.lines().count(), LISTED + 1);
         assert!(note.message.ends_with("……另外 40 台"));
         assert_eq!(note.node.split(", ").count(), 60);
+
+        // Fewer items than LISTED, but long names: the byte budget cuts the
+        // list where the item count would not, and the count line says so.
+        let long: Vec<String> = (0..60).map(|i| format!("server-with-a-very-long-name-{i:03}")).collect();
+        let note = batch(
+            "offline",
+            "🔴",
+            "离线",
+            long.iter().map(|n| (n.as_str(), "a long detail line".into())).collect(),
+        )
+        .unwrap();
+        assert!(note.message.len() <= MESSAGE_BYTES + "……另外 60 台".len(), "{} bytes", note.message.len());
+        assert!(note.message.contains("……另外"), "the truncation is named, not silent");
+        assert!(note.node.chars().count() <= NODE_CHARS, "the node field is bounded too");
+        assert!(note.node.ends_with('…'));
+
+        // A single item with a long detail is truncated without the list
+        // machinery, and short text passes through byte for byte.
+        let single = batch("offline", "🔴", "离线", vec![("a", "x".repeat(9_000))]).unwrap();
+        assert!(single.message.chars().count() <= MESSAGE_BYTES);
+        assert_eq!(truncate_chars("short", MESSAGE_BYTES), "short");
+        assert_eq!(truncate_chars("精确边界值", 4), "精确边…");
+
+        // Telegram's 429 names its window; anything else falls back to the
+        // fixed pause, and a window the endpoint made up is capped.
+        assert_eq!(retry_wait(r#"{"ok":false,"parameters":{"retry_after":25}}"#), Some(Duration::from_secs(25)));
+        assert_eq!(retry_wait(r#"{"parameters":{"retry_after":9000}}"#), Some(Duration::from_secs(60)));
+        assert_eq!(retry_wait(r#"{"ok":false,"description":"Too Many Requests"}"#), None);
+        assert_eq!(retry_wait("not json"), None);
     }
 
     #[test]
