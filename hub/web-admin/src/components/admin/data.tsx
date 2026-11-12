@@ -224,5 +224,3 @@ export function Data() {
     </div>
   )
 }
-
-// Each area is its own route rather than a tab, so a page can be linked to and a

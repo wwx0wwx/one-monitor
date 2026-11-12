@@ -288,5 +288,3 @@ export function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void 
     </div>
   )
 }
-
-// The two ways into this panel, on their own page: the GitHub identity it trusts

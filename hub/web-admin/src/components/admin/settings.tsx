@@ -124,13 +124,23 @@ export function SettingsTab() {
         <div className="flex items-center gap-2 text-sm">
           <Switch
             aria-labelledby="private-xff-label"
-            checked={s.trust_private_xff === "on"}
+            checked={s.trust_private_xff !== "off"}
             onCheckedChange={(v) => set("trust_private_xff", v ? "on" : "off")}
           />
           <span id="private-xff-label">
             反代与 hub 之间经过内网时按 X-Forwarded-For 识别来源（Docker 等容器部署需要开；反代在本机或 hub 直接公网时可关闭以收紧）
           </span>
         </div>
+        <Field
+          label="信任的代理地址"
+          hint="逗号分隔的 IP 或网段（如 172.18.0.4, 10.0.0.0/24）。列出的地址发来的 X-Forwarded-For 会被信任，比上面的内网开关更收紧；留空则只按上面两项判断"
+        >
+          <Input
+            value={String(s.trusted_proxies ?? "")}
+            onChange={(e) => set("trusted_proxies", e.target.value)}
+            placeholder="172.18.0.4, 10.0.0.0/24"
+          />
+        </Field>
         <div>
           <Button
             size="sm"
@@ -142,6 +152,11 @@ export function SettingsTab() {
                 public_page: s.public_page === "off" ? "off" : "on",
                 auto_join_ping: s.auto_join_ping === "on" ? "on" : "off",
                 cf_connecting_ip: s.cf_connecting_ip === "on" ? "on" : "off",
+                // Was missing from this call before: the switch above edited
+                // local state only, and a reload quietly showed the unsaved
+                // value as if it were the hub's.
+                trust_private_xff: s.trust_private_xff === "off" ? "off" : "on",
+                trusted_proxies: String(s.trusted_proxies ?? ""),
               })
             }
           >

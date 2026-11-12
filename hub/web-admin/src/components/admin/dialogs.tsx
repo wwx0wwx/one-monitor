@@ -398,9 +398,13 @@ export function RegisterDialog({ site, reg, onClose }: {
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
-          <Button onClick={() => copy(command)} disabled={!command}>
-            <Copy className="size-4" /> 复制
-          </Button>
+          {/* No disabled copy button while the window is shut: there is nothing
+              to copy yet, and a greyed button implies a command that exists. */}
+          {command && (
+            <Button onClick={() => copy(command)}>
+              <Copy className="size-4" /> 复制
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -418,7 +422,9 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
   // reissue: displaying the command must not retire what the running agent
   // holds; the button below does that, deliberately.
   const [token, setToken] = useState("")
-  const [interval, setInterval] = useState("1")
+  // Text rather than a number, and named for it: a bare `setInterval` shadows
+  // the global the rest of this file's countdowns reach for.
+  const [intervalText, setIntervalText] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   // The hub relays the agent binary from GitHub behind this prefix. Surfaced
@@ -439,7 +445,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
       .catch(() => setProxy(""))
   }, [node.id])
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(intervalText) || 1)))
   const command = token ? installCommand(site, token, seconds) : ""
 
   // The toggle stores the setting itself: on with an address, or off clearing
@@ -483,7 +489,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
         </DialogHeader>
         <div className="space-y-5">
           <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
-            <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
+            <Input type="number" min={1} max={3600} value={intervalText} onChange={(e) => setIntervalText(e.target.value)} />
           </Field>
           <div className="space-y-2 rounded-lg border bg-muted/30 px-3 py-2.5">
             <label className="flex cursor-pointer items-center justify-between gap-4 text-sm">
@@ -507,6 +513,7 @@ export function InstallDialog({ node, site, onClose, onRotated }: {
           </div>
           <div className="space-y-2">
             <Label className="text-sm font-medium">安装命令</Label>
+            <p className="text-sm text-muted-foreground">在目标服务器上以 root 执行（Linux）：</p>
             <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
               {/* The token read failed, or the dialog is still reading it;
                   reissuing is the operator's explicit choice below. */}

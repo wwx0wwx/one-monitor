@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, changes, GIB, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, ApiError, changes, GIB, provisioningSite, trafficCorrection, upload } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -31,3 +31,50 @@ assert.deepEqual(addresses({ ip: "203.0.113.7" }), ["203.0.113.7"])
 assert.deepEqual(addresses({ ipv4: "10.0.0.2" }), ["10.0.0.2"])
 assert.deepEqual(addresses({}), [])
 console.log("partial edits, traffic corrections, provisioning and address checks passed")
+
+// Chunk retries, against a fake POST and a sleep that returns at once. The
+// hub's receive() only appends a piece that begins where the file on disk
+// ends, so a retried chunk always re-aligns -- what these exercise is the
+// client's side of that bargain: same offset resent, transient faults ridden
+// out, verdicts on the request itself accepted on first sight.
+{
+  const file = new File([new Uint8Array(8)], "backup.db")
+  const reply = (status: number) => new Response(status === 200 ? '{"received":8}' : "", { status })
+  const nowait = () => Promise.resolve()
+
+  // First POST dies on the network, second is answered 500, third lands:
+  // both retryable kinds, still one completed upload.
+  let calls = 0
+  const flaky = async () => {
+    calls++
+    if (calls === 1) throw new TypeError("fetch failed")
+    return reply(calls === 2 ? 500 : 200)
+  }
+  assert.deepEqual(await upload("/db/restore", file, undefined, undefined, flaky, nowait), { received: 8 })
+  assert.equal(calls, 3)
+
+  // A 413 is the proxy's own answer; resending the same bytes cannot change it.
+  let seen = 0
+  const rejected = async () => {
+    seen++
+    return reply(413)
+  }
+  await assert.rejects(
+    () => upload("/db/restore", file, undefined, undefined, rejected, nowait),
+    (e: Error) => e instanceof ApiError && e.status === 413,
+  )
+  assert.equal(seen, 1)
+
+  // Three network failures in a row exhaust the retries and surface the error.
+  calls = 0
+  const dead = async () => {
+    calls++
+    throw new TypeError("fetch failed")
+  }
+  await assert.rejects(
+    () => upload("/db/restore", file, undefined, undefined, dead, nowait),
+    (e: Error) => e instanceof TypeError,
+  )
+  assert.equal(calls, 3)
+}
+console.log("upload chunk retry checks passed")

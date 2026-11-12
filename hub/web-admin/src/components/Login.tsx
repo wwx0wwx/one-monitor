@@ -51,6 +51,11 @@ export function Login({ totp, onDone }: { totp: boolean; onDone: () => void }) {
               autoComplete="current-password"
               autoFocus
             />
+            {/* 首次部署的入口：初始密码只存在服务器文件里，登录页无从知道它
+                是否还在用，这行指引常驻而不是仅首次显示。 */}
+            <p className="text-xs text-muted-foreground">
+              初始密码在服务器上：sudo cat /opt/monitor/data/initial-password（首次登录后自动删除）
+            </p>
           </div>
           {totp && (
             <div className="space-y-1.5">

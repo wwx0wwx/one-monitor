@@ -1,6 +1,6 @@
 // The server list: drag and keyboard ordering, the row actions.
 import { useRef, useState } from "react"
-import { CalendarClock, Download, GripVertical, Pencil, Plus, Server, Trash2 } from "lucide-react"
+import { CalendarClock, Download, GripVertical, Pencil, Plus, Server, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -14,14 +14,29 @@ import { bytes, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 import { Addresses, ConfirmDialog, animate } from "./shared"
 import { BillingForm, CreateNode, InstallDialog, NodeForm, RegisterDialog, useRegisterWindow } from "./dialogs"
+import { useSettings } from "./settings"
 
-export function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
+export function Nodes({ nodes, refresh, site, canProvision, go }: {
+  nodes: Node[]
+  refresh: () => void
+  site: string
+  canProvision: boolean
+  /** The section nav's own router, so the banner below can point elsewhere. */
+  go: (to: string) => void
+}) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
   const [installing, setInstalling] = useState<Node | null>(null)
   const [registering, setRegistering] = useState(false)
   const reg = useRegisterWindow()
+  // The one settings read this page makes: whether two-step login is on. Read
+  // from /settings like the security page itself, so the banner agrees with the
+  // page it sends the operator to.
+  const { s: settings } = useSettings()
+  // Dismissed, not "done": the banner must survive reloads until it is either
+  // acted on or explicitly closed, but not nag across devices.
+  const [bannerOff, setBannerOff] = useState(() => localStorage.getItem("security-banner-dismissed") === "1")
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
@@ -90,6 +105,30 @@ export function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; r
 
   return (
     <div className="space-y-4">
+      {/* The first-login nudge: a fresh hub has password-only login and often
+          the initial password still in place. Shown only while that is actually
+          true -- once totp_set reports bound, the banner goes without a
+          dismissal needed. */}
+      {settings && settings.totp_set !== true && !bannerOff && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-muted/30 px-4 py-3 text-sm">
+          <span>建议到「安全」开启两步验证，如果还在用初始密码请先修改</span>
+          <span className="flex items-center gap-1">
+            <Button size="sm" variant="outline" onClick={() => go("/admin/security")}>去开启</Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              title="关闭提醒"
+              aria-label="关闭两步验证提醒"
+              onClick={() => {
+                localStorage.setItem("security-banner-dismissed", "1")
+                setBannerOff(true)
+              }}
+            >
+              <X />
+            </Button>
+          </span>
+        </div>
+      )}
       {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装服务器。</p>}
       <datalist id="node-groups">
         {groups.map((g) => <option key={g} value={g} />)}

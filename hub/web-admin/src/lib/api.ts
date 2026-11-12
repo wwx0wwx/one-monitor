@@ -162,12 +162,32 @@ const CHUNK = 4 * 1024 * 1024
  * Uploads a file one chunk at a time. There is no upload id: the hub tracks an
  * upload by the length of what it has already written, so a chunk states only
  * where it begins. The last one carries the result.
+ *
+ * A failed chunk is resent at the same offset, up to two more times with a
+ * 500 ms then 1500 ms backoff. The hub's `receive()` makes that safe by design:
+ * it accepts a piece only when it begins exactly where the file on disk already
+ * ends, and a failure truncates back to that boundary -- a piece lands whole or
+ * not at all -- so a resend always aligns and two failures in a row leave
+ * nothing half-written behind. Network errors, HTTP 5xx and 429 are transient
+ * and worth another attempt; any other 4xx is a verdict on the request itself
+ * (the proxy's 413, the hub's own 400) and is thrown without retrying.
  */
 export async function upload<T>(
   path: string,
   file: File,
   onProgress?: (sent: number) => void,
   signal?: AbortSignal,
+  // The two trailing parameters exist for the test: a fake POST fails on
+  // schedule, and a no-op sleep keeps the backoff from adding seconds to the
+  // suite. No caller passes them.
+  post: (offset: number) => Promise<Response> = (offset) =>
+    fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: file.slice(offset, offset + CHUNK),
+      signal,
+    }),
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<T> {
   if (file.size === 0) throw new ApiError(400, "文件是空的")
   let last: Response | null = null
@@ -176,21 +196,38 @@ export async function upload<T>(
     // the last piece lands, and `offset = 0` truncates whatever an abandoned
     // attempt left behind, so aborting here leaves the state unchanged.
     if (signal?.aborted) throw new DOMException("aborted", "AbortError")
-    const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
-      method: "POST",
-      headers: { "content-type": "application/octet-stream" },
-      body: file.slice(offset, offset + CHUNK),
-      signal,
-    })
-    if (!res.ok) {
-      // A 413 never reached the hub: the proxy in front answered, and only its
-      // own logs record it. The message names the setting responsible.
-      throw new ApiError(
-        res.status,
-        res.status === 413
-          ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-          : (await res.text()) || res.statusText,
-      )
+    let res: Response
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await post(offset)
+        if (res.ok) break
+        if (res.status >= 500 || res.status === 429) {
+          if (attempt < 2) {
+            await sleep(attempt === 0 ? 500 : 1500)
+            // The backoff may be exactly when the operator gives up.
+            if (signal?.aborted) throw new DOMException("aborted", "AbortError")
+            continue
+          }
+        }
+        // Exhausted retries, or a 4xx the same bytes cannot fix. A 413 never
+        // reached the hub: the proxy in front answered, and only its own logs
+        // record it. The message names the setting responsible.
+        throw new ApiError(
+          res.status,
+          res.status === 413
+            ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
+            : (await res.text()) || res.statusText,
+        )
+      } catch (e) {
+        // Abort is the operator's choice, not a fault to retry; the ApiError
+        // above must also leave through, not loop again.
+        if (e instanceof ApiError || (e as Error).name === "AbortError") throw e
+        // A thrown fetch is a network-level failure: the request may never have
+        // arrived, which is precisely the transient kind.
+        if (attempt >= 2) throw e
+        await sleep(attempt === 0 ? 500 : 1500)
+        if (signal?.aborted) throw new DOMException("aborted", "AbortError")
+      }
     }
     last = res
     onProgress?.(Math.min(offset + CHUNK, file.size))

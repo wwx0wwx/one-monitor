@@ -13,7 +13,18 @@ import QRCode from "qrcode"
 import { ConfirmDialog, Field, copy } from "./shared"
 import { useSettings, type Settings } from "./settings"
 
-export type Session = { id: string; current: boolean; created_at: number }
+export type Session = { id: string; current: boolean; created_at: number; ip: string }
+
+// 24-hour Chinese: every server's journal and the hub's own logs use it, so an
+// am/pm stamp reads as wrong at a glance here.
+const sessionTime = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+})
 
 export function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
@@ -47,8 +58,11 @@ export function Sessions() {
       <div className="divide-y">
         {rows.map((s) => (
           <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-            <div className="flex min-w-0 items-center gap-2 text-sm">
-              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
+            <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm">
+              <span className="tnum">{sessionTime.format(new Date(s.created_at * 1000))}</span>
+              {/* Where the sign-in came from; empty when no address survived the
+                  proxies in front of the hub. */}
+              <span className="tnum text-muted-foreground">{s.ip || "—"}</span>
               {s.current && <Badge variant="secondary">当前设备</Badge>}
             </div>
             {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删

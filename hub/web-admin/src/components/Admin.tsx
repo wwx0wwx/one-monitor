@@ -76,7 +76,7 @@ export function Admin({
         ) : path === "/admin/settings" ? (
           <SettingsTab />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} go={go} />
         )}
       </div>
     </div>
