@@ -133,11 +133,18 @@ fi
 
 # The service user the unit below runs as, created before the download and the
 # registration, so a host where this fails keeps the agent it already runs and
-# spends no registration key. OpenRC has no equivalent and Alpine ships no
-# useradd, which is why this is confined to systemd.
+# spends no registration key. The agent needs no privilege it would lose: it
+# reads /proc and /sys, opens outbound sockets and nothing else. Alpine ships
+# no useradd, but its busybox adduser answers the same question (-S system,
+# -D no password, -H no home directory), so the OpenRC branch drops privileges
+# the same way the systemd one does.
 if [ "$INIT" = systemd ]; then
 	id -u monitor-agent >/dev/null 2>&1 ||
 		useradd --system --no-create-home --shell /usr/sbin/nologin monitor-agent ||
+		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
+else
+	id -u monitor-agent >/dev/null 2>&1 ||
+		adduser -S -D -H -h /nonexistent -s /sbin/nologin monitor-agent ||
 		{ echo "cannot create the system user monitor-agent" >&2; exit 1; }
 fi
 
@@ -208,6 +215,18 @@ case "$TOKEN" in
 	;;
 esac
 
+# The old binary is kept aside until the new one has proved it starts, in the
+# same shape as install-hub.sh: an upgrade that fails on a remote node must
+# leave it reporting, not crash-looping until someone SSHes in. Never over an
+# existing backup -- a run that died between the install and the check below
+# left $BIN holding a binary that never proved itself, and copying that over
+# the good backup would make the rollback restore the same broken binary while
+# reporting success.
+backup=""
+if [ -f "$BIN" ]; then
+	backup="$BIN.old"
+	[ -f "$backup" ] || cp -f "$BIN" "$backup"
+fi
 # Stop an agent already running here before replacing its binary. The service
 # name is fixed, so a reinstall could never start a second copy, but without this
 # the new binary lands beneath a live process and only the restart at the end
@@ -241,6 +260,11 @@ if [ "$INIT" = openrc ]; then
 description="monitor agent"
 command="$BIN"
 command_args="--interval $INTERVAL${INSECURE:+ --insecure}"
+# The supervisor and this script's own start_pre run as root; only the agent
+# drops privileges. The token reaches it through the environment sourced below,
+# which survives the setuid -- the log files above are likewise opened by the
+# root supervisor and inherited, so the service user needs no write anywhere.
+command_user="monitor-agent"
 supervisor="supervise-daemon"
 respawn_delay=5
 output_log="/var/log/monitor-agent.log"
@@ -259,12 +283,12 @@ start_pre() {
 RC
 	chmod 0755 /etc/init.d/monitor-agent
 	rc-update add monitor-agent default >/dev/null
-	rc-service monitor-agent restart
-	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
-	exit 0
-fi
-
-cat >/etc/systemd/system/monitor-agent.service <<UNIT
+	# Not left to set -e: a service that cannot start is what the check below
+	# exists to catch and roll back, not a reason to abandon the script midway
+	# with the node down.
+	rc-service monitor-agent restart || true
+else
+	cat >/etc/systemd/system/monitor-agent.service <<UNIT
 [Unit]
 Description=monitor agent
 After=network-online.target
@@ -289,18 +313,65 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 # AF_NETLINK is how getifaddrs(3) obtains this host's own addresses from the
-# kernel; without it the agent reports none.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+# kernel; without it the agent reports none. AF_UNIX is named outright for the
+# logger's /dev/log and any libc helper that consults a local socket, rather
+# than left to whatever the filter lets through implicitly.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 MemoryMax=64M
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-systemctl daemon-reload
-systemctl enable monitor-agent >/dev/null
-# restart rather than `enable --now`: --now leaves an already-running service
-# untouched, so reinstalling over a live agent would keep the old binary
-# running.
-systemctl restart monitor-agent
-echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+	systemctl daemon-reload
+	systemctl enable monitor-agent >/dev/null
+	# restart rather than `enable --now`: --now leaves an already-running service
+	# untouched, so reinstalling over a live agent would keep the old binary
+	# running. Unguarded, a unit that cannot start would exit the script here
+	# with a raw systemd error -- exactly the case the check below rolls back.
+	systemctl restart monitor-agent || true
+fi
+
+# The service's own word for whether it is running, asked once it has had a
+# moment to fail: a unit whose exec fails reports active first, and the agent
+# opens no port an outer probe could ask instead. rc-service status answers 0
+# for a started service whatever supervises it.
+sleep 3
+alive=""
+if [ "$INIT" = openrc ]; then
+	rc-service monitor-agent status >/dev/null 2>&1 || alive=1
+else
+	systemctl is-active --quiet monitor-agent || alive=1
+fi
+if [ -n "$alive" ]; then
+	if [ "$INIT" = openrc ]; then
+		rc-service monitor-agent stop >/dev/null 2>&1 || true
+	else
+		systemctl stop monitor-agent >/dev/null 2>&1 || true
+	fi
+	if [ -n "$backup" ]; then
+		install -m 0755 "$backup" "$BIN"
+		rm -f "$backup"
+		if [ "$INIT" = openrc ]; then
+			rc-service monitor-agent restart >/dev/null 2>&1 || true
+		else
+			systemctl restart monitor-agent >/dev/null 2>&1 || true
+		fi
+		echo "the new agent did not start; rolled back to the previous binary" >&2
+	else
+		echo "the agent did not start" >&2
+	fi
+	if [ "$INIT" = openrc ]; then
+		echo "logs: tail -50 /var/log/monitor-agent.log" >&2
+	else
+		echo "logs: journalctl -u monitor-agent -n 50" >&2
+	fi
+	exit 1
+fi
+rm -f "$BIN.old"
+if [ "$INIT" = openrc ]; then
+	echo "monitor-agent installed; follow it with: tail -f /var/log/monitor-agent.log"
+else
+	echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+fi
+
