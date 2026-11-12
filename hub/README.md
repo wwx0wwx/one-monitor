@@ -47,8 +47,10 @@ sudo sh install-hub.sh
 首启的管理员密码只显示一次，在安装完成的输出里；错过了这样取：
 
 ```bash
-journalctl -u monitor-hub --no-pager | grep Password
+sudo cat /opt/monitor/data/initial-password   # 0600，只给 root 读；首次登录后自动删除
 ```
+
+密码从 v1.6.2 起写进这个文件而不是日志：journal 里的明文密码要多活一个日志轮转周期，而且 hub 自己删不掉它。
 
 然后按[「反向代理」](#反向代理)一节把域名指到 `127.0.0.1:28080`。
 配好后**用 https 域名**打开 `https://hub.example.com/admin` 登录，到「安全」里改掉密码并绑定两步验证。
@@ -103,7 +105,7 @@ docker run -d --name monitor -p 28080:28080 -v monitor-data:/data \
   ghcr.io/wwx0wwx/one-monitor:1.5.4
 ```
 
-数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码看 `docker logs monitor`。
+数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
 镜像与同版本二进制来自同一次 release 构建。容器监听所有地址，请只映射到本机或防火墙后面，仍走反向代理。
 
 ## 升级
@@ -185,14 +187,15 @@ ingress:
 2. **`client_max_body_size` 至少 8m**：备份导入和主题上传按 4 MiB 分片传输，请求体上限不够会传一半失败。
 3. **WebSocket 升级头要放行**（上面的 `Upgrade`/`Connection` 两行）：实时推送和 agent 上报都是长连接。
 4. **反代或 WAF 按路径正向白名单时**，除 `/` 与 `/api/` 外还要放行 `/install.sh`、`/agent/{arch}`（节点安装）和 `/node/{id}`（状态页详情页直链刷新）。Cloudflare 代理（橙云）场景可在后台「设置」打开 `cf_connecting_ip`，节点国家识别才不会被边缘地址冲掉。
+5. **反代与 hub 之间经过内网**（如 Docker 桥接的两个容器）时，后台「设置」的「内网 X-Forwarded-For」需要保持开启；反代在本机回环、或 hub 直接面向公网时，关闭它可让登录限流只认真实来源地址。
 
 ## 常见坑
 
 - **添加节点被 403 拒绝**：正常部署不需要 `--site`——配好反代、用 https 域名进面板就自动对了。仍被拒按序检查：浏览器地址是不是 https 域名（IP 直连不行）→ 反代是否透传 Host 与 `X-Forwarded-Proto` → hub 启动参数 `--site` 是否被误设（必须是 `https://域名`，不能是 IP、不能带路径，配错时启动日志有警告）。
 - **端口**：默认 28080，且只听本机回环。换端口用 `--port`，升级不会冲掉。
 - **主题图片必须 https**：背景图与 Logo 的链接必须以 `https://` 开头（http 图在 https 页面会被浏览器拦掉，保存时 hub 也会拒绝）。
-- **一次性密码**只在数据库首次创建时显示一次，改密入口在后台「安全」。
-- **延迟探测的默认任务**：首启自动建了三条——浙江移动/联通/电信 v4（TCP 443、60 秒间隔），后台「延迟」里可改目标、调间隔或删除；「设置」里的「新添加的服务器自动加入全部延迟检测任务」默认关。
+- **一次性密码**只在数据库首次创建时写一次（`data/initial-password`，0600，首次登录即删），改密入口在后台「安全」。
+- **延迟探测**：首启不预置任何任务（v1.6.2 起不再默认建浙江运营商探测），在后台「延迟」里按需添加；「设置」里的「新添加的服务器自动加入全部延迟检测任务」默认关。
 
 ## 命令行参数
 

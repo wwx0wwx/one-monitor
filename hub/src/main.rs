@@ -31,7 +31,7 @@ use tower_http::compression::Predicate;
 use tracing::{info, warn};
 
 use agent_ws::Agent;
-use db::{Db, PingTask};
+use db::Db;
 
 pub type Shared = Arc<App>;
 
@@ -59,12 +59,22 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// Where one-time credentials land: the initial password file, 0600,
+    /// removed at the sign-in that spends it. A field rather than derived from
+    /// `themes` so tests point it at a tempdir instead of the working tree.
+    pub secrets: PathBuf,
     /// Alerts on their way out; see `notify::send`.
     pub notes: tokio::sync::mpsc::Sender<notify::Note>,
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf, notes: tokio::sync::mpsc::Sender<notify::Note>) -> Self {
+    fn new(
+        db: Db,
+        site: String,
+        themes: PathBuf,
+        secrets: PathBuf,
+        notes: tokio::sync::mpsc::Sender<notify::Note>,
+    ) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -77,14 +87,30 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            secrets,
             notes,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DIRS: AtomicU64 = AtomicU64::new(0);
         // Nothing delivers in tests; `notify::send` drops into the closed channel.
-        Self::new(db, String::new(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0)
+        // The secrets dir is a fresh tempdir each call: the one-time password
+        // file a test's `first_run` writes never lands in the working tree and
+        // never collides with a parallel test's.
+        Self::new(
+            db,
+            String::new(),
+            PathBuf::from("themes"),
+            std::env::temp_dir().join(format!(
+                "monitor-hub-unit-{}-{}",
+                std::process::id(),
+                DIRS.fetch_add(1, Ordering::Relaxed),
+            )),
+            tokio::sync::mpsc::channel(1).0,
+        )
     }
 
     pub fn public_page(&self) -> bool {
@@ -447,7 +473,11 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     std::fs::create_dir_all(&args.themes)?;
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
+    // One-time credentials live beside the database, with the themes directory:
+    // everything the operator backs up and moves together.
+    let secrets = args.themes.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let app =
+        Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes.clone(), secrets, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     if exposed_over_plain_http(&url) {
@@ -666,40 +696,39 @@ fn host_is_loopback(authority: &str) -> bool {
     host.is_empty() || host == "localhost" || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback())
 }
 
-/// Prints a one-time admin password when the database is first created, since a
-/// fresh hub is otherwise inaccessible until GitHub is configured. That same
-/// first boot also opens with one latency probe per carrier, so the delay page
-/// has something to draw before its operator has touched anything. The three
-/// Zhejiang carrier addresses answer TCP on 443 while their DNS port 53 stays
-/// filtered, so the probe rides the port that connects; each is editable or
-/// deletable under 延迟检测 like any probe an operator added by hand.
-fn first_run(app: &App, url: &str) -> Result<()> {
+/// Sets a one-time admin password when the database is first created, since a
+/// fresh hub is otherwise inaccessible until the operator has signed in once.
+///
+/// The password is written to `<secrets>/initial-password`, 0600, and never to
+/// stdout: a unit's stdout lands in the journal, readable by the adm and
+/// systemd-journal groups for as long as the logs live, and the hub cannot
+/// unsay it there. The file is removed by the sign-in that spends the
+/// credential, so what remains afterwards is the hash and nothing else.
+///
+/// No latency probes are seeded. The old set of three Zhejiang carrier probes
+/// assumed a Chinese audience every fresh install has to prove it does not
+/// have; an operator who wants the delay page populated adds a probe under
+/// 延迟检测 in a few clicks, with targets they chose.
+pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
     if app.db.get("admin_password_hash").is_some() {
         return Ok(());
     }
-    for (name, target) in [
-        ("浙江移动v4", "112.13.210.86:443"),
-        ("浙江联通v4", "124.160.144.214:443"),
-        ("浙江电信v4", "122.228.6.140:443"),
-    ] {
-        app.db.save_ping_task(&PingTask {
-            id: 0,
-            name: name.into(),
-            target: target.into(),
-            // The interval the one probe a fleet usually carries runs at.
-            interval: 60,
-            // No nodes exist yet on a first boot; auto-join assigns these to
-            // every server that arrives later.
-            nodes: Vec::new(),
-        })?;
-    }
     let password = auth::random_token()[..24].to_owned();
     app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
+    let file = app.secrets.join("initial-password");
+    std::fs::create_dir_all(&app.secrets)?;
+    std::fs::write(&file, format!("{password}\n"))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&file, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o600)
+    })?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
-         Password: {password}\n\n  \
-         This is shown once. Change it, and set up two-factor, under Security.\n"
+         Password: in {} (0600, removed at first sign-in)\n\n  \
+         Change it, and set up two-factor, under Security.\n",
+        file.display()
     );
     Ok(())
 }
@@ -785,10 +814,19 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DIRS: AtomicU64 = AtomicU64::new(0);
         App::new(
             Db::open(":memory:").unwrap(),
             site.into(),
             PathBuf::from("themes"),
+            // A tempdir per call, so a `first_run` test's password file never
+            // lands in the working tree and never collides with another test's.
+            std::env::temp_dir().join(format!(
+                "monitor-hub-test-{}-{}",
+                std::process::id(),
+                DIRS.fetch_add(1, Ordering::Relaxed),
+            )),
             tokio::sync::mpsc::channel(1).0,
         )
     }
@@ -1010,19 +1048,44 @@ mod tests {
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
     }
 
+    /// The one-time password is a 0600 file beside the database, never stdout:
+    /// a unit's stdout is the journal, and the journal outlives the credential.
+    /// What it holds opens the door the hash guards, and the sign-in that
+    /// spends it removes it -- asserted here against `verify_password`, the
+    /// same check the login route runs.
     #[test]
-    fn first_run_opens_with_one_probe_per_carrier_and_never_touches_them_again() {
+    fn the_one_time_password_lands_in_a_private_file_the_first_sign_in_removes() {
+        use std::os::unix::fs::PermissionsExt;
         let app = app("http://x");
         first_run(&app, "http://x").unwrap();
-        let probes = app.db.ping_tasks().unwrap();
-        assert_eq!(probes.len(), 3, "one per carrier");
-        assert!(probes.iter().all(|p| p.target.ends_with(":443")), "port 53 is filtered");
-        assert!(probes.iter().all(|p| p.nodes.is_empty()), "nodes arrive later, via auto-join");
+        let file = app.secrets.join("initial-password");
+        let written = std::fs::read_to_string(&file).unwrap();
+        let password = written.trim();
+        assert_eq!(password.len(), 24, "the 24-character one-time password");
+        let hash = app.db.get("admin_password_hash").unwrap();
+        assert!(
+            crate::auth::verify_password(password, &hash),
+            "what the file holds is what the hash was made from"
+        );
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "owner only");
 
-        // A restart returns before the seeding, so an operator who deleted the
-        // set keeps it deleted rather than finding it re-created underneath them.
-        app.db.delete_ping_task(probes[0].id).unwrap();
+        // The spending sign-in removes it, and only that: a restart before any
+        // sign-in keeps the file where the operator was told it is.
         first_run(&app, "http://x").unwrap();
-        assert_eq!(app.db.ping_tasks().unwrap().len(), 2, "must not seed again on restart");
+        assert!(file.exists(), "a restart alone must not remove it");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(&app.secrets);
+    }
+
+    /// Nothing is seeded on a first boot: no probe, no node, no assumption
+    /// about which network the operator measures. The delay page answers an
+    /// empty fleet like any other page.
+    #[test]
+    fn a_first_boot_seeds_no_probes() {
+        let app = app("http://x");
+        first_run(&app, "http://x").unwrap();
+        assert!(app.db.ping_tasks().unwrap().is_empty(), "no carrier probes are assumed");
+        let _ = std::fs::remove_dir_all(&app.secrets);
     }
 }

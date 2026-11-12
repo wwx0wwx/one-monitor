@@ -684,7 +684,7 @@ pub async fn agent_register(
     if !provisioning_allowed(&app, &headers) {
         return (StatusCode::FORBIDDEN, PROVISIONING_DENIED).into_response();
     }
-    let ip = client_ip(trust_cf_ip(&app), &headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), crate::auth::trust_private_xff(&app), &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -986,6 +986,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "geoip_provider",
     "geoip_account_id",
     "cf_connecting_ip",
+    "trust_private_xff",
     "retention_metrics_days",
     "retention_ping_days",
     "theme",
@@ -1622,6 +1623,10 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         json!(if app.db.get("auto_join_ping").as_deref() == Some("on") { "on" } else { "off" }),
     );
     out.insert("cf_connecting_ip".into(), json!(if crate::auth::trust_cf_ip(&app) { "on" } else { "off" }));
+    out.insert(
+        "trust_private_xff".into(),
+        json!(if crate::auth::trust_private_xff(&app) { "on" } else { "off" }),
+    );
     out.insert("geoip_provider".into(), json!(crate::geo::provider(&app).to_string()));
     out.insert("totp_set".into(), json!(crate::auth::totp_bound(&app)));
     out.insert(
@@ -1705,7 +1710,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         "emergency_password" => None,
         // ---- what the status page shows: the theme's display settings ----
         "bg_enabled" | "cost_public" | "show_busiest" | "show_swap" | "show_speed" | "show_billing"
-        | "ip_capsule" | "expiring_group" | "region_group"
+        | "ip_capsule" | "expiring_group" | "region_group" | "trust_private_xff"
             if !matches!(value, "on" | "off") =>
         {
             Some(format!("{key} must be on or off"))
@@ -1847,6 +1852,32 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// The one-time password file exists for exactly one purpose -- the first
+    /// sign-in -- and that sign-in retires it. A wrong password leaves it in
+    /// place: the credential has not been spent, and the operator who typed a
+    /// typo still needs somewhere to read it.
+    #[tokio::test]
+    async fn the_first_successful_sign_in_removes_the_one_time_password_file() {
+        let app = std::sync::Arc::new(app());
+        crate::first_run(&app, "https://hub.example.com").unwrap();
+        let file = app.secrets.join("initial-password");
+        let password = std::fs::read_to_string(&file).unwrap().trim().to_owned();
+        let headers = HeaderMap::new();
+        let peer: ConnectInfo<std::net::SocketAddr> = ConnectInfo("127.0.0.1:40000".parse().unwrap());
+        let body = |password: &str| {
+            Json(serde_json::from_value::<crate::auth::LoginBody>(json!({ "password": password })).unwrap())
+        };
+
+        let wrong = crate::auth::login(State(app.clone()), peer, headers.clone(), body("not-it")).await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert!(file.exists(), "a wrong password spends nothing");
+
+        let right = crate::auth::login(State(app.clone()), peer, headers, body(&password)).await;
+        assert_eq!(right.status(), StatusCode::OK);
+        assert!(!file.exists(), "the sign-in that spends the password removes its copy");
+        let _ = std::fs::remove_dir_all(&app.secrets);
     }
 
     #[tokio::test]

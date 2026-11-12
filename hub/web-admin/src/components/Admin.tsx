@@ -13,6 +13,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
+import QRCode from "qrcode"
+import { moveIds } from "@/lib/order"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -677,11 +679,11 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   }
 
   // Rows are displaced while the pointer is down; the order is saved on drop.
+  // The splice itself lives in `moveIds`, tested there for exactly the
+  // filtered-view-against-full-order mistake this table once made.
   function move(from: number, to: number) {
-    if (from < 0 || to < 0 || to >= order.length || from === to) return
-    const next = [...order]
-    next.splice(to, 0, ...next.splice(from, 1))
-    const ids = next.map((node) => node.id)
+    const ids = moveIds(order.map((node) => node.id), from, to)
+    if (!ids) return
     animate(() => setManualOrder(ids))
     return ids
   }
@@ -1493,6 +1495,16 @@ function SettingsTab() {
             域名经 Cloudflare 橙云代理时，按 CF-Connecting-IP 识别服务器真实 IP
           </span>
         </div>
+        <div className="flex items-center gap-2 text-sm">
+          <Switch
+            aria-labelledby="private-xff-label"
+            checked={s.trust_private_xff === "on"}
+            onCheckedChange={(v) => set("trust_private_xff", v ? "on" : "off")}
+          />
+          <span id="private-xff-label">
+            反代与 hub 之间经过内网时按 X-Forwarded-For 识别来源（Docker 等容器部署需要开；反代在本机或 hub 直接公网时可关闭以收紧）
+          </span>
+        </div>
         <div>
           <Button
             size="sm"
@@ -1907,23 +1919,39 @@ function Sessions() {
   )
 }
 
-function Security() {
+function Security({ siteName }: { siteName: string }) {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
   const [recovery, setRecovery] = useState("")
-  // The TOTP binding flow: begin returns a secret the operator pastes into an
-  // authenticator app; confirm proves the app holds the same secret with one
-  // live code. Neither step is stored until confirm succeeds.
+  // The TOTP binding flow: begin returns a secret the operator scans or
+  // pastes into an authenticator app; confirm proves the app holds the same
+  // secret with one live code. Neither step is stored until confirm succeeds.
   const [binding, setBinding] = useState<{ secret: string } | null>(null)
   const [code, setCode] = useState("")
   const [busy, setBusy] = useState(false)
   const [confirmOff, setConfirmOff] = useState(false)
+  // The QR of the otpauth:// URI, rendered locally: no third-party image
+  // service learns the secret, and dark mode needs the white pad anyway.
+  const [qr, setQr] = useState("")
+  useEffect(() => {
+    if (!binding) return
+    const issuer = siteName || "Monitor"
+    const uri =
+      `otpauth://totp/${encodeURIComponent(issuer)}:admin` +
+      `?secret=${binding.secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`
+    let live = true
+    QRCode.toDataURL(uri, { margin: 1, width: 180 })
+      .then((url) => { if (live) setQr(url) })
+      .catch(() => { if (live) setQr("") })
+    return () => { live = false }
+  }, [binding, siteName])
   if (!s) return null
 
   async function beginTotp() {
     setBusy(true)
     try {
       const r = await api<{ secret: string }>("/auth/totp")
+      setQr("")
       setBinding(r)
       setCode("")
     } catch (e) {
@@ -1986,10 +2014,26 @@ function Security() {
         )}
         {binding ? (
           <div className="space-y-4">
-            {/* Secret text only: one input field in the app beats a camera
-                lens aimed at a screen, and with no derived otpauth URL there
-                is nothing on the card that can go stale or get the issuer
-                wrong. */}
+            {/* Both channels: the QR for a phone camera, the bare secret for
+                an app that takes one input field. The URI is derived here
+                from the site's own name, so the issuer an authenticator shows
+                is the name the operator chose. */}
+            <div className="flex flex-wrap items-center gap-4">
+              {binding && qr ? (
+                // A white pad whatever the theme: a QR is dark modules on
+                // light ground or it does not scan.
+                <div className="rounded-md border p-2">
+                  <img src={qr} alt="两步验证二维码" width={180} height={180} />
+                </div>
+              ) : (
+                <div className="grid h-[196px] w-[196px] place-items-center rounded-md border text-xs text-muted-foreground">
+                  二维码生成中…
+                </div>
+              )}
+              <p className="max-w-64 text-xs leading-relaxed text-muted-foreground">
+                用验证器 App 扫码即可添加；无法扫码时用下方密钥手动输入。
+              </p>
+            </div>
             <Field
               label="验证器密钥"
               hint="在验证器 App 里选「手动输入密钥」，粘贴这串字符"
@@ -2321,6 +2365,7 @@ export function Admin({
   nodes,
   refresh,
   site,
+  siteName,
   canProvision,
 }: {
   path: string
@@ -2328,6 +2373,7 @@ export function Admin({
   nodes: Node[]
   refresh: () => void
   site: string
+  siteName: string
   canProvision: boolean
 }) {
   return (
@@ -2361,7 +2407,7 @@ export function Admin({
         ) : path === "/admin/themes" ? (
           <Themes />
         ) : path === "/admin/security" ? (
-          <Security />
+          <Security siteName={siteName} />
         ) : path === "/admin/settings" ? (
           <SettingsTab />
         ) : (

@@ -123,3 +123,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # The digests of what this release published, committed back into
+  # install-hub.sh on main. The installer then verifies its default download
+  # against a value that travelled by git rather than by the release it names,
+  # so swapping a release asset no longer passes the way swapping
+  # sha256sums.txt beside it would. Warns rather than fails: a protected main
+  # or a missing permission degrades the installer to the sums-file check it
+  # always had, it does not take the release down with it.
+  pin:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: main
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          path: bin
+          merge-multiple: true
+      - run: |
+          set -eu
+          amd64="$(sha256sum bin/monitor-hub-x86_64-unknown-linux-musl | cut -d' ' -f1)"
+          arm64="$(sha256sum bin/monitor-hub-aarch64-unknown-linux-musl | cut -d' ' -f1)"
+          sed -i "s|^PIN_amd64=.*|PIN_amd64="$amd64"|" hub/install-hub.sh
+          sed -i "s|^PIN_arm64=.*|PIN_arm64="$arm64"|" hub/install-hub.sh
+          git config user.name "release-bot"
+          git config user.email "noreply@github.com"
+          git add hub/install-hub.sh
+          # Empty commit is fine on a re-run; the hashes it would write are
+          # already there. [skip ci] keeps ci-hub from re-running on main.
+          git commit -m "pin: install-hub.sh digests for $GITHUB_REF_NAME [skip ci]" || exit 0
+          git push

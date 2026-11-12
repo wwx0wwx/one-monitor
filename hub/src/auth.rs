@@ -68,7 +68,9 @@ pub fn hash_password(password: &str) -> Result<String> {
         .to_string())
 }
 
-fn verify_password(password: &str, stored: &str) -> bool {
+// pub(crate) rather than pub: the panel tests read the hash back and check
+// the one-time password file against the same test the login route runs.
+pub(crate) fn verify_password(password: &str, stored: &str) -> bool {
     PasswordHash::new(stored)
         .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
         .unwrap_or(false)
@@ -256,13 +258,13 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(trust_cf_ip(&app), &headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), trust_private_xff(&app), &headers, peer.ip());
     if app.throttle.locked(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，请稍后再试").into_response();
     }
     // Held across the check below, which is its purpose.
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，请稍后再试").into_response();
     };
     let mut credential = Credential::Password;
     let verified = match app.db.get("admin_password_hash") {
@@ -281,14 +283,15 @@ pub async fn login(
     };
     if !verified {
         app.throttle.record_failure(ip);
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+        return (StatusCode::UNAUTHORIZED, "密码不正确").into_response();
     }
     let via = match credential {
         Credential::Password => {
             if totp_bound(&app) {
                 let code = body.code.as_deref().unwrap_or_default().trim().to_owned();
                 let Some(secret) = app.db.get("totp_secret").filter(|s| !s.is_empty()) else {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "second factor unreadable").into_response();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "两步验证数据不可读，请检查数据库")
+                        .into_response();
                 };
                 if !totp_fresh(&app, &secret, &code) {
                     // Counted like a wrong password: the code is the other half
@@ -297,7 +300,7 @@ pub async fn login(
                     // lands here too, whatever half of the credential it
                     // completed.
                     app.throttle.record_failure(ip);
-                    return (StatusCode::UNAUTHORIZED, "invalid authenticator code").into_response();
+                    return (StatusCode::UNAUTHORIZED, "验证码不正确，请确认时间同步后重试").into_response();
                 }
             }
             "密码"
@@ -305,6 +308,11 @@ pub async fn login(
         Credential::Recovery => "应急密码",
     };
     app.throttle.clear(ip);
+    // The one-time password file has served its purpose the moment a password
+    // works: whoever holds it is inside, and can change the password under
+    // Security. Left behind it would be a second copy of a credential that
+    // outlives the sign-in it was printed for.
+    let _ = std::fs::remove_file(app.secrets.join("initial-password"));
     match issue_session(&app, &headers) {
         Ok(cookie) => {
             crate::notify::signed_in(&app, via, ip);
@@ -422,9 +430,9 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
 /// this header: behind an untrusting proxy the tail here is Cloudflare's own
 /// address, different on every connection, and the setting is what keeps a
 /// node's country badge from churning with it.
-pub fn client_ip(trust_cf: bool, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+pub fn client_ip(trust_cf: bool, trust_private: bool, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     let peer = peer.to_canonical();
-    if !behind_local_proxy(peer) {
+    if !behind_local_proxy(peer, trust_private) {
         return peer;
     }
     if trust_cf {
@@ -452,16 +460,30 @@ pub fn trust_cf_ip(app: &App) -> bool {
 }
 
 /// Loopback or a private network, where a reverse proxy resides.
-fn behind_local_proxy(ip: IpAddr) -> bool {
+///
+/// `trust_private` widens the loopback-only default to private ranges: a hub in
+/// a container, fronted by a proxy in another container on the same bridge,
+/// sees a private peer. That is also the shape of a network an untrusted
+/// machine can sit on, so it is a setting (`trust_private_xff`) rather than a
+/// constant -- a hub whose proxy is on loopback, or which faces the internet
+/// directly, has nothing to gain and spoofing to refuse.
+fn behind_local_proxy(ip: IpAddr, trust_private: bool) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => v4.is_loopback() || (trust_private && (v4.is_private() || v4.is_link_local())),
         // Unique-local (fc00::/7) and link-local (fe80::/10); the stable
         // standard library provides no predicate for either.
         IpAddr::V6(v6) => {
             let head = v6.segments()[0];
-            v6.is_loopback() || head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80
+            v6.is_loopback() || (trust_private && (head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80))
         }
     }
+}
+
+/// Whether the panel trusts a private-network peer's X-Forwarded-For; on by
+/// default, preserving container deployments, and read per request like
+/// `trust_cf_ip` for the same reason.
+pub fn trust_private_xff(app: &App) -> bool {
+    app.db.get("trust_private_xff").as_deref() != Some("off")
 }
 
 #[cfg(test)]
@@ -619,6 +641,33 @@ mod tests {
         assert_eq!(totp_step_matched(secret, "000000"), None::<i64>);
     }
 
+    /// The `trust_private_xff` half of the same gate: a hub whose proxy is on
+    /// loopback, or which faces the internet directly, refuses the header from
+    /// a private-network peer -- a network another machine can sit on -- while
+    /// loopback peers keep it either way.
+    #[test]
+    fn a_private_peer_is_trusted_only_while_the_setting_says_so() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.9".parse().unwrap());
+
+        for private in ["10.0.0.1", "172.18.0.4", "fd00::1"] {
+            assert_eq!(
+                client_ip(false, true, &headers, ip(private)).to_string(),
+                "198.51.100.9",
+                "{private}: trusted while on"
+            );
+            assert_eq!(
+                client_ip(false, false, &headers, ip(private)),
+                ip(private),
+                "{private}: the peer itself while off"
+            );
+        }
+        // Loopback is not a setting: the proxy the installer puts there is the
+        // deployment's own, and nothing else can appear from it.
+        assert_eq!(client_ip(false, false, &headers, ip("127.0.0.1")).to_string(), "198.51.100.9");
+    }
+
     #[test]
     fn forwarded_header_is_trusted_only_behind_a_local_proxy() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -630,7 +679,7 @@ mod tests {
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(false, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, true, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
@@ -638,20 +687,20 @@ mod tests {
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(false, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+            assert_eq!(client_ip(false, true, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
         // which is the same local peer.
-        assert_eq!(client_ip(false, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(false, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, true, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, true, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
-        assert_eq!(client_ip(false, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(false, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
+        assert_eq!(client_ip(false, true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, true, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
-        assert_eq!(client_ip(false, &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(client_ip(false, true, &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
     }
 
     #[test]
@@ -672,24 +721,24 @@ mod tests {
         // observation -- Cloudflare's address, not the caller's -- is what the
         // X-Forwarded-For tail holds.
         let behind_edge = headers(Some("198.51.100.9"), Some("162.158.0.1"));
-        assert_eq!(client_ip(false, &behind_edge, ip("127.0.0.1")).to_string(), "162.158.0.1");
+        assert_eq!(client_ip(false, true, &behind_edge, ip("127.0.0.1")).to_string(), "162.158.0.1");
 
         // On, the edge's answer wins: through Cloudflare the header was
         // overwritten by the edge itself, so it is the one value a caller
         // cannot choose.
-        assert_eq!(client_ip(true, &behind_edge, ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(true, true, &behind_edge, ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // On but absent -- a deployment where Cloudflare fronts only some
         // hosts, or was switched off since: the X-Forwarded-For fallback
         // still applies.
         assert_eq!(
-            client_ip(true, &headers(None, Some("198.51.100.9")), ip("127.0.0.1")).to_string(),
+            client_ip(true, true, &headers(None, Some("198.51.100.9")), ip("127.0.0.1")).to_string(),
             "198.51.100.9"
         );
 
         // On and unparseable: same fallback.
         assert_eq!(
-            client_ip(true, &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
+            client_ip(true, true, &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
                 .to_string(),
             "198.51.100.9"
         );
@@ -697,6 +746,6 @@ mod tests {
         // Directly from the internet the header is caller-supplied even with
         // the setting on: the peer address is the only honest answer.
         let forged = headers(Some("10.0.0.2"), Some("10.0.0.2, 198.51.100.9"));
-        assert_eq!(client_ip(true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(true, true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
     }
 }

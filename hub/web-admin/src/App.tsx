@@ -10,10 +10,13 @@ import { api, provisioningSite, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; totp: boolean; site_name: string; public_page: boolean; site: string; can_provision: boolean }
 
-// `/admin` alone is not a page; it is normalised to the first section so that a
-// bookmark resolves to a real route.
+// A trailing slash is stripped and nothing else. `/admin` itself is a valid
+// address -- it renders the first section, which the sign-in success below
+// turns into `/admin/nodes` -- so rewriting it at mount would move the
+// address bar to a route the login page does not stand for while a wrong
+// password is still on the screen.
 function normalise(p: string) {
-  return p === "/admin" || p === "/admin/" ? "/admin/nodes" : p.replace(/\/$/, "") || "/admin/nodes"
+  return p.replace(/\/$/, "") || "/admin"
 }
 
 function usePath() {
@@ -145,6 +148,7 @@ export default function App() {
             // panel is frequently reached over a loopback port behind a proxy,
             // while the install command and OAuth callback need the real one.
             site={me.site || location.origin}
+            siteName={me.site_name}
             canProvision={me.can_provision && !!provisioningSite(location.origin) && !!provisioningSite(me.site || location.origin)}
           />
         )}

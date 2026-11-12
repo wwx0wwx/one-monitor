@@ -21,7 +21,7 @@ agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ─
 # 1. hub：装在一台 VPS 上（只监听 127.0.0.1:28080，按安装器输出的说明配反代）
 curl -fsSL https://raw.githubusercontent.com/wwx0wwx/one-monitor/main/hub/install-hub.sh -o install-hub.sh
 sudo sh install-hub.sh
-journalctl -u monitor-hub --no-pager | grep Password   # 首启一次性密码
+sudo cat /opt/monitor/data/initial-password            # 首启一次性密码（0600，首次登录后自删）
 
 # 2. 节点：面板「服务器」→ 添加，复制生成的命令到目标 VPS 执行
 curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --token <TOKEN>
@@ -49,7 +49,7 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 
 ## 发版节奏
 
-- **hub**：`hub/` 有实质变更时发 `vX.Y.Z`。切 tag 的同一个提交里：bump `hub/Cargo.toml` 版本、bump `hub/install-hub.sh` 的 `VERSION`；若默认主题发了新版，还要挪 `hub/web-theme.pin`（tag + sha256）并刷新 `hub/vendor/theme/`
+- **hub**：`hub/` 有实质变更时发 `vX.Y.Z`。切 tag 的同一个提交里：bump `hub/Cargo.toml` 版本、bump `hub/install-hub.sh` 的 `VERSION`，并把 `PIN_amd64`/`PIN_arm64` 清空（release workflow 发布后会把两个摘要提交回 main，作为安装器的独立校验渠道）；若默认主题发了新版，还要挪 `hub/web-theme.pin`（tag + sha256）并刷新 `hub/vendor/theme/`
 - **agent**：`agent/` 有实质变更时发下一个代号（pio → voy → cas → new），hub 侧同 PR bump `AGENT_TAG` 并重算 `hub/agent.pin`（两个架构各一行 `<arch> <sha256>`，从 release 的 sha256sums.txt 抄）
 - **主题**：`themes/<short>/` 有实质变更时发 `theme-<short>-v<版本>`，版本号与 theme.json 对齐；hub 通过 vendor pin 内嵌，升级 hub 即更新内置主题
 - 顺序约束：主题先发（hub 的 pin 指向它的 release 资产 sha），再发 hub

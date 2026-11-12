@@ -155,7 +155,11 @@ export function Summary({ nodes, showCost, showBusiest = true }: {
               <span>CPU {busiest.metrics.cpu.toFixed(0)}%</span>
               <span>内存 {percent(busiest.metrics.mem_used, busiest.mem_total).toFixed(0)}%</span>
               <span>磁盘 {percent(busiest.metrics.disk_used, busiest.disk_total).toFixed(0)}%</span>
-              <span>↑↓{rate(busiest.metrics.net_rx + busiest.metrics.net_tx).replace(" ", "")}</span>
+              <span className="inline-flex items-center gap-0.5">
+                  <ArrowUp className="size-3 shrink-0 text-muted-foreground" />
+                  <ArrowDown className="size-3 shrink-0 text-muted-foreground" />
+                  {rate(busiest.metrics.net_rx + busiest.metrics.net_tx).replace(" ", "")}
+                </span>
             </div>
           ) : (
             <div className="mt-1 text-xs text-muted-foreground">无在线服务器</div>

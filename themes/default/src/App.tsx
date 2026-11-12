@@ -202,7 +202,10 @@ export default function App() {
               </div>
             )}
             {shown.length === 0 ? (
-              <p className="py-16 text-center text-sm text-muted-foreground">还没有服务器</p>
+              <div className="py-16 text-center text-sm text-muted-foreground">
+              <p>还没有服务器</p>
+              <p className="mt-1 text-xs">（站点管理员可从右上角「登录」进入后台，添加第一台服务器）</p>
+            </div>
             ) : (
               <div className="grid items-start gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 {shown.map((n: Node) => (

@@ -25,7 +25,20 @@ REPO="wwx0wwx/one-monitor"
 # in the same change that cuts the tag -- forgetting leaves plain installs one
 # release behind, not broken. `--version latest` follows the redirect instead,
 # and `--version <tag>` installs any release by name.
-VERSION="v1.6.1"
+VERSION="v1.6.2"
+# The version this run was asked for: the default until --version names one.
+VERSION_REQ="v1.6.2"
+# The digest of each binary $VERSION published, filled in by the release
+# workflow after it uploads them (it commits the two hashes back here, to
+# main). A digest that travels in this file comes from git, not from the
+# release it names, so replacing a release asset no longer passes the check
+# below the way replacing sha256sums.txt beside it would. Empty until the
+# release for $VERSION exists, and for any --version other than $VERSION the
+# release's own sums file is the check, as it always was. Bumping VERSION in a
+# release PR resets both to empty; the workflow refills them after publishing.
+PIN_VERSION="$VERSION"
+PIN_amd64=""
+PIN_arm64=""
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,
@@ -199,15 +212,29 @@ install_hub() {
 	curl -fsSL --max-time 300 "$base/$asset" -o "$tmp/$asset" || die "二进制下载失败：$base/$asset"
 	ok "下载" "$(du -h "$tmp/$asset" | cut -f1)"
 
-	# Verified against the release's own checksum file, so a truncated transfer or
-	# a substituted asset is caught before anything lands in /opt/monitor.
-	curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
-		die "校验文件下载失败"
-	want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
-	[ -n "$want" ] || die "sha256sums.txt 里没有 $asset 这一项"
+	# Verified before anything lands in /opt/monitor. Two sources, in order:
+	# the digest committed inside this script (git is a channel the release's
+	# own files cannot rewrite), then the release's checksum file, which still
+	# catches a truncated transfer for versions this script does not pin.
+	pin=""
+	if [ "$VERSION_REQ" = "$PIN_VERSION" ]; then
+		case "$ARCH" in
+		x86_64) pin="$PIN_amd64" ;;
+		aarch64) pin="$PIN_arm64" ;;
+		esac
+	fi
 	got="$(sha256sum "$tmp/$asset" | cut -d' ' -f1)"
-	[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
-	ok "校验" "sha256 一致"
+	if [ -n "$pin" ]; then
+		[ "$got" = "$pin" ] || die "校验不通过（对照仓库内摘要），已丢弃下载的文件。期望 $pin，实得 $got"
+		ok "校验" "sha256 一致（仓库内摘要）"
+	else
+		curl -fsSL --max-time 30 "$base/sha256sums.txt" -o "$tmp/sums" ||
+			die "校验文件下载失败"
+		want="$(sed -n "s/^\([0-9a-f]\{64\}\)  *$asset\$/\1/p" "$tmp/sums")"
+		[ -n "$want" ] || die "sha256sums.txt 里没有 $asset 这一项"
+		[ "$got" = "$want" ] || die "校验不通过，已丢弃下载的文件。期望 $want，实得 $got"
+		ok "校验" "sha256 一致"
+	fi
 
 	# Keep the old binary until the new one has proved it starts: a failed upgrade
 	# must leave a running hub rather than a dead service.
@@ -292,16 +319,16 @@ UNIT
 	printf '\n'
 	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
 	if [ -n "$first" ]; then
-		# The line the hub prints once on first run reads "  Password: <one
-		# time password>"; tail -1 guards against the odd second line a
-		# restart inside the window could add.
-		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
-			sed -n 's/.*Password: //p' | tail -1)"
-		if [ -n "$pw" ]; then
+		# Since v1.6.2 the hub writes the one-time password to a 0600 file beside
+		# the database instead of stdout, so it never lands in the journal; the
+		# file is removed by the sign-in that spends it. Read it here, as root,
+		# while it still exists.
+		if [ -f "$DATA/initial-password" ]; then
+			pw="$(sed -n '1s/[[:space:]]*$//p' "$DATA/initial-password")"
 			field "密码" "$pw"
-			field "    " "${D}只显示这一次，登录后到「设置」里改掉${N}"
+			field "    " "${D}只显示这一次；首次登录后该文件自动删除，请随即在「安全」里改掉${N}"
 		else
-			field "密码" "journalctl -u $SERVICE --no-pager | grep Password"
+			field "密码" "$DATA/initial-password（已被首次登录删除）"
 		fi
 	fi
 	field "数据" "$DATA/monitor.db"
@@ -474,7 +501,7 @@ while [ $# -gt 0 ]; do
 	# fatal in dash, and the output would be the shell's diagnostic rather than
 	# this message.
 	--port) [ $# -ge 2 ] || die "--port 后面要跟端口号"; PORT="$2"; PORT_SET=1; shift 2 ;;
-	--version) [ $# -ge 2 ] || die "--version 后面要跟 tag（或 latest）"; VERSION="$2"; shift 2 ;;
+	--version) [ $# -ge 2 ] || die "--version 后面要跟 tag（或 latest）"; VERSION="$2"; VERSION_REQ="$2"; shift 2 ;;
 	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
