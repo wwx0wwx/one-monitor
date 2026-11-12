@@ -1,0 +1,56 @@
+name: ci-e2e
+
+# The main path through the browser against a freshly built hub: public page,
+# sign-in, a node added through the panel, an agent reporting over the real
+# WebSocket protocol, and the status page carrying its figures. Stands beside
+# ci-hub because it answers a different question -- not "does it compile and
+# pass its units" but "can a person get a monitor running" -- and costs a
+# browser download to answer it.
+on:
+  push:
+    branches: [main]
+    paths: ["hub/**", ".github/workflows/ci-e2e.yml"]
+  pull_request:
+    paths: ["hub/**", ".github/workflows/ci-e2e.yml"]
+
+concurrency:
+  group: ci-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  main-path:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: hub/e2e/package-lock.json
+
+      # The panel is embedded in the binary at compile time, so its build
+      # comes before cargo's.
+      - run: npm ci && npm run build
+        working-directory: hub/web-admin
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+
+      - run: cargo build --locked
+
+      - run: npm ci
+        working-directory: hub/e2e
+
+      # --with-deps installs the browser's shared libraries; the self-signed
+      # certificate the harness makes needs openssl, which the runner carries.
+      - run: npx playwright install --with-deps chromium
+        working-directory: hub/e2e
+
+      - run: node main-path.mjs
+        working-directory: hub/e2e

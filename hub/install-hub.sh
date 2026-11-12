@@ -25,9 +25,9 @@ REPO="wwx0wwx/one-monitor"
 # in the same change that cuts the tag -- forgetting leaves plain installs one
 # release behind, not broken. `--version latest` follows the redirect instead,
 # and `--version <tag>` installs any release by name.
-VERSION="v1.6.2"
+VERSION="v1.6.3"
 # The version this run was asked for: the default until --version names one.
-VERSION_REQ="v1.6.2"
+VERSION_REQ="v1.6.3"
 # The digest of each binary $VERSION published, filled in by the release
 # workflow after it uploads them (it commits the two hashes back here, to
 # main). A digest that travels in this file comes from git, not from the

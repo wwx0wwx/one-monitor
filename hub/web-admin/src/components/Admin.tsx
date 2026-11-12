@@ -14,7 +14,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { addresses, api, changes, GIB, provisioningSite, trafficCorrection, upload, type Node, type PingTask } from "@/lib/api"
 import QRCode from "qrcode"
-import { moveIds } from "@/lib/order"
+import { moveIds, visibleNeighbour } from "@/lib/order"
 import { bytes, CYCLES, FOREVER, money, monthUsage, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -680,7 +680,8 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   // Rows are displaced while the pointer is down; the order is saved on drop.
   // The splice itself lives in `moveIds`, tested there for exactly the
-  // filtered-view-against-full-order mistake this table once made.
+  // filtered-view-against-full-order mistake this table once made; callers
+  // hand it two indices that both belong to `order`.
   function move(from: number, to: number) {
     const ids = moveIds(order.map((node) => node.id), from, to)
     if (!ids) return
@@ -807,9 +808,16 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                         const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
                         if (!delta) return
                         e.preventDefault()
+                        // The neighbouring row the operator can see, not the
+                        // full list's neighbour: under a group filter that
+                        // neighbour can be a hidden row of another group, and
+                        // swapping with it changes nothing on the screen --
+                        // a dead key, until it is pressed enough times to
+                        // cross every hidden row. Both ends land in `order`.
+                        const step = visibleNeighbour(order, visible, n.id, delta)
+                        if (!step) return
                         orderBeforeDrag.current = order.map((node) => node.id)
-                        const at = order.findIndex((node) => node.id === n.id)
-                        const ids = move(at, at + delta)
+                        const ids = move(step.from, step.to)
                         if (ids) save(ids)
                       }}
                     >

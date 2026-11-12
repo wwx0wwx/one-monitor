@@ -1,0 +1,12 @@
+{
+  "name": "monitor-e2e",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "^1.65.0",
+    "ws": "^8.22.2"
+  },
+  "scripts": {
+    "test": "node main-path.mjs"
+  }
+}

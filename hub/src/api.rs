@@ -446,6 +446,16 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
 const VIEWER_SLOTS: usize = 1000;
 static VIEWER_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(VIEWER_SLOTS);
 
+/// How often a quiet viewer is probed, how long the hub waits for a sign of
+/// life before abandoning the connection, and how long one frame may take to
+/// leave. Mirrors the agent stream's heartbeat: without it a connection that
+/// stops reading -- a stalled tab, a half-open TCP session the kernel has not
+/// given up on -- parks this loop on a send that never completes, holding an
+/// anonymous viewer slot for as long as the connection is nominally open.
+const VIEWER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+const VIEWER_SILENCE: std::time::Duration = std::time::Duration::from_secs(120);
+const VIEWER_SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn stream_live(
     app: Shared,
     mut socket: WebSocket,
@@ -454,14 +464,43 @@ async fn stream_live(
     _slot: Option<tokio::sync::SemaphorePermit<'static>>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut heartbeat = tokio::time::interval(VIEWER_HEARTBEAT);
+    // The first tick completes immediately; a frame just went out.
+    heartbeat.tick().await;
+    let mut last_pong = std::time::Instant::now();
     loop {
-        ticker.tick().await;
-        // Closed rather than downgraded to the public frame, which would leave the
-        // panel rendering a list with every admin field missing. The close allows
-        // a client to re-query /api/me and determine its current state.
-        let Some(full) = stream_audience(&app, session.as_deref()) else { break };
-        if socket.send(Message::Text(live_snapshot(&app, full))).await.is_err() {
-            break;
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Closed rather than downgraded to the public frame, which would
+                // leave the panel rendering a list with every admin field missing.
+                // The close allows a client to re-query /api/me and determine its
+                // current state.
+                let Some(full) = stream_audience(&app, session.as_deref()) else { break };
+                let frame = socket.send(Message::Text(live_snapshot(&app, full)));
+                // A viewer that reads nothing fills its socket buffer and would
+                // otherwise park here for the life of the connection; the page
+                // reconnects through the poll fallback it already has.
+                // Timed out (Err(Elapsed)) or failed (Err(axum Error)): either way the
+                // viewer is not being served; the slot goes back.
+                if tokio::time::timeout(VIEWER_SEND_DEADLINE, frame).await.map(|r| r.is_err()).unwrap_or(true) {
+                    break;
+                }
+            }
+            // Browsers answer a ping with a pong without any page code running,
+            // so a quiet tab still counts as alive. Any frame in return would do.
+            _ = heartbeat.tick() => {
+                if last_pong.elapsed() > VIEWER_SILENCE {
+                    break;
+                }
+                let ping = socket.send(Message::Ping(Default::default()));
+                if tokio::time::timeout(VIEWER_SEND_DEADLINE, ping).await.map(|r| r.is_err()).unwrap_or(true) {
+                    break;
+                }
+            }
+            inbound = socket.recv() => match inbound {
+                Some(Ok(_)) => last_pong = std::time::Instant::now(),
+                Some(Err(_)) | None => break,
+            },
         }
     }
 }
