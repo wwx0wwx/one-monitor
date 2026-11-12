@@ -50,6 +50,9 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// Failed second-factor codes, counted globally rather than per address;
+    /// see `auth::TotpFailures`.
+    pub totp: auth::TotpFailures,
     pub http: reqwest::Client,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
@@ -81,6 +84,7 @@ impl App {
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            totp: auth::TotpFailures::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()

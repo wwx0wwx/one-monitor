@@ -33,6 +33,13 @@ const SESSION_DAYS: i64 = 14;
 const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(900);
 
+// Not `__Host-monitor_session`, deliberately: a `__Host-` cookie must carry
+// Secure, and a browser then refuses it over the plain-HTTP ip:port entry
+// point this hub supports out of the box (local development, an SSH tunnel).
+// The cookie is already host-only (no Domain) and SameSite=Lax, so a subdomain
+// can neither receive nor overwrite it; the prefix would buy nothing the
+// supported deployments can keep.
+
 /// How many password checks may run concurrently.
 ///
 /// argon2 is deliberately expensive: one attempt costs 19 MiB and a tenth of a
@@ -90,6 +97,52 @@ pub(crate) fn throttle_key(ip: IpAddr) -> IpAddr {
             let masked = [segments[0], segments[1], segments[2], segments[3], 0, 0, 0, 0];
             IpAddr::V6(masked.into())
         }
+    }
+}
+
+/// TOTP failures counted across every address, not per address.
+///
+/// The second factor is only reached with the password already verified, so
+/// these attempts come from someone holding half the credential. Per-address
+/// throttling is the wrong shape against that: the remaining half is six
+/// digits, and a caller with several addresses -- or a forged X-Forwarded-For
+/// behind a private-network deployment -- gets a fresh counter for each. The
+/// hub has one account, so one global counter cannot lock out anyone but the
+/// attacker, and the operator who types a wrong code a few times waits out the
+/// same window rather than being told their memory of it is a threat.
+///
+/// In memory, like `Throttle`: the alternative is a table row, and a row a
+/// restart forgets costs nothing while the code is only six digits long.
+pub struct TotpFailures {
+    seen: Mutex<(u32, Instant)>,
+}
+
+impl Default for TotpFailures {
+    fn default() -> Self {
+        // A window that has already elapsed rather than one starting at the
+        // process's birth: the first failure of the process begins a new one.
+        Self { seen: Mutex::new((0, Instant::now() - LOCKOUT)) }
+    }
+}
+
+impl TotpFailures {
+    pub(crate) fn locked(&self) -> bool {
+        let (count, since) = *self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        count >= MAX_ATTEMPTS && since.elapsed() < LOCKOUT
+    }
+
+    pub(crate) fn record_failure(&self) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.1.elapsed() >= LOCKOUT {
+            // A new window starts at this failure rather than carrying the
+            // previous window's count, which would lock out on the first try.
+            *seen = (0, Instant::now());
+        }
+        seen.0 += 1;
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = (0, Instant::now());
     }
 }
 
@@ -173,10 +226,12 @@ pub fn issued_at(expires_at: i64) -> i64 {
 }
 
 /// The request's headers decide the Secure flag when the hub has no `--site`;
-/// see `App::secure_cookies`.
-pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
+/// see `App::secure_cookies`. The address the sign-in came from is stored with
+/// the session, so the session list can tell the operator's own logins from
+/// someone else's.
+pub fn issue_session(app: &App, headers: &HeaderMap, ip: IpAddr) -> Result<String> {
     let token = random_token();
-    app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400)?;
+    app.db.create_session(&sha256(&token), Utc::now().timestamp() + SESSION_DAYS * 86_400, &ip.to_string())?;
     Ok(set_cookie(COOKIE, &token, SESSION_DAYS * 86_400, app.secure_cookies(headers)))
 }
 
@@ -258,7 +313,7 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let ip = client_ip(trust_cf_ip(&app), trust_private_xff(&app), &headers, peer.ip());
+    let ip = client_ip(trust_cf_ip(&app), trust_private_xff(&app), &trusted_proxies(&app), &headers, peer.ip());
     if app.throttle.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "尝试次数过多，请稍后再试").into_response();
     }
@@ -288,6 +343,12 @@ pub async fn login(
     let via = match credential {
         Credential::Password => {
             if totp_bound(&app) {
+                // Counted globally as well as per address: see `TotpFailures`.
+                // Checked before the code is read, so a flood of wrong codes
+                // cannot keep spending argon2 on the password in front of them.
+                if app.totp.locked() {
+                    return (StatusCode::TOO_MANY_REQUESTS, "两步验证尝试过多，请稍后再试").into_response();
+                }
                 let code = body.code.as_deref().unwrap_or_default().trim().to_owned();
                 let Some(secret) = app.db.get("totp_secret").filter(|s| !s.is_empty()) else {
                     return (StatusCode::INTERNAL_SERVER_ERROR, "两步验证数据不可读，请检查数据库")
@@ -300,8 +361,10 @@ pub async fn login(
                     // lands here too, whatever half of the credential it
                     // completed.
                     app.throttle.record_failure(ip);
+                    app.totp.record_failure();
                     return (StatusCode::UNAUTHORIZED, "验证码不正确，请确认时间同步后重试").into_response();
                 }
+                app.totp.clear();
             }
             "密码"
         }
@@ -313,7 +376,7 @@ pub async fn login(
     // Security. Left behind it would be a second copy of a credential that
     // outlives the sign-in it was printed for.
     let _ = std::fs::remove_file(app.secrets.join("initial-password"));
-    match issue_session(&app, &headers) {
+    match issue_session(&app, &headers, ip) {
         Ok(cookie) => {
             crate::notify::signed_in(&app, via, ip);
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
@@ -404,9 +467,10 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
 /// through a local reverse proxy. Used for throttling and for the address shown
 /// beside a node, never for authorization.
 ///
-/// The header is honoured only when the peer is itself local. Otherwise a
-/// caller could mint a fresh identity per request, bypassing the lockout and
-/// growing the throttle map without bound.
+/// The header is honoured only when the peer is itself local, or is one of the
+/// addresses the operator named in `trusted_proxies`. Otherwise a caller could
+/// mint a fresh identity per request, bypassing the lockout and growing the
+/// throttle map without bound.
 ///
 /// The last value is taken, not the first. Both documented proxies append
 /// rather than replace -- nginx's `$proxy_add_x_forwarded_for`, caddy's
@@ -430,9 +494,15 @@ pub fn with_cookies<const N: usize>(response: impl IntoResponse, cookies: [Strin
 /// this header: behind an untrusting proxy the tail here is Cloudflare's own
 /// address, different on every connection, and the setting is what keeps a
 /// node's country badge from churning with it.
-pub fn client_ip(trust_cf: bool, trust_private: bool, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+pub fn client_ip(
+    trust_cf: bool,
+    trust_private: bool,
+    proxies: &str,
+    headers: &HeaderMap,
+    peer: IpAddr,
+) -> IpAddr {
     let peer = peer.to_canonical();
-    if !behind_local_proxy(peer, trust_private) {
+    if !behind_local_proxy(peer, trust_private) && !named_proxy(peer, proxies) {
         return peer;
     }
     if trust_cf {
@@ -459,6 +529,11 @@ pub fn trust_cf_ip(app: &App) -> bool {
     app.db.get("cf_connecting_ip").as_deref() == Some("on")
 }
 
+/// The `trusted_proxies` setting, read per request like its neighbours.
+pub fn trusted_proxies(app: &App) -> String {
+    app.db.get("trusted_proxies").unwrap_or_default()
+}
+
 /// Loopback or a private network, where a reverse proxy resides.
 ///
 /// `trust_private` widens the loopback-only default to private ranges: a hub in
@@ -477,6 +552,82 @@ fn behind_local_proxy(ip: IpAddr, trust_private: bool) -> bool {
             v6.is_loopback() || (trust_private && (head & 0xfe00 == 0xfc00 || head & 0xffc0 == 0xfe80))
         }
     }
+}
+
+/// One entry of `trusted_proxies`: an address, or a network with a prefix.
+struct Net(IpAddr, u8);
+
+impl Net {
+    fn parse(entry: &str) -> Option<Self> {
+        let (addr, prefix) = match entry.split_once('/') {
+            Some((addr, prefix)) => {
+                let addr: IpAddr = addr.parse().ok()?;
+                let prefix = prefix.parse::<u8>().ok()?;
+                let bits = if addr.is_ipv4() { 32 } else { 128 };
+                if prefix > bits {
+                    return None;
+                }
+                (addr, prefix)
+            }
+            None => {
+                let addr: IpAddr = entry.parse().ok()?;
+                let bits = if addr.is_ipv4() { 32 } else { 128 };
+                (addr, bits)
+            }
+        };
+        Some(Net(addr.to_canonical(), prefix))
+    }
+
+    /// A v4-mapped v6 address canonicalizes to v4, so both sides arrive in the
+    /// family they were written in and a mismatch is a genuine one.
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.0, ip.to_canonical()) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let bits = u32::from(self.1);
+                let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                let (net, ip) = (u32::from(net), u32::from(ip));
+                net & mask == ip & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                // Whole segments up to the prefix boundary, then the masked
+                // remainder of the segment it lands in.
+                let bits = u32::from(self.1);
+                let (full, rem) = ((bits / 16) as usize, bits % 16);
+                let (net, ip) = (net.segments(), ip.segments());
+                if net[..full] != ip[..full] {
+                    return false;
+                }
+                rem == 0 || {
+                    let mask = u16::MAX << (16 - rem);
+                    net[full] & mask == ip[full] & mask
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether the peer is one of the networks `trusted_proxies` names -- the
+/// precise form of the trust `trust_private_xff` hands to every private
+/// address at once. An empty setting trusts nothing; malformed entries are
+/// refused by the settings gate, and one that slips through is ignored here
+/// rather than widening the trust it failed to describe.
+fn named_proxy(peer: IpAddr, setting: &str) -> bool {
+    setting
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| Net::parse(entry).is_some_and(|net| net.contains(peer)))
+}
+
+/// Whether every entry of a `trusted_proxies` value names an address or a
+/// network, for the settings gate: an unparsable entry is a spelling the
+/// operator meant to trust, so it is refused outright rather than silently
+/// narrowing (or, half-parsed, reinterpreting) the list.
+pub fn trusted_proxies_valid(value: &str) -> bool {
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| Net::parse(entry).is_some())
 }
 
 /// Whether the panel trusts a private-network peer's X-Forwarded-For; on by
@@ -667,19 +818,19 @@ mod tests {
 
         for private in ["10.0.0.1", "172.18.0.4", "fd00::1"] {
             assert_eq!(
-                client_ip(false, true, &headers, ip(private)).to_string(),
+                client_ip(false, true, "", &headers, ip(private)).to_string(),
                 "198.51.100.9",
                 "{private}: trusted while on"
             );
             assert_eq!(
-                client_ip(false, false, &headers, ip(private)),
+                client_ip(false, false, "", &headers, ip(private)),
                 ip(private),
                 "{private}: the peer itself while off"
             );
         }
         // Loopback is not a setting: the proxy the installer puts there is the
         // deployment's own, and nothing else can appear from it.
-        assert_eq!(client_ip(false, false, &headers, ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, false, "", &headers, ip("127.0.0.1")).to_string(), "198.51.100.9");
     }
 
     #[test]
@@ -693,7 +844,7 @@ mod tests {
 
         // Nothing arrived with the request: the proxy appended the single
         // address it observed, which is the entire header.
-        assert_eq!(client_ip(false, true, &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, true, "", &xff("198.51.100.9"), ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // The caller supplied a header of its own. Both documented proxies
         // append, so the fabricated value sits at the head and the proxy's
@@ -701,20 +852,20 @@ mod tests {
         // own throttle bucket each request, or claim the operator's address.
         let forged = xff("10.0.0.2, 198.51.100.9");
         for peer in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
-            assert_eq!(client_ip(false, true, &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
+            assert_eq!(client_ip(false, true, "", &forged, ip(peer)).to_string(), "198.51.100.9", "{peer}");
         }
 
         // A dual-stack `[::]` listener reports an IPv4 proxy as `::ffff:a.b.c.d`,
         // which is the same local peer.
-        assert_eq!(client_ip(false, true, &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
-        assert_eq!(client_ip(false, true, &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, true, "", &forged, ip("::ffff:172.18.0.4")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(false, true, "", &HeaderMap::new(), ip("::ffff:203.0.113.5")), ip("203.0.113.5"));
 
         // Directly from the internet the entire header is caller-supplied, and
         // honouring any part of it bypasses the lockout.
-        assert_eq!(client_ip(false, true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
-        assert_eq!(client_ip(false, true, &forged, ip("2001:db8::5")), ip("2001:db8::5"));
+        assert_eq!(client_ip(false, true, "", &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(false, true, "", &forged, ip("2001:db8::5")), ip("2001:db8::5"));
         // No header at all: the peer address is used.
-        assert_eq!(client_ip(false, true, &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(client_ip(false, true, "", &HeaderMap::new(), ip("10.0.0.1")), ip("10.0.0.1"));
     }
 
     #[test]
@@ -735,24 +886,24 @@ mod tests {
         // observation -- Cloudflare's address, not the caller's -- is what the
         // X-Forwarded-For tail holds.
         let behind_edge = headers(Some("198.51.100.9"), Some("162.158.0.1"));
-        assert_eq!(client_ip(false, true, &behind_edge, ip("127.0.0.1")).to_string(), "162.158.0.1");
+        assert_eq!(client_ip(false, true, "", &behind_edge, ip("127.0.0.1")).to_string(), "162.158.0.1");
 
         // On, the edge's answer wins: through Cloudflare the header was
         // overwritten by the edge itself, so it is the one value a caller
         // cannot choose.
-        assert_eq!(client_ip(true, true, &behind_edge, ip("127.0.0.1")).to_string(), "198.51.100.9");
+        assert_eq!(client_ip(true, true, "", &behind_edge, ip("127.0.0.1")).to_string(), "198.51.100.9");
 
         // On but absent -- a deployment where Cloudflare fronts only some
         // hosts, or was switched off since: the X-Forwarded-For fallback
         // still applies.
         assert_eq!(
-            client_ip(true, true, &headers(None, Some("198.51.100.9")), ip("127.0.0.1")).to_string(),
+            client_ip(true, true, "", &headers(None, Some("198.51.100.9")), ip("127.0.0.1")).to_string(),
             "198.51.100.9"
         );
 
         // On and unparseable: same fallback.
         assert_eq!(
-            client_ip(true, true, &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
+            client_ip(true, true, "", &headers(Some("not-an-address"), Some("198.51.100.9")), ip("127.0.0.1"))
                 .to_string(),
             "198.51.100.9"
         );
@@ -760,6 +911,87 @@ mod tests {
         // Directly from the internet the header is caller-supplied even with
         // the setting on: the peer address is the only honest answer.
         let forged = headers(Some("10.0.0.2"), Some("10.0.0.2, 198.51.100.9"));
-        assert_eq!(client_ip(true, true, &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+        assert_eq!(client_ip(true, true, "", &forged, ip("203.0.113.5")), ip("203.0.113.5"));
+    }
+
+    /// The precise form of the trust `trust_private_xff` grants a whole
+    /// address range at once: a named proxy list admits exactly the proxies
+    /// the deployment has, and nothing else on their network.
+    #[test]
+    fn a_named_proxy_is_trusted_and_its_neighbours_are_not() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let xff = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", v.parse().unwrap());
+            h
+        };
+
+        // Off by default: an empty setting trusts no private peer.
+        assert_eq!(client_ip(false, false, "", &xff("198.51.100.9"), ip("172.18.0.4")), ip("172.18.0.4"));
+        // The one proxy the operator named.
+        let named = "172.18.0.4";
+        assert_eq!(
+            client_ip(false, false, named, &xff("198.51.100.9"), ip("172.18.0.4")).to_string(),
+            "198.51.100.9"
+        );
+        // Its neighbour on the same bridge is not the proxy, and a public peer
+        // is never trusted however the setting reads.
+        assert_eq!(client_ip(false, false, named, &xff("198.51.100.9"), ip("172.18.0.5")), ip("172.18.0.5"));
+        assert_eq!(client_ip(false, false, named, &xff("198.51.100.9"), ip("203.0.113.5")), ip("203.0.113.5"));
+
+        // A network names several proxies at once, in either family; a
+        // v4-mapped peer of a v4 entry is the same proxy.
+        let net = "10.0.0.0/24, 2001:db8:1::/64";
+        assert_eq!(client_ip(false, false, net, &xff("198.51.100.9"), ip("10.0.0.199")).to_string(), "198.51.100.9");
+        assert_eq!(
+            client_ip(false, false, net, &xff("198.51.100.9"), ip("::ffff:10.0.0.7")).to_string(),
+            "198.51.100.9"
+        );
+        assert_eq!(client_ip(false, false, net, &xff("198.51.100.9"), ip("10.0.1.1")), ip("10.0.1.1"));
+        assert_eq!(
+            client_ip(false, false, net, &xff("198.51.100.9"), ip("2001:db8:1::dead")).to_string(),
+            "198.51.100.9"
+        );
+        assert_eq!(
+            client_ip(false, false, net, &xff("198.51.100.9"), ip("2001:db8:2::1")),
+            ip("2001:db8:2::1")
+        );
+
+        // Separators, surrounding whitespace and junk entries: an entry that
+        // is not an address matches nothing rather than widening the trust.
+        for setting in [" 10.0.0.5 ,  not-an-address  ", "10.0.0.5\t10.0.0.6"] {
+            assert_eq!(
+                client_ip(false, false, setting, &xff("198.51.100.9"), ip("10.0.0.5")).to_string(),
+                "198.51.100.9",
+                "{setting:?}"
+            );
+            assert_eq!(
+                client_ip(false, false, setting, &xff("198.51.100.9"), ip("10.0.0.7")),
+                ip("10.0.0.7"),
+                "{setting:?}"
+            );
+        }
+
+        // A prefix past its family's width describes no network at all.
+        assert!(Net::parse("10.0.0.0/33").is_none());
+        assert!(Net::parse("2001:db8::/129").is_none());
+        assert!(Net::parse("").is_none());
+    }
+
+    /// Two-step failures pool across addresses: the account has one second
+    /// factor, and a caller with several addresses gets no fresh counter for
+    /// each. The window expires on its own, as the per-address one does.
+    #[test]
+    fn totp_failures_pool_into_one_lockout_that_expires() {
+        let t = TotpFailures::default();
+        assert!(!t.locked());
+        for _ in 0..MAX_ATTEMPTS {
+            t.record_failure();
+        }
+        assert!(t.locked(), "the attempt past the limit is shut out");
+        // A success clears it: the operator who misread their authenticator a
+        // few times is not remembered for it.
+        t.clear();
+        assert!(!t.locked());
     }
 }

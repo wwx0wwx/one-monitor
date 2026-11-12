@@ -156,6 +156,11 @@ CREATE TABLE IF NOT EXISTS ping_record (
 
 CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
+  -- The address the sign-in came from, shown beside the session so the
+  -- operator can tell their own logins from someone else's. Empty on sessions
+  -- issued before the column existed, and on a hub whose proxy header the
+  -- deployment does not trust.
+  ip         TEXT    NOT NULL DEFAULT '',
   expires_at INTEGER NOT NULL
 );
 "#;
@@ -163,7 +168,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -274,6 +279,10 @@ fn migrate_to_6(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "auto_renew INTEGER NOT NULL DEFAULT 0")
 }
 
+fn migrate_to_7(conn: &Connection) -> Result<()> {
+    add_column(conn, "session", "ip TEXT NOT NULL DEFAULT ''")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -298,6 +307,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 6 {
         migrate_to_6(conn)?;
+    }
+    if from < 7 {
+        migrate_to_7(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -1651,10 +1663,10 @@ impl Db {
 
     // ---- sessions ----
 
-    pub fn create_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
+    pub fn create_session(&self, token_hash: &str, expires_at: i64, ip: &str) -> Result<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO session (token_hash, expires_at) VALUES (?1, ?2)",
-            params![token_hash, expires_at],
+            "INSERT OR REPLACE INTO session (token_hash, ip, expires_at) VALUES (?1, ?2, ?3)",
+            params![token_hash, ip, expires_at],
         )?;
         Ok(())
     }
@@ -1672,15 +1684,16 @@ impl Db {
             .is_some()
     }
 
-    /// Live sessions, newest first. Expired rows are filtered here rather than
-    /// left to `expire_sessions`, which sweeps only once an hour.
-    pub fn sessions(&self) -> Result<Vec<(String, i64)>> {
+    /// Live sessions, newest first, each with the address it was issued from.
+    /// Expired rows are filtered here rather than left to `expire_sessions`,
+    /// which sweeps only once an hour.
+    pub fn sessions(&self) -> Result<Vec<(String, i64, String)>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
-            "SELECT token_hash, expires_at FROM session WHERE expires_at > ?1 ORDER BY expires_at DESC",
+            "SELECT token_hash, expires_at, ip FROM session WHERE expires_at > ?1 ORDER BY expires_at DESC",
         )?;
         let rows = stmt
-            .query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([Utc::now().timestamp()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
