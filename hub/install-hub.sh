@@ -27,7 +27,11 @@ REPO="wwx0wwx/one-monitor"
 # and `--version <tag>` installs any release by name.
 VERSION="v1.6.5"
 # The version this run was asked for: the default until --version names one.
-VERSION_REQ="v1.6.4"
+# Derived rather than restated: two version literals here have drifted before
+# (a bump that moved one and not the other silently disabled the built-in
+# digests for every default install, since the gate below compared them), and
+# nothing about the default can name a version $VERSION does not.
+VERSION_REQ="$VERSION"
 # The digest of each binary $VERSION published, filled in by the release
 # workflow after it uploads them (it commits the two hashes back here, to
 # main). A digest that travels in this file comes from git, not from the

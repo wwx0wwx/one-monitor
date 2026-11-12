@@ -30,6 +30,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
+      # The built-in digests apply only while VERSION_REQ tracks VERSION. The
+      # derivation keeps them in step; this step fails a change that hardcodes
+      # a second version literal there again -- the shape that once shipped a
+      # release whose default installs silently skipped their own pins.
+      - run: grep -q '^VERSION_REQ="\$VERSION"$' install-hub.sh
+
       # The default theme arrives as a published archive, verified against the
       # hash in web-theme.pin. Run here rather than left to build.rs so the
       # download happens on the runner: release builds go through cross, whose
