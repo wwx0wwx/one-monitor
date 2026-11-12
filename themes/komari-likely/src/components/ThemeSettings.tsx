@@ -1,8 +1,9 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { RotateCcw, Settings2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import type { Bg, ThemeSettings } from "@/lib/display"
+import { followCommitted } from "@/lib/draft"
 import { cn } from "@/lib/utils"
 
 /**
@@ -46,13 +47,26 @@ export function BackgroundLayer({ bg, dark }: { bg: Bg; dark: boolean }) {
  *  would otherwise flash a broken image with every letter. */
 function UrlField({ label, value, onCommit }: { label: string; value: string; onCommit: (next: string) => void }) {
   const [draft, setDraft] = useState(value)
+  // `value` is controlled by the caller and moves under the field -- 「恢复默认」
+  // emptying every link, a save from the hub's theme tab -- and the draft must
+  // follow (followCommitted) or the box keeps showing the old value and the
+  // next blur quietly PUTs it back. Reconciled here in render rather than an
+  // effect or a caller-side key: an effect paints one stale frame first, and a
+  // key would remount the input, dropping focus and undo history on every
+  // server-side change.
+  const [saved, setSaved] = useState(value)
+  const shown = followCommitted(draft, saved, value)
+  if (shown !== draft) {
+    setSaved(value)
+    setDraft(shown)
+  }
   return (
     <label className="block">
       <span className="text-xs text-muted-foreground">{label}</span>
       <input
-        value={draft}
+        value={shown}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => onCommit(draft.trim())}
+        onBlur={() => onCommit(shown.trim())}
         onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
         placeholder="https://…"
         spellCheck={false}
@@ -154,13 +168,34 @@ export function ThemeSettingsButton({ settings, onSave }: {
   const save = (patch: Record<string, string>) =>
     onSave(patch).then(() => setError(""), (e: Error) => setError(e.message || "保存失败"))
 
+  // Esc closes the panel no matter where focus sits: the panel is often opened
+  // by touch, which leaves focus on <body>, outside this wrapper and out of
+  // reach of an onKeyDown. The listener takes capture and stops the event so
+  // App's own Esc -- back out of a node page -- does not also fire on the same
+  // press; the panel dismisses first, the next press navigates.
+  useEffect(() => {
+    if (!open) return
+    const close = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return
+      e.stopPropagation()
+      setOpen(false)
+    }
+    addEventListener("keydown", close, true)
+    return () => removeEventListener("keydown", close, true)
+  }, [open])
+
   const { bg, display, layout } = settings
   return (
-    <div
-      className="relative"
-      onKeyDown={(e) => e.key === "Escape" && open && (e.stopPropagation(), setOpen(false))}
-    >
-      <Button variant="ghost" size="icon" onClick={() => setOpen((o) => !o)} title="主题设置">
+    <div className="relative">
+      {/* max-sm:size-11 -- a thumb needs 44px; the desktop icon stays 36px. */}
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={() => setOpen((o) => !o)}
+        title="主题设置"
+        aria-label="主题设置"
+        className="max-sm:size-11"
+      >
         <Settings2 />
       </Button>
       {open && (

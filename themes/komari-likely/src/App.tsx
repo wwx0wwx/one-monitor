@@ -172,8 +172,12 @@ export default function App() {
         : n.country === group
   const shown = group ? sorted.filter(inGroup) : sorted
   const count = (name: string) => sorted.filter((n) => (name === EXPIRING ? expiring.some((e) => e.id === n.id) : groups.includes(name) ? n.group === name : n.country === name)).length
+  // The pills stay thumb-sized on a phone (44px is the smallest a finger hits
+  // without missing) and drop back to their compact height from sm up, so the
+  // desktop row looks exactly as it did. The RegionPicker trigger wears the
+  // same classes, so it grows with them.
   const pill = (active: boolean) =>
-    `frost-chip inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${active ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`
+    `frost-chip inline-flex min-h-11 items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors sm:min-h-0 ${active ? "border-primary bg-secondary font-medium" : "text-muted-foreground hover:bg-muted"}`
 
   // `/node/{id}` is a page people bookmark and share, so the tab needs the node's
   // name. The site name rather than a fixed string, since the hub lets an operator
@@ -248,13 +252,23 @@ export default function App() {
                 theme, so this is a navigation rather than a route. The wording
                 lives in the hover text alone, the shape of an icon reading the
                 same signed in or out. */}
-            <Button variant="ghost" size="icon" asChild>
+            {/* max-sm:size-11 -- the header icons stay thumb-sized (44px) on a
+                phone and revert to 36px from sm up, keeping the desktop bar as
+                compact as it always was. */}
+            <Button variant="ghost" size="icon" asChild className="max-sm:size-11">
               <a href="/admin/" title={me.authed ? "进入后台" : "登录"} aria-label={me.authed ? "进入后台" : "登录"}>
                 <Wrench />
               </a>
             </Button>
             {me.authed && <ThemeSettingsButton settings={ts} onSave={saveSettings} />}
-            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={toggleTheme}
+              title="切换主题"
+              aria-label="切换深浅色"
+              className="max-sm:size-11"
+            >
               {dark ? <Sun /> : <Moon />}
             </Button>
           </div>

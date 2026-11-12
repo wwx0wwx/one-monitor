@@ -251,6 +251,10 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
     [data],
   )
 
+  // Answered samples only: a bucket whose every probe timed out draws a gap,
+  // not a point a reader can use, so "how much is there" counts what answered.
+  const answeredPings = pingSeries.reduce((n, s) => n + s.points.filter((p) => p.latency !== null).length, 0)
+
   // The hub answers in seconds; the time axis requires milliseconds.
   const metricRows = useMemo(
     () => (data?.metrics ?? []).map((m) => ({ ...m, ts: m.ts * 1_000 })),
@@ -303,8 +307,9 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
         row[`t${s.id}`] = p.latency
         row[`s${s.id}`] = smoothed[i]
         row[`l${s.id}`] = p.loss ?? 0
-        // Raw, never despiked: the band exists to show what the line omits, and
-        // smoothing it would omit the same points.
+        // Raw even when the line draws the moving average: the band exists to
+        // show the spread such averaging smooths over, and averaging it in
+        // turn would hide the very points it carries.
         row[`b${s.id}`] = p.band ?? null
         rows.set(p.ts, row)
       })
@@ -446,6 +451,11 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
       ) : tab === "latency" ? (
         pingSeries.length === 0 ? (
           <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有延迟数据</p>
+        ) : answeredPings < 2 ? (
+          // One answered sample draws nothing -- dot:false leaves a lone point
+          // invisible -- and an empty panel reads as broken. A window this
+          // fresh is usually a machine just added; say so instead.
+          <p className="py-8 text-center text-sm text-muted-foreground">数据积累中，稍后再看</p>
         ) : (
           // An explicit pixel height on the card, so the chart can be `flex-1`
           // within it while the legend takes what it needs: four probes are one
@@ -591,6 +601,11 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
         )
       ) : data.metrics.length === 0 ? (
         <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有历史数据</p>
+      ) : data.metrics.length < 2 ? (
+        // As on the latency tab: a single sample draws no line, and four blank
+        // panels read as four broken charts rather than one machine too new
+        // to have history.
+        <p className="py-8 text-center text-sm text-muted-foreground">数据积累中，稍后再看</p>
       ) : (
         // Two across where the viewport allows: a half-width panel still holds
         // a day of minutes legibly, and the page stops being four full-width
