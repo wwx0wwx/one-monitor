@@ -548,8 +548,22 @@ mod tests {
     /// arena for the life of the process.
     #[test]
     fn the_password_gate_refuses_a_flood_rather_than_queueing_it() {
-        let held: Vec<_> =
-            (0..PASSWORD_CHECKS).map(|_| PASSWORD_GATE.try_acquire().expect("up to the limit")).collect();
+        // The gate is one global permit, and any login-route test running in
+        // parallel holds it across its argon2 for a moment. Waiting here is
+        // not the behaviour under test -- the refusal past the limit, below,
+        // is -- so the first grab retries while that neighbour finishes, and
+        // the assert only fires if it never comes back at all.
+        let held: Vec<_> = (0..PASSWORD_CHECKS)
+            .map(|_| {
+                for _ in 0..200 {
+                    if let Ok(permit) = PASSWORD_GATE.try_acquire() {
+                        return permit;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                panic!("a login-route test never released the gate")
+            })
+            .collect();
         assert!(PASSWORD_GATE.try_acquire().is_err(), "the attempt past the limit must be refused");
         drop(held);
         assert!(PASSWORD_GATE.try_acquire().is_ok(), "permits come back when the checks finish");
