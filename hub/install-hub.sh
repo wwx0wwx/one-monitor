@@ -25,7 +25,7 @@ REPO="wwx0wwx/one-monitor"
 # in the same change that cuts the tag -- forgetting leaves plain installs one
 # release behind, not broken. `--version latest` follows the redirect instead,
 # and `--version <tag>` installs any release by name.
-VERSION="v1.6.4"
+VERSION="v1.6.5"
 # The version this run was asked for: the default until --version names one.
 VERSION_REQ="v1.6.4"
 # The digest of each binary $VERSION published, filled in by the release
@@ -37,8 +37,8 @@ VERSION_REQ="v1.6.4"
 # release's own sums file is the check, as it always was. Bumping VERSION in a
 # release PR resets both to empty; the workflow refills them after publishing.
 PIN_VERSION="$VERSION"
-PIN_amd64=4403975b84542a400ff13c045fa3a65bad0e6cb0c145b037869b71802ceef340
-PIN_arm64=5bf2fca38ce0d018ff1da2f0770604ab6fcc2289d25292f184f4b99e58879ec8
+PIN_amd64=""
+PIN_arm64=""
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,

@@ -16,6 +16,7 @@ import { spawn, execFileSync } from "node:child_process"
 import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import net from "node:net"
 import http from "node:http"
 import https from "node:https"
 import { setTimeout as sleep } from "node:timers/promises"
@@ -24,8 +25,23 @@ import { chromium } from "playwright"
 import WebSocket from "ws"
 
 const DOMAIN = "e2e.test"
-const HUB_PORT = 28170
-const TLS_PORT = 28443
+
+// A port that is free on this machine right now: a fixed number races anything
+// else that happens to listen on it (another e2e run, a leftover process), and
+// the failure reads as the hub failing to start. Falls upward until one binds.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer()
+    probe.once("error", reject)
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address()
+      probe.close(() => resolve(port))
+    })
+  })
+}
+// The two ports must be found before the URL and the hub's --listen are built,
+// so both are awaited up front; the browser's origin derives from TLS_PORT.
+const [HUB_PORT, TLS_PORT] = await Promise.all([freePort(), freePort()])
 const ORIGIN = `https://${DOMAIN}:${TLS_PORT}`
 
 const failed = []
