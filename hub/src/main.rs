@@ -208,11 +208,21 @@ pub async fn same_origin(req: axum::extract::Request, next: axum::middleware::Ne
     next.run(req).await
 }
 
+/// Marks every API response `Cache-Control: no-store`; see the layer above.
+async fn no_store(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
+    let mut response = next.run(req).await;
+    if is_api && !response.headers().contains_key(header::CACHE_CONTROL) {
+        response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static value"));
+    }
+    response
+}
+
 /// Whether `Origin` (an absolute URL) addresses the same host the request's
 /// `Host` header names. Hostnames match case-insensitively; an explicit port in
 /// `Origin` must appear in `Host` too, and a bracketed IPv6 literal compares by
 /// its address rather than its spelling with brackets.
-fn origin_names_host(origin: &str, host: &str) -> bool {
+pub(crate) fn origin_names_host(origin: &str, host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else { return false };
     let Some(origin_host) = url.host_str() else { return false };
     let host = host.split('/').next().unwrap_or("");
@@ -588,6 +598,13 @@ async fn main() -> Result<()> {
         // writes the panel makes, stand behind the same gate as every other.
         // Reads, and requests without an Origin at all, pass through.
         .layer(axum::middleware::from_fn(same_origin))
+        // Every /api answer is either per-request state or a credential, and
+        // neither may sit in a shared cache: the panel's settings and session
+        // list carry as much as the token read that already sets no-store
+        // itself. Inserted rather than appended so handlers that name their own
+        // policy (no-store on tokens and backups) keep it, and skipped for the
+        // streamed frames, which carry their own per-tick freshness.
+        .layer(axum::middleware::from_fn(no_store))
         // Excludes the agent binary and database backups: both are already
         // compressed and both are megabytes, so deflating them would consume the
         // cores argon2 and the SQLite writer share for no gain.
@@ -718,7 +735,13 @@ pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
         return Ok(());
     }
     let password = auth::random_token()[..24].to_owned();
-    app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
+    // The file lands before the hash does. The other order -- hash committed,
+    // then a disk error takes the process down -- leaves a restart facing a
+    // database that already has a password and no file holding it: every later
+    // boot takes the early return above and the credential is unreachable
+    // forever. Writing the file first inverts the failure: a restart that finds
+    // no hash generates a fresh password and overwrites the file, which an
+    // operator who just watched the first boot fail reads instead.
     let file = app.secrets.join("initial-password");
     std::fs::create_dir_all(&app.secrets)?;
     std::fs::write(&file, format!("{password}\n"))?;
@@ -727,6 +750,7 @@ pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(0o600)
     })?;
+    app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
@@ -881,6 +905,13 @@ mod tests {
         assert_eq!(spa("/").await.status(), StatusCode::OK);
         // A path merely beginning with "api" is not an API path.
         assert_eq!(spa("/apiary").await.status(), StatusCode::OK);
+
+        // A path naming a file is not a client route either: answering
+        // /robots.txt with the app shell hands a 200 HTML page to whatever
+        // asked for a file.
+        for file in ["/robots.txt", "/favicon.ico", "/random.txt"] {
+            assert_eq!(spa(file).await.status(), StatusCode::NOT_FOUND, "{file}");
+        }
     }
 
     /// A build writes hashed filenames under `assets/`, so a miss there means a
@@ -1050,6 +1081,48 @@ mod tests {
         assert!(hash.starts_with("$argon2"));
         first_run(&app, "http://x").unwrap();
         assert_eq!(app.db.get("admin_password_hash").unwrap(), hash, "must not rotate on restart");
+    }
+
+    /// A first boot that dies writing the password file must leave no hash
+    /// behind: the other order committed the hash first, and the restart then
+    /// took the "already initialised" early return forever -- a hub that starts
+    /// and can never be signed in to. With the file first, a failed boot simply
+    /// tries again.
+    #[test]
+    fn a_first_boot_that_fails_to_write_the_password_file_leaves_no_hash_behind() {
+        let app = app("http://x");
+        // A file where the secrets directory should be: create_dir_all fails,
+        // standing in for the disk-full or read-only data directory.
+        let name = app.secrets.file_name().unwrap().to_string_lossy().into_owned();
+        let blocker = app.secrets.with_file_name(format!("{name}.blocker"));
+        std::fs::write(&blocker, b"").unwrap();
+        let mut blocked = app;
+        blocked.secrets = blocker.clone();
+
+        assert!(first_run(&blocked, "http://x").is_err(), "the write fails");
+        assert!(
+            blocked.db.get("admin_password_hash").is_none(),
+            "a restart must get a fresh password, not a hash with no credential behind it"
+        );
+
+        // The retry, on a data directory that works this time: the file the
+        // failed boot never wrote lands now.
+        blocked.secrets = app_secrets_dir();
+        first_run(&blocked, "http://x").unwrap();
+        assert!(blocked.secrets.join("initial-password").is_file());
+        assert!(blocked.db.get("admin_password_hash").is_some());
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&blocked.secrets);
+    }
+
+    /// A fresh tempdir for the test above's second half, separate from the
+    /// helper's own (which `blocked` no longer owns).
+    fn app_secrets_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "monitor-hub-firstrun-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     /// The one-time password is a 0600 file beside the database, never stdout:

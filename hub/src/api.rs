@@ -423,6 +423,19 @@ fn stream_audience(app: &App, session: Option<&str>) -> Option<bool> {
 /// operator, and an operator must not be locked out of the live view by
 /// visitors.
 pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    // Cross-site WebSocket hijacking: a page on another origin cannot set a
+    // cookie SameSite=Lax would keep off its handshake, but that is a browser
+    // courtesy this hub should not be the last line of. An Origin naming
+    // another host is refused here, exactly as a cross-site write is below;
+    // requests without one (curl, the agent installer) pass untouched.
+    if let (Some(origin), Some(host)) = (
+        headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+    ) {
+        if !crate::origin_names_host(origin, host) {
+            return (StatusCode::FORBIDDEN, "cross-origin WebSocket refused").into_response();
+        }
+    }
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
@@ -1326,21 +1339,44 @@ pub async fn db_restore(
         return bad(&format!("上传收齐了却取不到文件：{e}"));
     }
 
-    let outcome = restore(&app, &source).await;
-    // SQLite writes a -wal and a -shm beside any file it opens in WAL mode, and a
-    // plain copy of a running hub's database is exactly that. They are removed
-    // when the connection closes cleanly; these three lines cover the case where
-    // it does not.
-    for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
-        let _ = std::fs::remove_file(leftover);
-    }
-    match outcome {
+    // Restore and its cleanup run in a detached task, and the handler only
+    // observes the result. A client that walks away mid-restore -- the dialog
+    // closed, the tab navigated, the proxy timed the request out -- drops this
+    // handler at an await point; a plain `.await` would take the post-restore
+    // cleanup with it, leaving a restored database whose old session rows are
+    // still valid and whose agents still hold tokens that now name other nodes.
+    // The spawned task cannot be dropped, so whatever restore did, the cleanup
+    // that must follow it happens; the cookie below is the only part that needs
+    // a live caller, and a caller that left has no use for a cookie.
+    let restoring = {
+        let (app, source) = (app.clone(), source.clone());
+        tokio::spawn(async move {
+            let outcome = restore(&app, &source).await;
+            // SQLite writes a -wal and a -shm beside any file it opens in WAL
+            // mode, and a plain copy of a running hub's database is exactly
+            // that. They are removed when the connection closes cleanly; these
+            // three lines cover the case where it does not.
+            for leftover in [source.clone(), format!("{source}-wal"), format!("{source}-shm")] {
+                let _ = std::fs::remove_file(leftover);
+            }
+            if outcome.is_ok() {
+                // Agents authenticate at the handshake, and the tokens they hold
+                // may now belong to different nodes, or to none. Dropping the
+                // senders ends those loops; each reconnects against the restored
+                // database. Sessions die with the backup's own rows: a restore
+                // must not revive sessions the operator logged out of before the
+                // backup was taken.
+                app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+                invalidate_snapshot(&app);
+                if let Err(e) = app.db.drop_all_sessions() {
+                    tracing::warn!("dropping the restored sessions failed: {e:#}");
+                }
+            }
+            outcome
+        })
+    };
+    match restoring.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e))) {
         Ok(()) => {
-            // Agents authenticate at the handshake, and the tokens they hold may
-            // now belong to different nodes, or to none. Dropping the senders ends
-            // those loops; each reconnects against the restored database.
-            app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
-            invalidate_snapshot(&app);
             // The replacement session records where it was issued, like every
             // other, so the session list still answers for a restored hub.
             let ip = client_ip(
@@ -1350,7 +1386,7 @@ pub async fn db_restore(
                 &headers,
                 peer.ip(),
             );
-            let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers, ip)) {
+            let cookie = match issue_session(&app, &headers, ip) {
                 Ok(cookie) => cookie,
                 Err(e) => return fail(e),
             };

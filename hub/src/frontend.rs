@@ -96,6 +96,12 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) ->
     if is_asset(path) {
         return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
     }
+    if names_a_file(path) {
+        // A path with an extension names a file, not a client route: /robots.txt
+        // and /favicon.ico are not SPA destinations, and answering them with the
+        // app shell hands a 200 HTML page to anything that asked for a file.
+        return (StatusCode::NOT_FOUND, format!("no such file: /{path}")).into_response();
+    }
     match T::get("index.html") {
         Some(index) => asset("index.html", index.data.into_owned(), known),
         None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
@@ -109,10 +115,18 @@ fn disk(root: &Path, requested: &str, known: Option<&str>) -> Option<Response> {
     }
     // None rather than a 404: an external theme lacking the file defers to the
     // built-in one, which issues the refusal.
-    if is_asset(path) {
+    if is_asset(path) || names_a_file(path) {
         return None;
     }
     read_inside(root, "index.html").map(|data| asset("index.html", data, known))
+}
+
+/// Whether the path's last segment carries a file extension: `/random.txt`,
+/// `/robots.txt`, `/assets/x.css`. Routes never do -- `/node/3` and `/admin`
+/// are extensionless by design -- so this is the cheap line between "a file
+/// the dists did not carry" and "a client route to fall through to the app".
+fn names_a_file(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|last| last.contains('.'))
 }
 
 /// Serves one file with the caching policy its path warrants.
@@ -327,6 +341,14 @@ fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme>
     if let Some(expected) = expect.filter(|&expected| expected != theme.short) {
         bail!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
     }
+    // The manifest's `url` is rendered by the panel as a link, so a scheme
+    // other than http(s) is refused here rather than trusted to whatever the
+    // browser does with it. Empty is fine: the link is hidden without one.
+    if !theme.url.is_empty()
+        && !reqwest::Url::parse(&theme.url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+    {
+        bail!("theme.json 的 url 必须是 http(s) 地址或留空：{:?}", theme.url);
+    }
     // The one file `serve` requires. Without it every request falls through to
     // the built-in theme, indistinguishable from the upload having no effect.
     if !staging.join("dist").join("index.html").is_file() {
@@ -485,12 +507,15 @@ mod tests {
 
         // A theme the hub cannot serve, a name that cannot be a directory, and
         // a symlink -- the entry type that writes where the path check cannot
-        // look.
+        // look. The last: a manifest url that is not an http(s) address would
+        // be rendered by the panel as a link, so publish refuses it here.
         for bad in [
             pack(&[("theme.json", manifest)], None),
             pack(&[("theme.json", r#"{"name":"x","short":"../evil","description":"","version":"1","author":"a","url":""}"#.as_bytes()), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
+            pack(&[("theme.json", r#"{"name":"x","short":"evil","description":"","version":"1","author":"a","url":"javascript:alert(1)"}"#.as_bytes()), ("dist/index.html", b"x")], None),
+            pack(&[("theme.json", r#"{"name":"x","short":"evil","description":"","version":"1","author":"a","url":"data:text/html,x"}"#.as_bytes()), ("dist/index.html", b"x")], None),
         ] {
             assert!(install(&base, bad, None).is_err());
         }
