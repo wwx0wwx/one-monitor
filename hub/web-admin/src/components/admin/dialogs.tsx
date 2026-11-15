@@ -323,11 +323,21 @@ export function useRegisterWindow() {
   const [key, setKey] = useState("")
   const [until, setUntil] = useState(0)
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000))
+  // A failed read used to be swallowed, which rendered the "open a window"
+  // button as if none were open -- the operator could not tell a closed window
+  // from a broken fetch, and a retry meant guessing.
+  const [readFailed, setReadFailed] = useState(false)
 
-  useEffect(() => {
+  const read = () =>
     api<Settings>("/settings")
-      .then((s) => { setKey(String(s.register_key ?? "")); setUntil(Number(s.register_until ?? 0)) })
-      .catch(() => {})
+      .then((s) => {
+        setKey(String(s.register_key ?? ""))
+        setUntil(Number(s.register_until ?? 0))
+        setReadFailed(false)
+      })
+      .catch(() => setReadFailed(true))
+  useEffect(() => {
+    read()
     const timer = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000)
     return () => clearInterval(timer)
   }, [])
@@ -335,11 +345,14 @@ export function useRegisterWindow() {
   return {
     key,
     left: key === "" ? 0 : Math.max(0, until - now),
+    readFailed,
+    read,
     async open() {
       try {
         const w = await api<{ register_key: string; register_until: string }>("/register-window", { method: "POST" })
         setKey(w.register_key)
         setUntil(Number(w.register_until))
+        setReadFailed(false)
       } catch (e) {
         toast.error((e as Error).message)
       }
@@ -393,7 +406,18 @@ export function RegisterDialog({ site, reg, onClose }: {
               </div>
             </div>
           ) : (
-            <Button onClick={reg.open}>开启一小时窗口</Button>
+            <div className="space-y-3">
+              {/* Shown inside the dialog, not only as a toast: this state is
+                  why there is no command, and the toast is gone by the time
+                  the dialog is read again. */}
+              {reg.readFailed && (
+                <div className="flex items-center gap-3 text-sm text-destructive" role="alert">
+                  <span>读取失败，请重试</span>
+                  <Button size="xs" variant="outline" onClick={reg.read}>重试</Button>
+                </div>
+              )}
+              <Button onClick={reg.open}>开启一小时窗口</Button>
+            </div>
           )}
         </div>
         <DialogFooter>

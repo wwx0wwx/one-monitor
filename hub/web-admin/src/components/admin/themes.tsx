@@ -34,25 +34,41 @@ export function Themes() {
   const [doomed, setDoomed] = useState<Theme | null>(null)
   const [zoomed, setZoomed] = useState<Theme | null>(null)
   const picker = useRef<HTMLInputElement>(null)
-
-  const load = () =>
-    api<{ themes: Theme[] }>("/themes").then((data) => setThemes(data.themes)).catch(() => setThemes([]))
-  useEffect(() => { load() }, [])
-
   // 站点级的状态页背景：存在设置键里，所有访客看到同一张图。链接和开关在这里，
   // 透明度、模糊、铺满这些观感细节在状态页右上角的「主题设置」（需登录）。
   const [bg, setBg] = useState({ enabled: "off", desktop: "", mobile: "" })
-  useEffect(() => {
+  // One error per load, so a failed background read cannot be erased by the
+  // theme list's success and vice versa. Either failing used to be swallowed
+  // entirely -- the list one even answered `[]`, so a broken fetch read as
+  // "hub has no themes", a state that cannot happen (the default is built in).
+  const [themesErr, setThemesErr] = useState<string | null>(null)
+  const [bgErr, setBgErr] = useState<string | null>(null)
+
+  const loadBg = () =>
     api<Settings>("/settings")
-      .then((s) =>
+      .then((s) => {
         setBg({
           enabled: s.bg_enabled === "on" ? "on" : "off",
           desktop: String(s.bg_desktop ?? ""),
           mobile: String(s.bg_mobile ?? ""),
-        }),
-      )
-      .catch(() => {})
-  }, [])
+        })
+        setBgErr(null)
+      })
+      .catch((e: Error) => setBgErr(e.message || "网络错误"))
+
+  const loadThemes = () =>
+    api<{ themes: Theme[] }>("/themes")
+      .then((data) => {
+        setThemes(data.themes)
+        setThemesErr(null)
+      })
+      .catch((e: Error) => setThemesErr(e.message || "网络错误"))
+
+  const load = () => {
+    loadThemes()
+    loadBg()
+  }
+  useEffect(() => { load() }, [])
 
   async function saveBg(patch: Partial<typeof bg>) {
     setBg((old) => ({ ...old, ...patch }))
@@ -126,9 +142,32 @@ export function Themes() {
     }
   }
 
-  if (!themes) return null
+  // Loading and error come before anything else; the "no themes" empty state
+  // belongs to a successful empty answer alone, never to a failed fetch.
+  if (!themes) {
+    return themesErr ? (
+      <div className="space-y-3 text-center text-sm">
+        <p role="alert" className="text-destructive">加载失败：{themesErr}</p>
+        <Button size="sm" variant="outline" onClick={loadThemes}>
+          <RefreshCw /> 重试
+        </Button>
+      </div>
+    ) : (
+      <p className="text-sm text-muted-foreground">加载中…</p>
+    )
+  }
   return (
     <div className="space-y-4">
+      {/* The list is already up while the background-image settings failed:
+          one road broken, not the page. */}
+      {bgErr && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <span role="alert">背景图设置加载失败：{bgErr}</span>
+          <Button size="sm" variant="outline" onClick={loadBg}>
+            <RefreshCw /> 重试
+          </Button>
+        </div>
+      )}
       <Card className="gap-4 p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
@@ -269,6 +308,10 @@ export function Themes() {
             </p>
           </Card>
         ))}
+        {/* Only on a successful empty answer: a hub always has the built-in
+            default, so an empty list means the fetch failed, and saying
+            "没有主题" then would be the silent failure again. */}
+        {themes.length === 0 && <p className="text-sm text-muted-foreground">没有主题</p>}
       </div>
 
       {/* 原图，不是卡片上那张裁过的：宽度给到 4xl，高度让 80vh 兜住，

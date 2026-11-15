@@ -1,6 +1,6 @@
 // The latency monitors page.
 import { useEffect, useState } from "react"
-import { Pencil, Plus, Trash2 } from "lucide-react"
+import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -14,7 +14,10 @@ import { api, type Node, type PingTask } from "@/lib/api"
 import { ConfirmDialog, Field } from "./shared"
 
 export function Ping({ nodes }: { nodes: Node[] }) {
-  const [tasks, setTasks] = useState<PingTask[]>([])
+  // null until an answer arrives: an initial `[]` could not tell "no monitors
+  // yet" from "the fetch failed", and rendered the empty state for both.
+  const [tasks, setTasks] = useState<PingTask[] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [saving, setSaving] = useState(false)
@@ -23,7 +26,13 @@ export function Ping({ nodes }: { nodes: Node[] }) {
   // list made this dialog taller than the screen.
   const [pickerOpen, setPickerOpen] = useState(false)
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
+  const load = () =>
+    api<{ tasks: PingTask[] }>("/ping-tasks")
+      .then((d) => { setTasks(d.tasks); setErr(null) })
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setErr(e.message || "网络错误")
+      })
   useEffect(() => { load() }, [])
 
   async function save() {
@@ -84,7 +93,7 @@ export function Ping({ nodes }: { nodes: Node[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {tasks.map((t) => (
+            {tasks?.map((t) => (
               <TableRow key={t.id}>
                 <TableCell className="font-medium">{t.name}</TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
@@ -98,7 +107,26 @@ export function Ping({ nodes }: { nodes: Node[] }) {
                 </TableCell>
               </TableRow>
             ))}
-            {tasks.length === 0 && (
+            {tasks === null && !err && (
+              <TableRow>
+                <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
+                  加载中…
+                </TableCell>
+              </TableRow>
+            )}
+            {err && (
+              <TableRow>
+                <TableCell colSpan={5} className="py-10 text-center text-sm">
+                  <span role="alert" className="text-destructive">加载失败：{err}</span>
+                  <Button size="sm" variant="outline" className="ml-3" onClick={load}>
+                    <RefreshCw /> 重试
+                  </Button>
+                </TableCell>
+              </TableRow>
+            )}
+            {/* Only once an answer actually arrived: this is the "none yet"
+                state, which a failed fetch must not impersonate. */}
+            {tasks !== null && tasks.length === 0 && !err && (
               <TableRow>
                 <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
                   还没有延迟监控。每台服务器独立 TCP 连接目标端口并上报耗时。

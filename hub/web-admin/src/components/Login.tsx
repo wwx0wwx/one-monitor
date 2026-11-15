@@ -62,6 +62,9 @@ export function Login({ totp, onDone }: { totp: boolean; onDone: () => void }) {
           {totp && (
             <div className="space-y-1.5">
               <Label htmlFor="code" className="text-xs">两步验证码</Label>
+              {/* 后端对应急密码不校验验证码——那是应急入口的意义所在；前端
+                  此前按 6 位锁死了提交按钮，等于把应急入口整个堵上。 */}
+              <p className="text-xs text-muted-foreground">使用应急密码登录时无需填写验证码</p>
               <Input
                 id="code"
                 inputMode="numeric"
@@ -72,7 +75,7 @@ export function Login({ totp, onDone }: { totp: boolean; onDone: () => void }) {
               />
             </div>
           )}
-          <Button type="submit" className="w-full" disabled={busy || !password || (totp && code.length !== 6)}>
+          <Button type="submit" className="w-full" disabled={busy || !password}>
             登录
           </Button>
         </form>

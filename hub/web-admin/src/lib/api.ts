@@ -142,13 +142,70 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+/** One request may not hang forever. */
+const REQUEST_TIMEOUT_MS = 15_000
+
+/**
+ * fetch with a hard timeout and a forwarded caller signal. The timeout aborts
+ * with a reason rather than a bare `abort()`: fetch rejects with exactly that
+ * value, so every existing branch on `name === "AbortError"` keeps working while
+ * the message still says what happened. The caller's own signal is linked by
+ * hand -- an already-aborted one never fires its event again -- and both the
+ * timer and the listener are dropped in `finally` no matter how the request
+ * ends, or one abandoned call would hold a timer each until it fired.
+ */
+async function request(path: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(new DOMException("请求超时", "AbortError")), REQUEST_TIMEOUT_MS)
+  const caller = init.signal
+  const forward = () => controller.abort(caller?.reason)
+  if (caller) {
+    if (caller.aborted) controller.abort(caller.reason)
+    else caller.addEventListener("abort", forward)
+  }
+  try {
+    return await fetch(path, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timeout)
+    caller?.removeEventListener("abort", forward)
+  }
+}
+
+/**
+ * The request every panel call shares: the timeout above, one place for the
+ * empty-message fallback, and the session-expiry exit. A 401 on anything but
+ * the sign-in call itself means the session is gone -- revoked from another
+ * device, a password change, a restore -- so the browser is sent back to
+ * /admin, where /me answers `authed: false` and the sign-in page renders.
+ * `/nodes` is exempt alongside `/auth/login`: with the public page switched
+ * off it answers 401 to anyone not signed in, and the anonymous visitor
+ * standing on the login page would otherwise be reloaded in a loop forever;
+ * that call has its own expiry handling in useNodes.
+ */
+async function raw(path: string, init?: RequestInit): Promise<Response> {
+  const res = await request(`/api${path}`, {
     ...init,
     headers: init?.body ? { "content-type": "application/json", ...init?.headers } : init?.headers,
   })
-  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
+  if (!res.ok) {
+    if (res.status === 401 && !path.startsWith("/auth/login") && path !== "/nodes") location.assign("/admin")
+    // HTTP/2 and HTTP/3 dropped the reason phrase, and a bodiless answer from
+    // a proxy in front of the hub reads as "" -- without the status line as
+    // the last resort, the toast that catches this shows an empty string and
+    // reads as no error at all.
+    throw new ApiError(res.status, (await res.text()) || res.statusText || `HTTP ${res.status}`)
+  }
+  return res
+}
+
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await raw(path, init)
   return res.status === 204 ? (undefined as T) : res.json()
+}
+
+/** For the responses that are not JSON: same timeout, same 401 exit, a Response to read a blob from. */
+export async function download(path: string): Promise<Response> {
+  return raw(path)
 }
 
 /**
@@ -181,7 +238,7 @@ export async function upload<T>(
   // schedule, and a no-op sleep keeps the backoff from adding seconds to the
   // suite. No caller passes them.
   post: (offset: number) => Promise<Response> = (offset) =>
-    fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
+    request(`/api${path}?offset=${offset}&total=${file.size}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
@@ -216,11 +273,12 @@ export async function upload<T>(
           res.status,
           res.status === 413
             ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-            : (await res.text()) || res.statusText,
+            : (await res.text()) || res.statusText || `HTTP ${res.status}`,
         )
       } catch (e) {
-        // Abort is the operator's choice, not a fault to retry; the ApiError
-        // above must also leave through, not loop again.
+        // Abort is the operator's choice, not a fault to retry -- and the
+        // request timeout arrives here under the same name; the ApiError above
+        // must also leave through, not loop again.
         if (e instanceof ApiError || (e as Error).name === "AbortError") throw e
         // A thrown fetch is a network-level failure: the request may never have
         // arrived, which is precisely the transient kind.

@@ -18,11 +18,23 @@ export type Settings = Record<string, string | boolean>
 // Two pages write settings, and each loads only what it displays.
 export function useSettings() {
   const [s, setS] = useState<Settings | null>(null)
-  useEffect(() => { api<Settings>("/settings").then(setS).catch(() => {}) }, [])
+  // A failed load used to leave `s` null forever and the page silently blank;
+  // the error plus a retry keep the operator in the loop instead.
+  const [err, setErr] = useState<string | null>(null)
+  const [reload, setReload] = useState(0)
+  useEffect(() => {
+    api<Settings>("/settings")
+      .then((d) => { setS(d); setErr(null) })
+      .catch((e: Error) => setErr(e.message || "网络错误"))
+  }, [reload])
   return {
     s,
-    set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
-    save: async (patch: Record<string, string>) => {
+    err,
+    reload: () => setReload((n) => n + 1),
+    // The `*_set` flags come back as booleans while every other key is a
+    // string; `totp_set` is written with the raw value, so both kinds pass.
+    set: (k: string, v: string | boolean) => setS((old) => ({ ...(old ?? {}), [k]: v })),
+    save: async (patch: Record<string, string>): Promise<boolean> => {
       try {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
         toast.success("已保存")
@@ -36,8 +48,13 @@ export function useSettings() {
           for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
           return next
         })
+        return true
       } catch (e) {
         toast.error((e as Error).message)
+        // Not rethrown: the caller decides via the return value what to do
+        // (keep a typed password on screen), and the callers that ignore it
+        // stay compatible.
+        return false
       }
     },
   }
@@ -50,9 +67,23 @@ export const GEOIP_PROVIDERS: Record<string, string> = {
 }
 
 export function SettingsTab() {
-  const { s, set, save } = useSettings()
+  const { s, err, reload, set, save } = useSettings()
   const [updating, setUpdating] = useState(false)
-  if (!s) return null
+  // Not a silent null: a blank page says nothing. The loading line owns the
+  // wait, the error branch keeps the retry one click away instead of one
+  // reload away.
+  if (!s) {
+    return err ? (
+      <div className="space-y-3 text-center text-sm">
+        <p role="alert" className="text-destructive">加载设置失败：{err}</p>
+        <Button size="sm" variant="outline" onClick={reload}>
+          <RefreshCw /> 重试
+        </Button>
+      </div>
+    ) : (
+      <p className="text-sm text-muted-foreground">加载中…</p>
+    )
+  }
   const provider = String(s.geoip_provider ?? "ipinfo")
 
   async function updateGeoip() {

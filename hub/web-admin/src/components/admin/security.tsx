@@ -28,16 +28,30 @@ const sessionTime = new Intl.DateTimeFormat("zh-CN", {
 
 export function Sessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState("")
+  // Deleting a session is the one action here that reaches another device, so
+  // it confirms first, like deleting a server or a monitor elsewhere.
+  const [doomed, setDoomed] = useState<Session | null>(null)
 
-  const load = () => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message))
+  // The row area answers with one of three states -- loading, error with a
+  // retry, the rows -- instead of sitting silently on null.
+  const load = () =>
+    api<Session[]>("/sessions")
+      .then((d) => { setRows(d); setErr(null) })
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setErr(e.message || "网络错误")
+      })
   useEffect(() => { load() }, [])
 
-  async function remove(id: string) {
-    setBusy(id)
+  async function remove() {
+    if (!doomed) return
+    setBusy(doomed.id)
     try {
-      await api(`/sessions/${id}`, { method: "DELETE" })
+      await api(`/sessions/${doomed.id}`, { method: "DELETE" })
       toast.success("已删除会话")
+      setDoomed(null)
       load()
     } catch (e) {
       toast.error((e as Error).message)
@@ -46,36 +60,65 @@ export function Sessions() {
     }
   }
 
-  if (!rows) return null
   return (
-    <Card className="gap-4 p-5">
-      <div>
-        <h3 className="text-sm font-medium">登录会话</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          每次登录一条，14 天后过期。删除后该设备下一次请求就被登出。
-        </p>
-      </div>
-      <div className="divide-y">
-        {rows.map((s) => (
-          <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-            <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm">
-              <span className="tnum">{sessionTime.format(new Date(s.created_at * 1000))}</span>
-              {/* Where the sign-in came from; empty when no address survived the
-                  proxies in front of the hub. */}
-              <span className="tnum text-muted-foreground">{s.ip || "—"}</span>
-              {s.current && <Badge variant="secondary">当前设备</Badge>}
+    <>
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">登录会话</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            每次登录一条，14 天后过期。删除后该设备下一次请求就被登出。
+          </p>
+        </div>
+        {rows === null ? (
+          err ? (
+            <div className="flex flex-wrap items-center gap-3 text-sm">
+              <span role="alert" className="text-destructive">加载失败：{err}</span>
+              <Button size="sm" variant="outline" onClick={load}>重试</Button>
             </div>
-            {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
-                只会让已经渲染好的面板以为自己还登着。 */}
-            {!s.current && (
-              <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => remove(s.id)}>
-                <Trash2 />
-              </Button>
-            )}
+          ) : (
+            <p className="text-sm text-muted-foreground">加载中…</p>
+          )
+        ) : (
+          <div className="divide-y">
+            {rows.map((s) => (
+              <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
+                <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm">
+                  <span className="tnum">{sessionTime.format(new Date(s.created_at * 1000))}</span>
+                  {/* Where the sign-in came from; empty when no address survived the
+                      proxies in front of the hub. */}
+                  <span className="tnum text-muted-foreground">{s.ip || "—"}</span>
+                  {s.current && <Badge variant="secondary">当前设备</Badge>}
+                </div>
+                {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
+                    只会让已经渲染好的面板以为自己还登着。 */}
+                {!s.current && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    disabled={!!busy}
+                    title="删除此登录会话"
+                    aria-label="删除此登录会话"
+                    onClick={() => setDoomed(s)}
+                  >
+                    <Trash2 />
+                  </Button>
+                )}
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-    </Card>
+        )}
+      </Card>
+      {doomed && (
+        <ConfirmDialog
+          title="删除此登录会话？"
+          description={`该设备（${doomed.ip || "来源未知"}，${sessionTime.format(new Date(doomed.created_at * 1000))} 登录）下一次请求就会被登出。`}
+          confirmLabel="删除会话"
+          busy={!!busy}
+          onClose={() => setDoomed(null)}
+          onConfirm={remove}
+        />
+      )}
+    </>
   )
 }
 
@@ -90,6 +133,9 @@ export function Security({ siteName }: { siteName: string }) {
   const [code, setCode] = useState("")
   const [busy, setBusy] = useState(false)
   const [confirmOff, setConfirmOff] = useState(false)
+  // Clearing the recovery password ends the one sign-in route that skips the
+  // code; that earns a confirm, like turning TOTP off above does.
+  const [confirmClear, setConfirmClear] = useState(false)
   // The QR of the otpauth:// URI, rendered locally: no third-party image
   // service learns the secret, and dark mode needs the white pad anyway.
   const [qr, setQr] = useState("")
@@ -129,9 +175,10 @@ export function Security({ siteName }: { siteName: string }) {
       toast.success("两步验证已开启")
       setBinding(null)
       // The flag drives the sign-in page's code field; re-read rather than
-      // guess, same as every credential flag here.
+      // guess, same as every credential flag here. Stored as the boolean the
+      // hub sends -- the comparisons below and the nodes banner rely on it.
       const fresh = await api<Settings>("/settings")
-      set("totp_set", String(fresh.totp_set))
+      set("totp_set", fresh.totp_set)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -144,13 +191,22 @@ export function Security({ siteName }: { siteName: string }) {
     try {
       await api("/auth/totp", { method: "DELETE" })
       toast.success("两步验证已关闭")
-      set("totp_set", "false")
+      set("totp_set", false)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       setBusy(false)
       setConfirmOff(false)
     }
+  }
+
+  async function clearRecovery() {
+    setBusy(true)
+    // save() reports rather than throws; the dialog stays open on failure so
+    // the retry is the button again, not a re-read of the card above.
+    const ok = await save({ emergency_password: "" })
+    setBusy(false)
+    if (ok) setConfirmClear(false)
   }
 
   const totpOn = s.totp_set === true
@@ -202,7 +258,7 @@ export function Security({ siteName }: { siteName: string }) {
                 <code className="min-w-0 flex-1 truncate rounded-md border bg-muted/40 px-3 py-2 font-mono text-xs select-all">
                   {binding.secret}
                 </code>
-                <Button size="sm" variant="outline" onClick={() => copy(binding.secret)}>
+                <Button size="sm" variant="outline" aria-label="复制密钥" onClick={() => copy(binding.secret)}>
                   <Copy className="size-4" />
                 </Button>
               </div>
@@ -252,7 +308,14 @@ export function Security({ siteName }: { siteName: string }) {
           <Button
             size="sm"
             disabled={password.length < 12}
-            onClick={() => save({ admin_password: password }).then(() => setPassword(""))}
+            onClick={() =>
+              // Cleared only on success: a failed save used to wipe the field,
+              // and retyping a 12-character password to retry is its own
+              // punishment.
+              save({ admin_password: password }).then((ok) => {
+                if (ok) setPassword("")
+              })
+            }
           >
             修改密码
           </Button>
@@ -273,7 +336,15 @@ export function Security({ siteName }: { siteName: string }) {
           <Button
             size="sm"
             disabled={recovery.length > 0 && recovery.length < 12}
-            onClick={() => save({ emergency_password: recovery }).then(() => setRecovery(""))}
+            onClick={() => {
+              // Clearing (empty field while one is set) is the destructive
+              // shape and confirms first; saving a new value is a plain edit.
+              if (!recovery && s.emergency_password_set) setConfirmClear(true)
+              else
+                save({ emergency_password: recovery }).then((ok) => {
+                  if (ok) setRecovery("")
+                })
+            }}
           >
             {recovery ? "保存应急密码" : s.emergency_password_set ? "清除应急密码" : "保存应急密码"}
           </Button>
@@ -288,6 +359,16 @@ export function Security({ siteName }: { siteName: string }) {
           busy={busy}
           onClose={() => setConfirmOff(false)}
           onConfirm={disableTotp}
+        />
+      )}
+      {confirmClear && (
+        <ConfirmDialog
+          title="清除应急密码？"
+          description="应急密码是丢失验证器时唯一免验证码的登录入口，清除后只剩常规密码与验证器。"
+          confirmLabel="清除应急密码"
+          busy={busy}
+          onClose={() => setConfirmClear(false)}
+          onConfirm={clearRecovery}
         />
       )}
     </div>

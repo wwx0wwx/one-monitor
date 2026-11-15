@@ -1,12 +1,12 @@
 // The database page: backup, restore, vacuum, retention.
 import { useEffect, useRef, useState } from "react"
-import { Download, Upload } from "lucide-react"
+import { Download, RefreshCw, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { api, upload } from "@/lib/api"
+import { api, download, upload } from "@/lib/api"
 import { bytes } from "@/lib/format"
 
 import { ConfirmDialog, Field } from "./shared"
@@ -33,19 +33,59 @@ export const DB_ROWS: [string, string][] = [
 
 export function Data() {
   const [info, setInfo] = useState<DbInfo | null>(null)
+  const [err, setErr] = useState<string | null>(null)
   const { s, set, save } = useSettings()
   const [busy, setBusy] = useState("")
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
+  // The whole file has reached the hub and it is swapping the database: from
+  // here on there is no "cancel", only waiting for the reload.
+  const [restoring, setRestoring] = useState(false)
   // Closing the dialog must stop the upload rather than merely hide it: restore
   // is the one irreversible action here, and it takes minutes on a large
   // backup.
   const abort = useRef<AbortController | null>(null)
   const picker = useRef<HTMLInputElement>(null)
 
-  const load = () => api<DbInfo>("/db").then(setInfo).catch((e: Error) => toast.error(e.message))
+  const load = () =>
+    api<DbInfo>("/db")
+      .then((d) => { setInfo(d); setErr(null) })
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setErr(e.message || "网络错误")
+      })
   useEffect(() => { load() }, [])
+  // Leaving the section mid-upload must abort it: without this the chunks keep
+  // flying after the dialog they belonged to is gone, and the last one would
+  // still trigger the restore the operator walked away from.
+  useEffect(() => () => abort.current?.abort(), [])
+
+  // Not the browser's own download (<a href>) any more: that link sat outside
+  // every fetch here, with no timeout and no 401 handling -- a proxy that hangs
+  // the request left a button that silently did nothing. Same route as api(),
+  // then a blob and a synthetic click.
+  async function backup() {
+    setBusy("backup")
+    try {
+      const res = await download("/db/backup")
+      const url = URL.createObjectURL(await res.blob())
+      const a = document.createElement("a")
+      a.href = url
+      // A blob download never sees the response's Content-Disposition, so the
+      // file is named here, after the day it was taken.
+      a.download = `monitor-${new Date().toISOString().slice(0, 10)}.db`
+      a.click()
+      // Revoked a beat later, not on the next line: the download has only
+      // STARTED at click, and a browser that has not taken its snapshot of the
+      // blob yet would abort on an already-dead URL.
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
 
   async function vacuum() {
     setBusy("vacuum")
@@ -64,9 +104,14 @@ export function Data() {
   async function restore(file: File) {
     setBusy("restore")
     setSent(0)
+    setRestoring(false)
     abort.current = new AbortController()
     try {
       await upload("/db/restore", file, setSent, abort.current.signal)
+      // Every chunk has landed; the hub is replacing the database right now.
+      // Cancelling stops meaning anything from this point, so the dialog says
+      // so instead of offering a button that lies.
+      setRestoring(true)
       toast.success("已恢复，正在重新加载")
       // Every node, setting and session on the page came from the database just
       // replaced.
@@ -82,7 +127,20 @@ export function Data() {
     setPending(null)
   }
 
-  if (!info) return null
+  // The page's own three states: loading, error with a retry, the data. A
+  // silent null used to read as an empty database page.
+  if (!info) {
+    return err ? (
+      <div className="space-y-3 text-center text-sm">
+        <p role="alert" className="text-destructive">加载失败：{err}</p>
+        <Button size="sm" variant="outline" onClick={load}>
+          <RefreshCw /> 重试
+        </Button>
+      </div>
+    ) : (
+      <p className="text-sm text-muted-foreground">加载中…</p>
+    )
+  }
   const stat = (label: string, value: string) => (
     <div key={label}>
       <div className="text-xs text-muted-foreground">{label}</div>
@@ -178,12 +236,8 @@ export function Data() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          {/* The browser's own download: the file is streamed straight from
-              the response, never held in the page. */}
-          <Button size="sm" asChild>
-            <a href="/api/db/backup" download>
-              <Download /> 导出备份
-            </a>
+          <Button size="sm" disabled={busy === "backup"} onClick={backup}>
+            <Download /> {busy === "backup" ? "导出中…" : "导出备份"}
           </Button>
           <Button size="sm" variant="secondary" disabled={!!busy} onClick={() => picker.current?.click()}>
             <Upload /> 导入备份
@@ -216,8 +270,16 @@ export function Data() {
           title="用备份覆盖当前数据？"
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
+          // While the file is still going up, cancelling stays possible the
+          // dialog's own way (Esc / clicking outside, which runs onClose);
+          // once every chunk has landed the cancel button says so and stops.
+          cancelLabel={restoring ? "正在恢复，不可取消" : "取消"}
           busy={!!busy}
-          onClose={() => { abort.current?.abort(); setPending(null) }}
+          onClose={() => {
+            if (restoring) return
+            abort.current?.abort()
+            setPending(null)
+          }}
           onConfirm={() => restore(pending)}
         />
       )}

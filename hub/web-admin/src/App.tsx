@@ -42,12 +42,24 @@ function usePath() {
 
 function useTheme() {
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("theme")
-    return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
+    // localStorage throws in privacy modes and with storage disabled; the
+    // saved choice is a convenience, the system answer is the fallback, and a
+    // thrown boot takes the whole panel down.
+    try {
+      const saved = localStorage.getItem("theme")
+      return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
+    } catch {
+      return matchMedia("(prefers-color-scheme: dark)").matches
+    }
   })
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
+    try {
+      localStorage.setItem("theme", dark ? "dark" : "light")
+    } catch {
+      // Unwritable only means the choice lives for this visit; the theme
+      // itself is applied above either way.
+    }
   }, [dark])
   return [dark, () => setDark((d) => !d)] as const
 }
@@ -125,10 +137,10 @@ export default function App() {
               <ExternalLink /> 状态面板
             </a>
           </Button>
-          <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
+          <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题" aria-label="切换主题">
             {dark ? <Sun /> : <Moon />}
           </Button>
-          <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
+          <Button variant="ghost" size="icon" onClick={signOut} title="退出登录" aria-label="退出登录">
             <LogOut />
           </Button>
         </div>

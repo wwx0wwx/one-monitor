@@ -1,6 +1,6 @@
 // The server list: drag and keyboard ordering, the row actions.
 import { useRef, useState } from "react"
-import { CalendarClock, Download, GripVertical, Pencil, Plus, Server, Trash2, X } from "lucide-react"
+import { CalendarClock, ChevronDown, ChevronUp, Download, GripVertical, Pencil, Plus, Server, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -35,19 +35,47 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
   // page it sends the operator to.
   const { s: settings } = useSettings()
   // Dismissed, not "done": the banner must survive reloads until it is either
-  // acted on or explicitly closed, but not nag across devices.
-  const [bannerOff, setBannerOff] = useState(() => localStorage.getItem("security-banner-dismissed") === "1")
+  // acted on or explicitly closed, but not nag across devices. The storage
+  // calls can throw (privacy modes, storage disabled); degrading to "not
+  // dismissed" costs one extra banner, a thrown boot costs the whole panel.
+  const [bannerOff, setBannerOff] = useState(() => {
+    try {
+      return localStorage.getItem("security-banner-dismissed") === "1"
+    } catch {
+      return false
+    }
+  })
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
-  const [manualOrder, setManualOrder] = useState<number[]>([])
+  // The reorder preview: `ids` is the order this session wants, `appliesTo`
+  // the stream orders it is still valid against. It is a preview and nothing
+  // more -- it never outlives its session, which is why the validity is
+  // derived here rather than the ids cleared at some picked moment:
+  const [manualOrder, setManualOrder] = useState<{ ids: number[]; appliesTo: string[] } | null>(null)
   const [query, setQuery] = useState("")
   const [group, setGroup] = useState("")
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const byId = new Map(nodes.map((node) => [node.id, node]))
-  const orderedIds = new Set(manualOrder)
+  const streamIds = nodes.map((n) => n.id).join()
+  // The preview applies while the stream still shows an order this session has
+  // already displaced (the stream as it stood when the drag or the first
+  // keyboard move began, and every saved-but-not-yet-echoed order in a chain
+  // of moves -- the echo of move one must not wipe the preview of move two),
+  // or the preview itself, which is the echo arriving (the two display the
+  // same rows, so retiring then is invisible). Any other stream order -- a
+  // node added or removed, another tab's reorder -- outranks it. That is what
+  // keeps the list following the stream without a reload, where keeping the
+  // ids forever would freeze the panel at its last drag; and clearing them
+  // "right after the save" instead would snap the rows back to the pre-save
+  // order for the frames the echo has not filled yet.
+  const preview =
+    manualOrder && (manualOrder.appliesTo.includes(streamIds) || manualOrder.ids.join() === streamIds)
+      ? manualOrder.ids
+      : []
+  const orderedIds = new Set(preview)
   const order = [
-    ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
+    ...preview.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
     ...nodes.filter((node) => !orderedIds.has(node.id)),
   ]
   // Groups exist only as they are used; the filter offers what the fleet has.
@@ -81,15 +109,25 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
   function move(from: number, to: number) {
     const ids = moveIds(order.map((node) => node.id), from, to)
     if (!ids) return
-    animate(() => setManualOrder(ids))
+    animate(() =>
+      setManualOrder((old) => ({
+        ids,
+        // A move built on a previous one inherits its ancestry: the chain of
+        // orders this session has already displaced, plus the stream as it
+        // stood before the first move.
+        appliesTo: old ? [old.ids.join(), ...old.appliesTo] : [streamIds],
+      })),
+    )
     return ids
   }
 
-  // Dropped outside the table or cancelled with Escape: the order is restored.
+  // Dropped outside the table or cancelled with Escape: the order is restored
+  // to what was on screen when the drag began -- the stream's own order, or a
+  // keyboard move's preview still waiting for its echo.
   function cancel() {
     setDragging(null)
     const rollback = orderBeforeDrag.current
-    if (rollback.length) animate(() => setManualOrder(rollback))
+    animate(() => setManualOrder(rollback.length ? { ids: rollback, appliesTo: [streamIds] } : null))
   }
 
   function save(ids: number[]) {
@@ -98,9 +136,26 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
     if (!rollback.length || ids.join() === rollback.join()) return
     orderBeforeDrag.current = ids
     api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
-      setManualOrder(rollback)
+      // The stream still holds the pre-save order (the save failed), so the
+      // rollback previews against exactly that.
+      animate(() => setManualOrder({ ids: rollback, appliesTo: [streamIds] }))
       toast.error(e.message)
     })
+  }
+
+  // Both reorder grips -- the arrow keys on the drag handle and the up/down
+  // buttons touch screens get, since a finger has no hover to drag by --
+  // travel the same path: the neighbouring row the operator can SEE, not the
+  // full list's neighbour. Under a group filter that neighbour may be a hidden
+  // row of another group, and swapping with it changes nothing on the screen:
+  // a dead key, until it is pressed enough times to cross every hidden row.
+  // Both ends land in `order`.
+  function shift(node: Node, delta: -1 | 1) {
+    const step = visibleNeighbour(order, visible, node.id, delta)
+    if (!step) return
+    orderBeforeDrag.current = order.map((n) => n.id)
+    const ids = move(step.from, step.to)
+    if (ids) save(ids)
   }
 
   return (
@@ -120,7 +175,12 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
               title="关闭提醒"
               aria-label="关闭两步验证提醒"
               onClick={() => {
-                localStorage.setItem("security-banner-dismissed", "1")
+                try {
+                  localStorage.setItem("security-banner-dismissed", "1")
+                } catch {
+                  // Unwritable storage only means the dismissal is not
+                  // remembered past this visit; the page state moves on.
+                }
                 setBannerOff(true)
               }}
             >
@@ -228,17 +288,7 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
                         const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
                         if (!delta) return
                         e.preventDefault()
-                        // The neighbouring row the operator can see, not the
-                        // full list's neighbour: under a group filter that
-                        // neighbour can be a hidden row of another group, and
-                        // swapping with it changes nothing on the screen --
-                        // a dead key, until it is pressed enough times to
-                        // cross every hidden row. Both ends land in `order`.
-                        const step = visibleNeighbour(order, visible, n.id, delta)
-                        if (!step) return
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        const ids = move(step.from, step.to)
-                        if (ids) save(ids)
+                        shift(n, delta)
                       }}
                     >
                       <GripVertical className="size-4" />
@@ -281,6 +331,30 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
+                  {/* Reordering without a drag: touch screens have no reliable
+                      one (long-press fights the system gestures) and the
+                      keyboard arrows need the focus on the grip first. Same
+                      move+save path, disabled at the visible ends. */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="上移"
+                    aria-label={`上移 ${n.name}`}
+                    disabled={!visibleNeighbour(order, visible, n.id, -1)}
+                    onClick={() => shift(n, -1)}
+                  >
+                    <ChevronUp />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    title="下移"
+                    aria-label={`下移 ${n.name}`}
+                    disabled={!visibleNeighbour(order, visible, n.id, 1)}
+                    onClick={() => shift(n, 1)}
+                  >
+                    <ChevronDown />
+                  </Button>
                   <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>

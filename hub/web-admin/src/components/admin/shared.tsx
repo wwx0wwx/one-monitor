@@ -1,12 +1,14 @@
 // Pieces every section of the panel reaches for: field layout, the
 // confirm dialog, small utilities. Split out of the one-file Admin.tsx
 // this panel used to be; a pure move, no behaviour change.
+import { cloneElement, isValidElement, useId } from "react"
 import { flushSync } from "react-dom"
 import { Copy } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { addresses, type Node } from "@/lib/api"
 
@@ -32,10 +34,29 @@ export function animate(update: () => void) {
 }
 
 export function copy(text: string) {
-  navigator.clipboard.writeText(text).then(
-    () => toast.success("已复制"),
-    () => toast.error("复制失败"),
-  )
+  // The hub officially supports plain http://IP:端口 as its entry, and the
+  // clipboard API only exists in secure contexts -- half the deployments this
+  // panel serves would get a dead "点击复制" without the fallback below.
+  if (window.isSecureContext && navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(
+      () => toast.success("已复制"),
+      () => toast.error("复制失败"),
+    )
+    return
+  }
+  // The pre-clipboard way: a textarea parked off-screen (display:none cannot be
+  // selected, and an unselectable copy is an empty one), selected, then
+  // execCommand. Deprecated but universally present, and the only route left.
+  const area = document.createElement("textarea")
+  area.value = text
+  area.style.position = "fixed"
+  area.style.left = "-9999px"
+  document.body.appendChild(area)
+  area.select()
+  const ok = document.execCommand("copy")
+  area.remove()
+  if (ok) toast.success("已复制")
+  else toast.error("复制失败")
 }
 
 // Every address a node has, each click-to-copy: pasting one into an ssh command
@@ -62,20 +83,42 @@ export function Addresses({ node }: { node: Node }) {
 }
 
 export function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+  // Clicking the label should focus the control, which needs the label's
+  // htmlFor to name the control's id. Callers hand-write the children, so the
+  // id is generated here and injected into the first child with cloneElement
+  // -- but only when that child IS the control: the shadcn Input (it spreads
+  // props onto the native input) or a native input/select/textarea. A wrapping
+  // div (an input with a button beside it) or a composite like Select takes no
+  // id this way; injecting one would point the label at a container and
+  // achieve nothing, so those stay exactly as they were.
+  const id = useId()
+  const [first, ...rest] = Array.isArray(children) ? children : [children]
+  const isControl =
+    isValidElement(first) &&
+    (first.type === Input || (typeof first.type === "string" && ["input", "select", "textarea"].includes(first.type)))
   return (
     <div className={`space-y-2 ${className}`}>
-      <Label className="text-sm font-medium">{label}</Label>
-      {children}
+      <Label htmlFor={isControl ? id : undefined} className="text-sm font-medium">{label}</Label>
+      {isControl ? (
+        <>
+          {cloneElement(first as React.ReactElement<{ id?: string }>, { id })}
+          {rest}
+        </>
+      ) : (
+        children
+      )}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   )
 }
 
 
-export function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
+export function ConfirmDialog({ title, description, confirmLabel, cancelLabel = "取消", busy = false, onClose, onConfirm }: {
   title: string
   description: string
   confirmLabel: string
+  /** The cancel button's own text, for the one dialog whose cancel means something while busy (a restore in progress). */
+  cancelLabel?: string
   busy?: boolean
   onClose: () => void
   onConfirm: () => void
@@ -88,7 +131,10 @@ export function ConfirmDialog({ title, description, confirmLabel, busy = false, 
           <DialogDescription className="leading-relaxed">{description}</DialogDescription>
         </DialogHeader>
         <DialogFooter className="border-t pt-4">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
+          {/* Busy disables cancelling too: the confirmed action is under way and
+              usually cannot be stopped (vacuum, a restore that has begun), and
+              a cancel that only looks like it worked is worse than none. */}
+          <Button variant="ghost" onClick={onClose} disabled={busy}>{cancelLabel}</Button>
           <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>
