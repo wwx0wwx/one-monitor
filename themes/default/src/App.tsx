@@ -41,12 +41,25 @@ function useNodeRoute() {
 
 function useTheme() {
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("theme")
+    // localStorage throws when the browser locks it down (privacy mode, quota,
+    // disabled cookies): the saved choice degrades to null and the system
+    // preference answers instead, rather than the page failing to load.
+    let saved: string | null = null
+    try {
+      saved = localStorage.getItem("theme")
+    } catch {
+      saved = null
+    }
     return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
   })
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
+    // The preference simply goes unremembered this visit; the toggle keeps working.
+    try {
+      localStorage.setItem("theme", dark ? "dark" : "light")
+    } catch {
+      /* the class was already applied above */
+    }
   }, [dark])
   return [dark, () => setDark((d) => !d)] as const
 }
@@ -57,6 +70,15 @@ export default function App() {
   const [meError, setMeError] = useState("")
   const { nodes, error, closed } = useNodes()
   const [open, go] = useNodeRoute()
+
+  // Esc leaves a detail page for the list, the same trip the back button and the
+  // site name offer a pointer. Bound only while one is open, and removed with it.
+  useEffect(() => {
+    if (open === null) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") go(null) }
+    addEventListener("keydown", onKey)
+    return () => removeEventListener("keydown", onKey)
+  }, [open, go])
 
   const loadMe = useCallback(() => {
     // `|| "..."` because an empty message reads as no error: api() falls back to
@@ -134,8 +156,8 @@ export default function App() {
     <div className="min-h-svh">
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto max-w-[1400px] px-4 py-3 sm:px-6">
-          {/* The site name is the way back to the list, so a node page needs
-              no back button of its own. */}
+          {/* The site name is one way back to the list; the node page also
+              carries its own back button. */}
           <div className="flex items-center gap-3">
             <button className="font-semibold transition-opacity hover:opacity-70" onClick={() => go(null)}>
               {me.site_name || "Monitor"}
@@ -151,7 +173,7 @@ export default function App() {
                 <Wrench /> {me.authed ? "进入后台" : "登录"}
               </a>
             </Button>
-            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
+            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题" aria-label="切换深浅色">
               {dark ? <Sun /> : <Moon />}
             </Button>
           </div>
@@ -166,7 +188,7 @@ export default function App() {
             <Skeleton className="h-96" />
           ) : selected ? (
             <Suspense fallback={<Skeleton className="h-96" />}>
-              <NodeDetail node={selected} />
+              <NodeDetail node={selected} onBack={() => go(null)} />
             </Suspense>
           ) : (
             <p className="py-16 text-center text-sm text-muted-foreground">

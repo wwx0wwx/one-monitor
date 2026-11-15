@@ -68,12 +68,18 @@ export function Country({ node }: { node: Node }) {
  * split on semicolons exactly as they were entered. Shared by the card and the
  * detail page, which own their spacing through `className`. */
 export function Tags({ node, className = "mt-2" }: { node: Node; className?: string }) {
-  const tags = node.tag?.split(";").map((t) => t.trim()).filter(Boolean) ?? []
+  // Deduped: an operator entering the same badge twice would otherwise render
+  // two chips and two identical keys.
+  const tags = [...new Set(node.tag?.split(";").map((t) => t.trim()).filter(Boolean) ?? [])]
   if (!tags.length) return null
   return (
     <div className={`${className} flex flex-wrap gap-1`}>
       {tags.map((tag) => (
-        <Badge key={tag} variant="secondary" className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground">
+        <Badge
+          key={tag}
+          variant="secondary"
+          className="max-w-40 min-w-0 truncate px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
+        >
           {tag}
         </Badge>
       ))}

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react"
+import { ArrowLeft } from "lucide-react"
 import { median } from "d3-array"
 import {
   Area, AreaChart, Brush, CartesianGrid, ComposedChart, Line, LineChart, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from "recharts"
 
+import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Country, Status, Tags } from "@/components/NodeCard"
 import { api, type Node } from "@/lib/api"
@@ -95,13 +97,24 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
   )
 }
 
-function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: string }) {
+// ARIA roles pass through so the same chip can be a tab (资源/网络延迟) or a
+// plain picker (the range row), which is a radio group in spirit.
+function Tab({
+  active,
+  onClick,
+  children,
+  ...props
+}: { active: boolean; onClick: () => void; children: string } & Omit<
+  React.ComponentProps<"button">,
+  "onClick" | "children"
+>) {
   return (
     <button
       onClick={onClick}
       className={`rounded-md px-2.5 py-1 text-xs transition-colors ${
         active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
       }`}
+      {...props}
     >
       {children}
     </button>
@@ -146,7 +159,7 @@ function Fact({ label, value }: { label: string; value?: string | number | null 
   )
 }
 
-export function NodeDetail({ node }: { node: Node }) {
+export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void }) {
   const [tab, setTab] = useState<(typeof TABS)[number]["key"]>("resources")
   // Each tab keeps its own range: a 7-day trend and a 1-hour trace answer
   // different questions.
@@ -306,6 +319,12 @@ export function NodeDetail({ node }: { node: Node }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
+        {/* Ghost on foreground, the page's own black-on-white either way: a
+            keyboard reader needs the same way out the site name offers a
+            pointer. */}
+        <Button variant="ghost" size="icon-sm" onClick={onBack} aria-label="返回" title="返回" className="shrink-0">
+          <ArrowLeft />
+        </Button>
         <h2 className="truncate text-lg font-medium">{node.name}</h2>
         <Country node={node} />
         <Status node={node} />
@@ -346,13 +365,19 @@ export function NodeDetail({ node }: { node: Node }) {
       </dl>
 
       {node.remark && (
-        <p className="rounded-md bg-muted px-3 py-2 text-sm whitespace-pre-wrap">{node.remark}</p>
+        <p className="break-all rounded-md bg-muted px-3 py-2 text-sm whitespace-pre-wrap">{node.remark}</p>
       )}
 
       <div className="space-y-2 border-t pt-4">
-        <div className="flex gap-1">
+        <div className="flex gap-1" role="tablist">
           {TABS.map((t) => (
-            <Tab key={t.key} active={tab === t.key} onClick={() => setTab(t.key)}>
+            <Tab
+              key={t.key}
+              role="tab"
+              aria-selected={tab === t.key}
+              active={tab === t.key}
+              onClick={() => setTab(t.key)}
+            >
               {t.label}
             </Tab>
           ))}
