@@ -22,7 +22,19 @@ export function Meter({ label, pct, foot, empty = "—" }: Props) {
   // unknown for a node with no metrics, ∞ for a plan with no limit.
   const filled = pct === null ? 0 : Math.min(100, Math.max(0, pct))
   return (
-    <div className="min-w-0">
+    // role="meter": the colour of the bar carries the state visually, and the
+    // percentage beside it is plain text; the role plus these values let a
+    // screen reader announce 「内存 42%」 as a measurement rather than loose
+    // numbers. No valuenow when there is no ceiling -- ∞ and unknown are not
+    // points on the 0-100 scale the bar draws.
+    <div
+      role="meter"
+      aria-label={typeof label === "string" ? label : undefined}
+      aria-valuenow={pct === null ? undefined : filled}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      className="min-w-0"
+    >
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-xs text-muted-foreground">{label}</span>
         <span className="tnum text-xs font-medium">

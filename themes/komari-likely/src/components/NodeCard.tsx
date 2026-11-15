@@ -78,12 +78,17 @@ export function Uptime({ node, emph }: { node: Node; emph?: boolean }) {
  * badge is ever cut; the detail page wraps without reservation, because there
  * all of them belong. */
 export function Tags({ node, className = "mt-2", reserve }: { node: Node; className?: string; reserve?: boolean }) {
-  const tags = node.tag?.split(";").map((t) => t.trim()).filter(Boolean) ?? []
+  // Deduped: the operator can save the same tag twice, and identical tags
+  // mean identical keys -- React warns and keeps only the first of each pair.
+  const tags = [...new Set(node.tag?.split(";").map((t) => t.trim()).filter(Boolean) ?? [])]
   if (!tags.length && !reserve) return null
   return (
     <div className={`${className} flex flex-wrap gap-1 ${reserve ? "min-h-[38px] content-center" : ""}`}>
+      {/* max-w-40 + truncate on each badge: an unbroken tag (a long model
+          number, a URL) must clip with an ellipsis, not push its card past the
+          column the grid gave it. */}
       {tags.map((tag) => (
-        <Badge key={tag} variant="secondary" className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground">
+        <Badge key={tag} variant="secondary" className="max-w-40 min-w-0 truncate px-1.5 py-0 text-[10px] font-normal text-muted-foreground">
           {tag}
         </Badge>
       ))}
@@ -104,7 +109,9 @@ function trafficFoot(node: Node) {
 function Expiry({ node }: { node: Node }) {
   const days = daysUntil(node.expires_at)
   if (days === null) return <span className="tnum text-xs text-muted-foreground" title="永不到期">{FOREVER}</span>
-  const tone = days < 0 ? "text-red-600" : days <= 7 ? "text-orange-500" : "text-muted-foreground"
+  // 12px small text needs >= 4.5:1: the -500/-600 oranges and reds fall short
+  // of it on both the light card and the dark one; -700 does not.
+  const tone = days < 0 ? "text-red-700" : days <= 7 ? "text-orange-700" : "text-muted-foreground"
   return (
     <span className={cn("tnum text-xs", tone)}>
       {days < 0 ? `已过期 ${-days} 天` : `${days} 天后到期`}

@@ -25,7 +25,15 @@ function readCache(): Table | undefined {
     const raw = localStorage.getItem("fx")
     if (!raw) return undefined
     const saved = JSON.parse(raw) as Table
-    return Date.now() - saved.fetchedAt < KEEP ? saved : undefined
+    // Shape check before use: the "fx" key is shared namespace, and whatever
+    // parses is not necessarily the table this version wrote -- a table
+    // without its usd rows, a fetchedAt that is a string. Comparing against a
+    // non-number or reading a missing row would surface as NaN rates, so
+    // anything not shaped like a table counts as no cache and reloads.
+    const shaped = saved && typeof saved === "object"
+      && saved.usd && typeof saved.usd === "object"
+      && Number.isFinite(saved.usd.cny) && Number.isFinite(saved.fetchedAt)
+    return shaped && Date.now() - saved.fetchedAt < KEEP ? saved : undefined
   } catch {
     return undefined
   }
@@ -94,7 +102,10 @@ export function useCnyTable(): Table | null | undefined {
  *  not list the currency. */
 export function cnyPer(code: string, table: NonNullable<Table>): number | null {
   if (code === "CNY") return 1
-  const perUsd = table.usd[code.toLowerCase()]
+  // Optional chaining: the row may be absent -- a caller-built table, or a
+  // cache written by something else entirely -- and "not listed" is the
+  // honest answer for that, not a crash.
+  const perUsd = table.usd?.[code.toLowerCase()]
   return perUsd && table.usd.cny ? table.usd.cny / perUsd : null
 }
 

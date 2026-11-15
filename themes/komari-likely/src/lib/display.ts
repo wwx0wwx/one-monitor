@@ -44,10 +44,15 @@ const flag = (raw: Record<string, string> | undefined, key: string, fallback: bo
 
 /** A raw string as a number, defaulting only on absence or nonsense -- `||`
  *  would be wrong here because 0 is a setting the operator can deliberately
- *  choose, and falsy 0 would fall to the default instead of standing. */
+ *  choose, and falsy 0 would fall to the default instead of standing.
+ *  An empty string is absence too: the hub sends unset keys as "", and
+ *  `Number("")` is 0, which would quietly turn 「not filled in」 into a
+ *  deliberate 0. */
 const num = (raw: Record<string, string> | undefined, key: string, fallback: number) => {
-  const v = Number(raw?.[key])
-  return Number.isFinite(v) ? v : fallback
+  const v = raw?.[key]
+  if (v === undefined || v.trim() === "") return fallback
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
 }
 
 export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings {

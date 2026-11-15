@@ -100,10 +100,17 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
   )
 }
 
-function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: string }) {
+// `tab` marks the two view tabs (资源 / 网络延迟) rather than the range and
+// toggle chips that borrow the same look: only they are tabs of a tablist, so
+// only they take the tab role and its selected state.
+function Tab({ active, onClick, children, tab }: {
+  active: boolean; onClick: () => void; children: string; tab?: boolean
+}) {
   return (
     <button
       onClick={onClick}
+      role={tab ? "tab" : undefined}
+      aria-selected={tab ? active : undefined}
       className={`frost-chip rounded-md px-2.5 py-1 text-xs transition-colors ${
         active ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
       }`}
@@ -254,6 +261,12 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
   // Answered samples only: a bucket whose every probe timed out draws a gap,
   // not a point a reader can use, so "how much is there" counts what answered.
   const answeredPings = pingSeries.reduce((n, s) => n + s.points.filter((p) => p.latency !== null).length, 0)
+  // The whole window's sample count, timeouts included. 100% loss is not "no
+  // data": the buckets hold real probe records whose every answer timed out,
+  // which is evidence about the target -- unreachable, or the path drops
+  // everything -- and deserves its own message rather than being folded into
+  // the emptier cases below.
+  const totalPings = pingSeries.reduce((n, s) => n + s.points.length, 0)
 
   // The hub answers in seconds; the time axis requires milliseconds.
   const metricRows = useMemo(
@@ -407,14 +420,17 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
         </dl>
 
         {node.remark && (
-          <p className="rounded-md bg-muted px-3 py-2 text-sm whitespace-pre-wrap">{node.remark}</p>
+          // break-all: remarks are free text, and the long unbroken kind is
+          // usually a URL -- whitespace-pre-wrap guards only the spaces it
+          // still has, so without this the card grows a sideways scrollbar.
+          <p className="rounded-md bg-muted px-3 py-2 text-sm break-all whitespace-pre-wrap">{node.remark}</p>
         )}
       </Card>
 
       <div className="space-y-2 border-t pt-4">
-        <div className="flex gap-1">
+        <div className="flex gap-1" role="tablist" aria-label="数据视图">
           {TABS.map((t) => (
-            <Tab key={t.key} active={tab === t.key} onClick={() => setTab(t.key)}>
+            <Tab key={t.key} active={tab === t.key} onClick={() => setTab(t.key)} tab>
               {t.label}
             </Tab>
           ))}
@@ -451,6 +467,12 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
       ) : tab === "latency" ? (
         pingSeries.length === 0 ? (
           <p className="py-8 text-center text-sm text-muted-foreground">这段时间没有延迟数据</p>
+        ) : totalPings > 0 && answeredPings === 0 ? (
+          // Every bucket recorded, every probe timed out: not an empty window
+          // nor a young one, but a verdict -- the target is unreachable or the
+          // path loses 100%. Drawing nothing is correct; saying nothing would
+          // misreport it as 数据积累中.
+          <p className="py-8 text-center text-sm text-muted-foreground">探测全部超时：目标不可达或链路丢包 100%，请检查探测目标</p>
         ) : answeredPings < 2 ? (
           // One answered sample draws nothing -- dot:false leaves a lone point
           // invisible -- and an empty panel reads as broken. A window this

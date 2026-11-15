@@ -73,12 +73,40 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 15s: the hub's endpoints answer in milliseconds, so a request still pending
+ * at this mark has been dropped by the network or a proxy on the way. Without
+ * a timeout of its own, fetch waits on the browser's TCP limits -- minutes on
+ * some stacks -- and the page sits on 「加载中…」 the whole way through. The
+ * timer is cleared however the fetch leaves, so a normal response is never
+ * aborted, and only this helper's own abort is translated: the engine's
+ * AbortError wording would otherwise surface verbatim in the red line the
+ * page shows.
+ */
+const TIMEOUT = 15_000
+
+async function fetchWithTimeout(path: string, init?: RequestInit): Promise<Response> {
+  const control = new AbortController()
+  const timer = setTimeout(() => control.abort(), TIMEOUT)
+  try {
+    return await fetch(path, { ...init, signal: control.signal })
+  } catch (e) {
+    if (control.signal.aborted) throw new ApiError(0, "请求超时")
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetchWithTimeout(`/api${path}`, {
     ...init,
     headers: init?.body ? { "content-type": "application/json", ...init?.headers } : init?.headers,
   })
-  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
+  // `|| \`HTTP ${status}\`` as the last resort: HTTP/2 dropped statusText, so a
+  // bodiless failure from a proxy arrives as "" -- and an empty message reads
+  // as no error to every caller that checks for one.
+  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText || `HTTP ${res.status}`)
   return res.status === 204 ? (undefined as T) : res.json()
 }
 

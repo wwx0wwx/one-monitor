@@ -19,12 +19,33 @@ function pickVariant(link: string, dark: boolean) {
   return (dark ? darkPart || light : light).trim()
 }
 
+/** Whether the viewport currently matches `query`. The change listener lets a
+ *  crossing re-render; the cleanup takes the listener back down. Exists so the
+ *  background can pick one source in JS instead of shipping both and hiding
+ *  one in CSS -- hidden is not undownloaded, see BackgroundLayer. */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => matchMedia(query).matches)
+  useEffect(() => {
+    const mq = matchMedia(query)
+    const sync = () => setMatches(mq.matches)
+    mq.addEventListener("change", sync)
+    return () => mq.removeEventListener("change", sync)
+  }, [query])
+  return matches
+}
+
 export function BackgroundLayer({ bg, dark }: { bg: Bg; dark: boolean }) {
+  const wide = useMediaQuery("(min-width: 768px)")
   if (!bg.enabled) return null
-  const desktop = pickVariant(bg.desktop, dark) || pickVariant(bg.mobile, dark)
-  const mobile = pickVariant(bg.mobile, dark) || pickVariant(bg.desktop, dark)
-  if (!desktop) return null
-  const painted = (src: string) => ({
+  // Only the source the viewport can show is rendered at all. This used to be
+  // two <img>s with the md: classes hiding one of them -- but a hidden img is
+  // still downloaded, so a phone paid for the desktop picture (and vice versa
+  // on a metered desktop link). One img, its src picked at the breakpoint; a
+  // resize crosses it and the hook re-renders with the other source.
+  const src = (wide ? pickVariant(bg.desktop, dark) || pickVariant(bg.mobile, dark)
+    : pickVariant(bg.mobile, dark) || pickVariant(bg.desktop, dark))
+  if (!src) return null
+  const painted = {
     src,
     alt: "",
     style: {
@@ -34,11 +55,10 @@ export function BackgroundLayer({ bg, dark }: { bg: Bg; dark: boolean }) {
       objectFit: bg.fit,
       objectPosition: bg.position,
     },
-  })
+  }
   return (
     <div className="pointer-events-none fixed inset-0 -z-10 overflow-hidden" aria-hidden>
-      <img className="absolute inset-0 hidden h-full w-full object-cover md:block" {...painted(desktop)} />
-      <img className="absolute inset-0 block h-full w-full object-cover md:hidden" {...painted(mobile)} />
+      <img className="absolute inset-0 block h-full w-full object-cover" {...painted} />
     </div>
   )
 }
@@ -72,7 +92,14 @@ function UrlField({ label, value, onCommit }: { label: string; value: string; on
       <input
         value={shown}
         onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => onCommit(shown.trim())}
+        onBlur={() => {
+          // No change, no PUT: focus often enters and leaves without editing
+          // (Enter routes through here too), and a no-op save is one more
+          // request racing whatever real save is in flight. Committing only
+          // what differs from the server's value keeps the queue quiet.
+          const next = shown.trim()
+          if (next !== value) onCommit(next)
+        }}
         onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
         placeholder="https://…"
         spellCheck={false}
@@ -200,6 +227,8 @@ export function ThemeSettingsButton({ settings, onSave }: {
         onClick={() => setOpen((o) => !o)}
         title="主题设置"
         aria-label="主题设置"
+        aria-expanded={open}
+        aria-haspopup="dialog"
         className="max-sm:size-11"
       >
         <Settings2 />
@@ -208,7 +237,17 @@ export function ThemeSettingsButton({ settings, onSave }: {
         <>
           {/* Click anywhere else closes; the panel sits above this blanket. */}
           <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} aria-hidden />
-          <div className="absolute right-0 top-full z-30 mt-2 max-h-[80svh] w-80 space-y-3 overflow-auto rounded-lg border bg-popover p-3 text-popover-foreground shadow-lg backdrop-blur-[64px]">
+          {/* Narrow screens first: anchored to the trigger's right edge, the
+              w-80 panel overflows a 390px viewport by 17px, and the body does
+              not scroll sideways to reveal what was cut. Below sm it becomes a
+              centered banner fixed near the top instead, inset-x-4 leaving
+              breathing room either side; from sm up it returns to the anchored
+              popover the desktop has always had. */}
+          <div
+            role="dialog"
+            aria-label="主题设置"
+            className="fixed inset-x-4 top-20 z-30 max-h-[80svh] space-y-3 overflow-auto rounded-lg border bg-popover p-3 text-popover-foreground shadow-lg backdrop-blur-[64px] sm:absolute sm:inset-x-auto sm:right-0 sm:top-full sm:mt-2 sm:w-80"
+          >
             <div>
               <p className="text-xs font-medium">主题设置</p>
               <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { Moon, Sun, Wrench } from "lucide-react"
 
 import { NodeCard } from "@/components/NodeCard"
@@ -54,15 +54,52 @@ function useNodeRoute() {
 }
 
 function useTheme() {
+  const readSaved = () => {
+    // localStorage throws in private modes and embedded WebViews with storage
+    // blocked -- an unreadable preference degrades to following the system
+    // rather than a SecurityError that takes the whole page down with it.
+    try {
+      return localStorage.getItem("theme")
+    } catch {
+      return null
+    }
+  }
+  // "System mode" is the absence of an explicit choice: no stored theme yet.
+  // The first manual toggle ends it, exactly as before -- only now the page
+  // also says so, so the live following below can be switched off.
+  const [followSystem, setFollowSystem] = useState(() => readSaved() === null)
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("theme")
+    const saved = readSaved()
     return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
   })
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
+    try {
+      localStorage.setItem("theme", dark ? "dark" : "light")
+    } catch {
+      // The choice lives for this session only; that is the graceful outcome,
+      // not an error worth surfacing.
+    }
   }, [dark])
-  return [dark, () => setDark((d) => !d)] as const
+  // In system mode the page tracks the scheme live: it can flip while the tab
+  // is open (sunset schedules, a keyboard dark-mode key), and a value read
+  // once at mount would strand the page in yesterday's mode.
+  useEffect(() => {
+    if (!followSystem) return
+    const mq = matchMedia("(prefers-color-scheme: dark)")
+    const sync = () => setDark(mq.matches)
+    mq.addEventListener("change", sync)
+    return () => mq.removeEventListener("change", sync)
+  }, [followSystem])
+  // The browser chrome -- address bar, status bar -- takes its colour from
+  // this meta. The two media-qualified metas in index.html answer for the
+  // moment before JS runs; from here on the effective colour is whatever this
+  // page resolved to, manual toggles and system flips alike, written as the
+  // single value the current mode actually shows.
+  useEffect(() => {
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#0a0a0a" : "#ffffff")
+  }, [dark])
+  return [dark, () => { setFollowSystem(false); setDark((d) => !d) }] as const
 }
 
 export default function App() {
@@ -105,11 +142,29 @@ export default function App() {
 
   // The operator's display settings, saved key by key: what the hub refuses
   // shows in the panel rather than half-applying here.
+  //
+  // Saves are serialized through one ref-held chain. HTTP/2 does not promise
+  // that responses arrive in the order their requests were sent (multiplexed
+  // streams, a proxy free to reorder), so two in-flight PUTs race for last
+  // write -- 「恢复默认」firing nineteen keys while a URL field's blur commits
+  // is the shape that lost, leaving the hub holding whichever landed later
+  // rather than whichever the operator did. Appending each save to the tail of
+  // the previous one eliminates the race entirely: the chain runs them in
+  // order, and merges each patch into me.theme only as its own save succeeds,
+  // still in order. The chain itself swallows failures so a rejected save
+  // cannot wedge every later one behind it; the caller's promise keeps the
+  // rejection so the panel can still show it.
+  const saveQueue = useRef(Promise.resolve())
   const saveSettings = useCallback(
-    (patch: Record<string, string>) =>
-      api("/settings", { method: "PUT", body: JSON.stringify(patch) }).then(() => {
-        setMe((old) => (old ? { ...old, theme: { ...(old.theme ?? {}), ...patch } } : old))
-      }),
+    (patch: Record<string, string>) => {
+      const doSave = () =>
+        api("/settings", { method: "PUT", body: JSON.stringify(patch) }).then(() => {
+          setMe((old) => (old ? { ...old, theme: { ...(old.theme ?? {}), ...patch } } : old))
+        })
+      const p = saveQueue.current.then(doSave)
+      saveQueue.current = p.catch(() => {})
+      return p
+    },
     [],
   )
 
@@ -239,7 +294,9 @@ export default function App() {
               operator's logo sits beside the site name. */}
           <div className="flex items-center gap-3">
             {ts.layout.logo && (
-              <img src={ts.layout.logo} alt="" className="h-6 w-auto shrink-0 rounded-sm" loading="lazy" />
+              // max-w-32: an over-wide logo is clamped, or it pushes the site
+              // name and the header's buttons off the right edge of a phone.
+              <img src={ts.layout.logo} alt="" className="h-6 max-w-32 w-auto shrink-0 rounded-sm" loading="lazy" />
             )}
             <button className="font-semibold transition-opacity hover:opacity-70" onClick={() => go(null)}>
               {me.site_name || "Monitor"}
@@ -306,7 +363,7 @@ export default function App() {
                 </button>
                 {ts.display.expiring && expiring.length > 0 && (
                   <button onClick={() => pick(group === EXPIRING ? "" : EXPIRING)} className={pill(group === EXPIRING)}>
-                    {EXPIRING} <span className={expired ? "text-red-600" : "text-orange-500"}>{expiring.length}</span>
+                    {EXPIRING} <span className={expired ? "text-red-700" : "text-orange-700"}>{expiring.length}</span>
                   </button>
                 )}
                 {groups.map((g) => (

@@ -20,3 +20,14 @@ test("numeric display keys clamp to the range their slider enforces", () => {
   expect(clamped.bg.cardBlur).toBe(0) // card_blur clamps to at least 0
   expect(clamped.layout.contentWidth).toBe(2560) // content_width clamps to its ceiling
 })
+
+// The hub sends unset keys as empty strings, and `Number("")` is 0 -- without
+// the guard, an unfilled slider reads as one deliberately set to its floor.
+// The same test pins the other half: a real "0" is a choice and stands.
+test("an empty value falls back to the default rather than reading as 0", () => {
+  const blank = parseThemeSettings({ card_blur: "", bg_opacity: "   ", content_width: "" })
+  expect(blank.bg.cardBlur).toBe(64) // 空串走默认，而不是 Number("") 的 0
+  expect(blank.bg.opacity).toBe(1) // 纯空白同样视为未填
+  expect(blank.layout.contentWidth).toBe(1400)
+  expect(parseThemeSettings({ card_blur: "0" }).bg.cardBlur).toBe(0) // 显式的 0 仍然成立
+})
