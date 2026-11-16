@@ -216,7 +216,7 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
                 Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
+                    match tokio::task::block_in_place(|| dispatch(&app, node_id, session, &ip, &text)) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
                     Ok(false) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -250,14 +250,32 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
     true
 }
 
+/// Whether `session` is still the connection the map holds for `node`.
+fn current(app: &App, node_id: i64, session: u64) -> bool {
+    app.agents.read().unwrap_or_else(|e| e.into_inner()).get(&node_id).is_some_and(|a| a.session == session)
+}
+
 /// Handles one inbound frame and reports whether the node is now owed a country
 /// lookup. The lookup itself is an outbound request and happens off this path;
 /// see `locate`.
-fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
+///
+/// The session fence is the read-side twin of `release`: a connection the map
+/// has replaced may run on for as long as its socket lasts -- up to SILENCE --
+/// and a frame it delivers late carries counters older than the ones its
+/// successor has already booked. `accumulate` cannot tell that shrinking
+/// reading from a genuinely vanished interface, and realigns its baseline to
+/// the stale figure, so the successor's next report bills the overlap twice.
+/// Nothing a replaced connection says is worth more than what the live one
+/// reports a second later, so none of it is parsed at all.
+fn dispatch(app: &App, node_id: i64, session: u64, ip: &str, text: &str) -> Result<bool> {
+    if !current(app, node_id, session) {
+        debug!("node {node_id}: dropped a frame from a replaced connection");
+        return Ok(false);
+    }
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
         "hello" => return app.db.save_facts(node_id, &rpc.params, ip),
-        "report" => report(app, node_id, rpc.params)?,
+        "report" => report(app, node_id, session, rpc.params)?,
         "ping.result" => {
             let task_id = rpc.params.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
             // A missing reading is not a reading of -1: `close_bucket` counts
@@ -372,7 +390,7 @@ fn check_contract(node_id: i64, metrics: &serde_json::Value) {
     }
 }
 
-fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()> {
+fn report(app: &App, node_id: i64, session: u64, mut metrics: serde_json::Value) -> Result<()> {
     // Missing fields remain compatible with older agents, while malformed values
     // must not become a live frame that can crash a browser. Counter validation
     // is separate: a missing or null kernel reading must not alter its
@@ -422,6 +440,20 @@ fn report(app: &App, node_id: i64, mut metrics: serde_json::Value) -> Result<()>
     // token, or the socket is unwinding. The bytes above remain booked; there is
     // simply no longer a session to attribute them to.
     let Some(entry) = agents.get_mut(&node_id) else { return Ok(()) };
+    // The second fence, and the airtight one for the live state below: the map
+    // swap and this lookup answer to the same lock, so a mismatch here means a
+    // replacement landed between the fence in `dispatch` and the accumulate
+    // above -- a microsecond window, against the whole of SILENCE without the
+    // first fence. The bytes are booked either way; what must not happen is the
+    // stale frame overwriting the successor's metrics, minute accumulator and
+    // history mark. Closing the window completely would mean holding this lock
+    // across the database write, parking the snapshot readers behind a report
+    // queued on the single write connection during a restore -- a frozen public
+    // page costs far more than a reconnect landing in a microsecond.
+    if entry.session != session {
+        debug!("node {node_id}: a replaced connection's report arrived after its successor's");
+        return Ok(());
+    }
     let first = entry.last_seen == 0;
     if first {
         check_contract(node_id, &metrics);
@@ -530,13 +562,13 @@ mod tests {
     fn malformed_reports_leave_the_last_good_frame_and_counters_untouched() {
         let app = app();
         let (id, _held) = connect(&app);
-        dispatch(&app, id, "ip", &report_json("boot", 1_000, 500)).unwrap();
+        dispatch(&app, id, 1, "ip", &report_json("boot", 1_000, 500)).unwrap();
         let good = app.agents.read().unwrap()[&id].metrics.clone();
         for bad in [json!({"load":null}), json!({"load":[1,"bad",3]}), json!({"cpu":"bad"}), json!([])] {
-            assert!(report(&app, id, bad).is_err());
+            assert!(report(&app, id, 1, bad).is_err());
             assert_eq!(app.agents.read().unwrap()[&id].metrics, good);
         }
-        dispatch(&app, id, "ip", &report_json("boot", 2_000, 600)).unwrap();
+        dispatch(&app, id, 1, "ip", &report_json("boot", 2_000, 600)).unwrap();
         assert_eq!(app.db.all_traffic()[&id].total_rx, 1_000);
     }
 
@@ -554,7 +586,7 @@ mod tests {
         // pair unreadable and every assertion below pass for that reason rather
         // than the one under test.
         let send = |boot: &str, rx: serde_json::Value| {
-            report(&app, id, json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}))
+            report(&app, id, 1, json!({"boot_id": boot, "net_rx_total": rx, "net_tx_total": 0}))
         };
 
         // A negative reading is rejected and, critically, does not survive as the
@@ -618,8 +650,8 @@ mod tests {
         // reconnect case below.
         app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
 
-        dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 1_000, 500)).unwrap();
-        dispatch(&app, id, "1.2.3.4", &report_json("boot-a", 3_000, 1_500)).unwrap();
+        dispatch(&app, id, 1, "1.2.3.4", &report_json("boot-a", 1_000, 500)).unwrap();
+        dispatch(&app, id, 1, "1.2.3.4", &report_json("boot-a", 3_000, 1_500)).unwrap();
 
         let live = app.agents.read().unwrap();
         let entry = live.get(&id).unwrap();
@@ -658,7 +690,7 @@ mod tests {
 
         // Busy for half the minute, then idle. The first reading is also the
         // traffic baseline: nothing is booked until a second arrives.
-        dispatch(&app, id, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
+        dispatch(&app, id, 1, "ip", &burst(1_000, 0, 100.0, 100)).unwrap();
         // Rewind the bookkeeping by a minute so the next report crosses the
         // boundary with a minute of elapsed time behind it. The mark is an
         // `Instant` precisely because a wall-clock difference can be negative when
@@ -672,7 +704,7 @@ mod tests {
         }
         // 60 MB arrived and the machine was busy for half the minute; by the next
         // sample both have ended.
-        dispatch(&app, id, "ip", &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
+        dispatch(&app, id, 1, "ip", &burst(1_000 + 60_000_000, 0, 0.0, 201)).unwrap();
 
         let row = &app.db.metrics(id, 0, 60).unwrap()[0];
         assert_eq!(row["net_rx"], 1_000_000, "60 MB over 60 s is 1 MB/s, not the agent's 0");
@@ -694,7 +726,7 @@ mod tests {
         let app = app();
         let (id, _held) = connect(&app);
         app.agents.write().unwrap().get_mut(&id).unwrap().last_minute -= 1;
-        dispatch(&app, id, "ip", &report_json("boot-a", 1_000, 500)).unwrap();
+        dispatch(&app, id, 1, "ip", &report_json("boot-a", 1_000, 500)).unwrap();
         let before = app.db.metrics(id, 0, 60).unwrap();
         assert_eq!(before.len(), 1, "the running session wrote the row for this minute");
 
@@ -705,7 +737,7 @@ mod tests {
                           "params": {"boot_id": "boot-a", "cpu": 99.0, "net_rx_total": 9_000,
                                      "net_tx_total": 4_500}})
         .to_string();
-        dispatch(&app, id, "ip", &loud).unwrap();
+        dispatch(&app, id, 2, "ip", &loud).unwrap();
 
         assert_eq!(app.db.metrics(id, 0, 60).unwrap(), before, "the row keeps the minute it described");
         // The bytes are still booked; only the history row is left untouched.
@@ -725,15 +757,15 @@ mod tests {
                    "params": {"cpu": 1.0, "net_rx_total": rx, "net_tx_total": 0}})
             .to_string()
         };
-        dispatch(&app, id, "ip", &report(1_000)).unwrap();
-        dispatch(&app, id, "ip", &report(3_000)).unwrap();
+        dispatch(&app, id, 1, "ip", &report(1_000)).unwrap();
+        dispatch(&app, id, 1, "ip", &report(3_000)).unwrap();
         assert_eq!(app.agents.read().unwrap()[&id].metrics["total_rx"], 2_000);
 
         // A report with no counters books nothing and, crucially, leaves the
         // baseline unchanged so the next one is a delta.
         let blind = json!({"jsonrpc": "2.0", "method": "report", "params": {"cpu": 1.0}}).to_string();
-        dispatch(&app, id, "ip", &blind).unwrap();
-        dispatch(&app, id, "ip", &report(4_000)).unwrap();
+        dispatch(&app, id, 1, "ip", &blind).unwrap();
+        dispatch(&app, id, 1, "ip", &report(4_000)).unwrap();
         assert_eq!(
             app.agents.read().unwrap()[&id].metrics["total_rx"],
             3_000,
@@ -744,12 +776,12 @@ mod tests {
     #[test]
     fn hello_stores_the_facts_and_the_observed_address() {
         let app = app();
-        let id = node(&app);
+        let (id, _held) = connect(&app);
         let hello = json!({
             "jsonrpc": "2.0", "method": "hello",
             "params": {"hostname": "vps-1", "os": "Debian 12", "cpu_cores": 4, "mem_total": 2048}
         });
-        dispatch(&app, id, "198.51.100.4", &hello.to_string()).unwrap();
+        dispatch(&app, id, 1, "198.51.100.4", &hello.to_string()).unwrap();
 
         let n = app.db.node(id).unwrap().unwrap();
         assert_eq!(n.hostname, "vps-1");
@@ -760,7 +792,7 @@ mod tests {
     #[test]
     fn ping_results_are_recorded_and_bad_ones_ignored() {
         let app = app();
-        let id = node(&app);
+        let (id, _held) = connect(&app);
         // Assigned probes: a result is readable only through a node's current
         // assignments.
         let probe = |name: &str| {
@@ -780,17 +812,18 @@ mod tests {
                    "params": {"task_id": task, "latency_ms": latency}})
             .to_string()
         };
-        dispatch(&app, id, "ip", &result(one, 42)).unwrap();
+        dispatch(&app, id, 1, "ip", &result(one, 42)).unwrap();
         // The rejected results carry task ids of their own: a bare count would be
         // satisfied by the key collapsing them onto a valid row.
-        dispatch(&app, id, "ip", &result(two, 15)).unwrap();
-        dispatch(&app, id, "ip", &result(0, 42)).unwrap(); // no such task
-        dispatch(&app, id, "ip", &result(-1, 42)).unwrap(); // nor this one
-                                                            // A frame carrying no reading. Defaulting to -1 would file it as a lost
-                                                            // packet, rendering a malformed frame as an outage.
+        dispatch(&app, id, 1, "ip", &result(two, 15)).unwrap();
+        dispatch(&app, id, 1, "ip", &result(0, 42)).unwrap(); // no such task
+        dispatch(&app, id, 1, "ip", &result(-1, 42)).unwrap(); // nor this one
+                                                               // A frame carrying no reading. Defaulting to -1 would file it as a lost
+                                                               // packet, rendering a malformed frame as an outage.
         dispatch(
             &app,
             id,
+            1,
             "ip",
             &json!({"jsonrpc": "2.0", "method": "ping.result",
                                          "params": {"task_id": one}})
@@ -824,6 +857,45 @@ mod tests {
         assert_eq!(bearer(&h), None, "an empty token is not accepted");
     }
 
+    /// The pollution this file's session fence exists for: a replaced
+    /// connection's late report carries counters older than the ones its
+    /// successor already booked. `accumulate` cannot tell that shrinking
+    /// reading from a genuinely vanished interface, and would realign the
+    /// baseline to the stale figure -- the successor's next report then bills
+    /// the overlap twice (1000→1100→late 1050→1200 booked 250 where the
+    /// machine moved 200). The fence drops the stale frame whole, so neither
+    /// the baseline nor the live entry ever sees it, while a genuine counter
+    /// shrink from the live connection still realigns as it always did.
+    #[test]
+    fn a_replaced_connections_late_report_neither_rebases_nor_overwrites() {
+        let app = app();
+        let (id, _held) = connect(&app);
+        let frame = |rx: i64| {
+            json!({"jsonrpc":"2.0","method":"report",
+                   "params":{"boot_id":"boot-a","net_rx_total":rx,"net_tx_total":0,"cpu":1.0}})
+            .to_string()
+        };
+
+        dispatch(&app, id, 1, "ip", &frame(1_000)).unwrap(); // 建立基线
+        dispatch(&app, id, 1, "ip", &frame(1_100)).unwrap(); // 会话 1 记 100
+
+        // 会话 2 上岗（重连），先于迟到的旧报告记账
+        let (tx, _rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        dispatch(&app, id, 2, "ip", &frame(1_150)).unwrap(); // 会话 2 记 50，基线 1150
+
+        // 会话 1 的迟到报告：计数器 1050 落后会话 2 之前——整帧作废
+        let live_before = app.agents.read().unwrap()[&id].metrics.clone();
+        dispatch(&app, id, 1, "ip", &frame(1_050)).unwrap();
+        let traffic = app.db.all_traffic()[&id].clone();
+        assert_eq!(traffic.total_rx, 150, "1000→1150 的真实增量，重叠不双计");
+        assert_eq!(app.agents.read().unwrap()[&id].metrics, live_before, "实时视图仍是会话 2 的");
+
+        // 会话 2 的下一份报告：基线未被旧帧回退
+        dispatch(&app, id, 2, "ip", &frame(1_200)).unwrap();
+        assert_eq!(app.db.all_traffic()[&id].total_rx, 200, "1200−1000，全程无污染");
+    }
+
     #[test]
     fn a_late_teardown_leaves_the_reconnected_session_alone() {
         let app = app();
@@ -853,9 +925,9 @@ mod tests {
     #[test]
     fn junk_from_an_agent_is_rejected_without_taking_the_connection_down() {
         let app = app();
-        let id = node(&app);
-        assert!(dispatch(&app, id, "ip", "not json").is_err());
+        let (id, _held) = connect(&app);
+        assert!(dispatch(&app, id, 1, "ip", "not json").is_err());
         // Unknown methods are ignored.
-        assert!(dispatch(&app, id, "ip", r#"{"method":"whatever"}"#).is_ok());
+        assert!(dispatch(&app, id, 1, "ip", r#"{"method":"whatever"}"#).is_ok());
     }
 }
