@@ -145,6 +145,9 @@ export class ApiError extends Error {
 /** One request may not hang forever. */
 const REQUEST_TIMEOUT_MS = 15_000
 
+/** The message `request` aborts with when that time is up. Read by name and message by the one caller that tells a timeout from a cancel. */
+const TIMED_OUT = "请求超时"
+
 /**
  * fetch with a hard timeout and a forwarded caller signal. The timeout aborts
  * with a reason rather than a bare `abort()`: fetch rejects with exactly that
@@ -156,7 +159,7 @@ const REQUEST_TIMEOUT_MS = 15_000
  */
 async function request(path: string, init: RequestInit): Promise<Response> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(new DOMException("请求超时", "AbortError")), REQUEST_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(new DOMException(TIMED_OUT, "AbortError")), REQUEST_TIMEOUT_MS)
   const caller = init.signal
   const forward = () => controller.abort(caller?.reason)
   if (caller) {
@@ -224,8 +227,11 @@ const CHUNK = 4 * 1024 * 1024
  * 500 ms then 1500 ms backoff. The hub's `receive()` makes that safe by design:
  * it accepts a piece only when it begins exactly where the file on disk already
  * ends, and a failure truncates back to that boundary -- a piece lands whole or
- * not at all -- so a resend always aligns and two failures in a row leave
- * nothing half-written behind. Network errors, HTTP 5xx and 429 are transient
+ * not at all -- so a resend after a failure that wrote nothing aligns, and two
+ * failures in a row leave nothing half-written behind. The one piece that
+ * cannot be resent is one the hub did take whose answer was lost: the resend
+ * finds the file longer than its offset, the hub refuses it with 400, and the
+ * upload ends with that message. Network errors, HTTP 5xx and 429 are transient
  * and worth another attempt; any other 4xx is a verdict on the request itself
  * (the proxy's 413, the hub's own 400) and is thrown without retrying.
  */
@@ -291,6 +297,38 @@ export async function upload<T>(
     onProgress?.(Math.min(offset + CHUNK, file.size))
   }
   return last!.json()
+}
+
+/**
+ * Where the last piece of a file of `size` bytes begins. The hub applies an
+ * upload the moment that piece lands, so a caller whose upload has consequences
+ * it cannot take back treats everything from this offset on differently.
+ */
+export function lastChunkOffset(size: number): number {
+  return Math.floor(Math.max(size - 1, 0) / CHUNK) * CHUNK
+}
+
+/**
+ * What to say when a restore upload ends without the page reloading: the one
+ * upload whose answer can go missing after the hub has already acted on it.
+ *
+ * Up to the last piece nothing is applied, so an abort or a timeout there
+ * really did leave the database alone. The last piece is different: the hub
+ * applies a complete upload whether or not this tab is still listening, and
+ * its response is the only thing that says which way it went. Without that
+ * response the outcome is unknown and is reported as unknown -- "cancelled,
+ * nothing changed" about a database that has just been replaced is the one
+ * wrong answer here. A response that did arrive is the hub's own verdict, and
+ * is passed on as it stands.
+ */
+export function restoreOutcome(lastPieceSent: boolean, e: unknown): { tone: "error" | "info"; text: string } {
+  if (e instanceof ApiError) return { tone: "error", text: e.message }
+  if (lastPieceSent) {
+    return { tone: "info", text: "没能确认恢复结果：备份已发完，恢复可能已经完成。请刷新页面确认；若被登出，重新登录即可" }
+  }
+  const err = e as Error
+  if (err.name !== "AbortError") return { tone: "error", text: err.message }
+  return { tone: "info", text: err.message === TIMED_OUT ? "请求超时，数据库没有改动" : "已取消，数据库没有改动" }
 }
 
 /**

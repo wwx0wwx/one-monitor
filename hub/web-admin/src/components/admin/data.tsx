@@ -6,7 +6,7 @@ import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { api, download, upload } from "@/lib/api"
+import { api, download, lastChunkOffset, restoreOutcome, upload } from "@/lib/api"
 import { bytes } from "@/lib/format"
 
 import { ConfirmDialog, Field } from "./shared"
@@ -39,8 +39,8 @@ export function Data() {
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
   const [sent, setSent] = useState(0)
-  // The whole file has reached the hub and it is swapping the database: from
-  // here on there is no "cancel", only waiting for the reload.
+  // The last piece has been sent: the hub applies the backup as soon as it
+  // lands, so from here on there is no "cancel", only waiting for the answer.
   const [restoring, setRestoring] = useState(false)
   // Closing the dialog must stop the upload rather than merely hide it: restore
   // is the one irreversible action here, and it takes minutes on a large
@@ -106,8 +106,31 @@ export function Data() {
     setSent(0)
     setRestoring(false)
     abort.current = new AbortController()
+    // The last piece is the one the hub applies the backup on. From the moment
+    // it is sent, what this tab does next decides nothing -- a close or a
+    // timeout in between used to be reported as "cancelled, nothing changed"
+    // about a database that had just been replaced -- so the dialog stops
+    // offering a cancel here rather than when the answer arrives. Held in a
+    // local as well as in `restoring`: that is state, and inside the failure
+    // path below it still holds the value from before the upload.
+    const lastAt = lastChunkOffset(file.size)
+    let finalSent = false
+    const finalPiece = () => {
+      finalSent = true
+      setRestoring(true)
+    }
+    // A backup that fits in one piece is applied by its very first request.
+    if (lastAt === 0) finalPiece()
     try {
-      await upload("/db/restore", file, setSent, abort.current.signal)
+      await upload(
+        "/db/restore",
+        file,
+        (n) => {
+          setSent(n)
+          if (n === lastAt) finalPiece()
+        },
+        abort.current.signal,
+      )
       // Every chunk has landed; the hub is replacing the database right now.
       // Cancelling stops meaning anything from this point, so the dialog says
       // so instead of offering a button that lies.
@@ -117,11 +140,12 @@ export function Data() {
       // replaced.
       setTimeout(() => location.reload(), 800)
     } catch (e) {
-      // Aborting partway is not a failure: the hub replaces nothing until the
-      // last chunk, so the original database remains.
-      const aborted = (e as Error).name === "AbortError"
-      if (aborted) toast.info("已取消，数据库没有改动")
-      else toast.error((e as Error).message)
+      // Up to the last piece the hub applies nothing, so a stop there leaves
+      // the original database in place. From the last piece on, only the hub's
+      // answer says what happened -- and without one, nothing here can.
+      const outcome = restoreOutcome(finalSent, e)
+      if (outcome.tone === "info") toast.info(outcome.text)
+      else toast.error(outcome.text)
       setBusy("")
     }
     setPending(null)
@@ -270,9 +294,9 @@ export function Data() {
           title="用备份覆盖当前数据？"
           description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`}
           confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
-          // While the file is still going up, cancelling stays possible the
-          // dialog's own way (Esc / clicking outside, which runs onClose);
-          // once every chunk has landed the cancel button says so and stops.
+          // While earlier pieces are still going up, cancelling stays possible
+          // the dialog's own way (Esc / clicking outside, which runs onClose);
+          // once the last piece has been sent the cancel button says so and stops.
           cancelLabel={restoring ? "正在恢复，不可取消" : "取消"}
           busy={!!busy}
           onClose={() => {

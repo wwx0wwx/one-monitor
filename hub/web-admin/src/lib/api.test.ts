@@ -1,5 +1,5 @@
 import { expect, test } from "vitest"
-import { addresses, ApiError, changes, GIB, provisioningSite, trafficCorrection, upload } from "./api.ts"
+import { addresses, ApiError, changes, GIB, lastChunkOffset, provisioningSite, restoreOutcome, trafficCorrection, upload } from "./api.ts"
 
 test("changes reports only the keys whose value actually moved", () => {
   expect(changes({ public: true, price: 5 }, { price: 20 })).toEqual({ price: 20 })
@@ -43,12 +43,45 @@ test("addresses: the NAT arrival address leads the private interface", () => {
 
 // Chunk retries, against a fake POST and a sleep that returns at once. The
 // hub's receive() only appends a piece that begins where the file on disk
-// ends, so a retried chunk always re-aligns -- what these exercise is the
-// client's side of that bargain: same offset resent, transient faults ridden
-// out, verdicts on the request itself accepted on first sight.
+// ends, so a retried chunk whose first attempt wrote nothing re-aligns -- what
+// these exercise is the client's side of that bargain: same offset resent,
+// transient faults ridden out, verdicts on the request itself accepted on
+// first sight.
 const file = new File([new Uint8Array(8)], "backup.db")
 const reply = (status: number) => new Response(status === 200 ? '{"received":8}' : "", { status })
 const nowait = () => Promise.resolve()
+
+test("lastChunkOffset names the piece the hub applies an upload on", () => {
+  const MiB = 1024 * 1024
+  // Any backup that fits in one piece is applied by its very first request.
+  expect(lastChunkOffset(1)).toBe(0)
+  expect(lastChunkOffset(4 * MiB)).toBe(0)
+  // One byte more and the second request is the one that counts.
+  expect(lastChunkOffset(4 * MiB + 1)).toBe(4 * MiB)
+  expect(lastChunkOffset(3 * 4 * MiB)).toBe(2 * 4 * MiB)
+})
+
+test("restoreOutcome: what to say when a restore stops before the page reloads", () => {
+  const refused = new ApiError(400, "the file is a damaged database")
+  // The hub's own verdict is passed on whenever its answer arrived.
+  expect(restoreOutcome(false, refused)).toEqual({ tone: "error", text: refused.message })
+  expect(restoreOutcome(true, refused)).toEqual({ tone: "error", text: refused.message })
+  // Before the last piece nothing was applied, so an abort or a timeout really
+  // did leave the database alone.
+  expect(restoreOutcome(false, new DOMException("aborted", "AbortError"))).toEqual({ tone: "info", text: "已取消，数据库没有改动" })
+  expect(restoreOutcome(false, new DOMException("请求超时", "AbortError"))).toEqual({ tone: "info", text: "请求超时，数据库没有改动" })
+  // A network fault before the last piece is a failure like any other.
+  expect(restoreOutcome(false, new TypeError("fetch failed"))).toEqual({ tone: "error", text: "fetch failed" })
+  // After the last piece the hub may already have replaced the database, so a
+  // missing answer -- cancelled, timed out or dropped on the way -- must not be
+  // read as "nothing changed". This is the case that used to say exactly that.
+  for (const e of [new DOMException("aborted", "AbortError"), new DOMException("请求超时", "AbortError"), new TypeError("fetch failed")]) {
+    const outcome = restoreOutcome(true, e)
+    expect(outcome.tone).toBe("info")
+    expect(outcome.text).not.toContain("没有改动")
+    expect(outcome.text).toContain("可能已经完成")
+  }
+})
 
 test("both kinds of transient fault are ridden out to one completed upload", async () => {
   // First POST dies on the network, second is answered 500, third lands:
