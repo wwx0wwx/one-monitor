@@ -240,9 +240,7 @@ fn jitter_millis() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u64(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
     );
     hasher.finish() % 2_000
 }
@@ -562,8 +560,9 @@ mod tests {
     fn only_an_http_refusal_of_the_token_counts_as_one() {
         use tokio_tungstenite::tungstenite::http::Response;
 
-        let refused =
-            |code| anyhow::Error::new(WsError::Http(Box::new(Response::builder().status(code).body(None).unwrap())));
+        let refused = |code| {
+            anyhow::Error::new(WsError::Http(Box::new(Response::builder().status(code).body(None).unwrap())))
+        };
         assert!(token_rejected(&refused(401)));
         assert!(token_rejected(&refused(403)));
         assert!(!token_rejected(&refused(500)));

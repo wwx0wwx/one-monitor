@@ -356,7 +356,8 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
         // As in `parse_cpu_jiffies`: a field that fails to parse fails the
         // line, rather than shifting rx bytes and tx bytes into each other's
         // columns.
-        let Some(f) = rest.split_whitespace().map(|v| v.parse::<u64>().ok()).collect::<Option<Vec<_>>>() else {
+        let Some(f) = rest.split_whitespace().map(|v| v.parse::<u64>().ok()).collect::<Option<Vec<_>>>()
+        else {
             continue;
         };
         if f.len() >= 9 {
@@ -688,7 +689,11 @@ mod tests {
         let head = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n";
         let good = "  eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
         let bad = "  eth1: 1000 x 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(&format!("{head}{good}{bad}")), (1000, 2000), "only the well-formed line counts");
+        assert_eq!(
+            parse_net_dev(&format!("{head}{good}{bad}")),
+            (1000, 2000),
+            "only the well-formed line counts"
+        );
     }
 
     /// The two questions asked of an interface name, and why one list cannot
