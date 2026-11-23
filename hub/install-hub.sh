@@ -383,7 +383,9 @@ server {
         proxy_http_version 1.1;
         # 导入备份与上传主题是分片传的，单片 4 MiB；这个数不随数据库增长。
         client_max_body_size 8m;
-        proxy_set_header Host              \$host;
+        # 用 \$http_host 而不是 \$host：\$host 会丢掉端口，面板跑在非默认端口时
+        # 浏览器发来的 Origin 带端口而 Host 不带，登录和所有写操作都会被拒。
+        proxy_set_header Host              \$http_host;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         # /api/agent/ws 与 /api/ws 是长连接。
