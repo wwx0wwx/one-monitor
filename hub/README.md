@@ -72,12 +72,16 @@ curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.ex
 agent 装在节点的 `/opt/monitor/monitor-agent`，token 写在 0600 的 `/opt/monitor/agent.env`，
 同样由 systemd 管理（服务名 `monitor-agent`）。日志：`journalctl -u monitor-agent -f`。
 
+**升级 agent**：已装的 agent 不会自己更新，升级 hub 也不改动节点上已装的 agent。hub 升级后，在每台节点上重新执行
+面板里该节点「安装 Agent」的命令即可——二进制由 hub 中转并按仓库内摘要校验，旧版本保留到新版确认能启动，起不来会自动回滚。
+
 ### 4. 上传并激活主题
 
-后台「主题」→ 上传主题包 → 点击启用。主题包从对应 tag 的 release 下载，例如 komari-likely：
+后台「主题」→ 上传主题包 → 点击启用。主题包从对应 tag 的 release 下载，例如 komari-likely
+（以 [Releases](https://github.com/wwx0wwx/one-monitor/releases) 里 `theme-komari-likely-v*` 的最新 tag 为准）：
 
 ```text
-https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.4/theme.tar.gz
+https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.9/theme.tar.gz
 ```
 
 也可以纯命令行（CI / AI 助手场景），四条依次执行：
@@ -86,7 +90,7 @@ https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.
 curl -s -c cj -H 'content-type: application/json' \
   -d '{"password":"<管理员密码>"}' https://hub.example.com/api/auth/login
 curl -fSL -o theme.tar.gz \
-  https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.4/theme.tar.gz
+  https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.9/theme.tar.gz
 size=$(stat -c%s theme.tar.gz)
 curl -s -b cj -X POST --data-binary @theme.tar.gz \
   "https://hub.example.com/api/themes?offset=0&total=$size"
@@ -105,22 +109,24 @@ curl -s -b cj -X PUT -H 'content-type: application/json' \
 ### 容器方式（可选）
 
 ```bash
-docker run -d --name monitor -p 28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.5.4
+docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
+  ghcr.io/wwx0wwx/one-monitor:1.6.9
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
-镜像与同版本二进制来自同一次 release 构建。容器监听所有地址，请只映射到本机或防火墙后面，仍走反向代理。
+镜像与同版本二进制来自同一次 release 构建。容器里的 hub 监听所有地址，所以上面只把端口映射到宿主机的回环地址，
+和二进制安装一致；公网访问仍走[反向代理](#反向代理)，把域名指到 `127.0.0.1:28080`。不要写成 `-p 28080:28080`，那会把面板直接开到公网上。
 
 ## 升级
 
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.5.4 --yes     # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.6.9 --yes     # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
+agent 升级：在每台节点上重跑安装命令，见[「添加节点」](#3-添加节点agent)。
 
 ## 卸载与数据
 

@@ -259,7 +259,7 @@ pub(crate) fn origin_names_host(origin: &str, host: &str) -> bool {
 /// voy → cas → new) means moving this tag in the same change that cuts it. Not
 /// settings: redirecting them implies a fork, which rebuilds these lines anyway.
 const AGENT_REPO: &str = "wwx0wwx/one-monitor";
-const AGENT_TAG: &str = "pio";
+const AGENT_TAG: &str = "voy";
 
 /// The sha256 of every agent binary `AGENT_TAG` published, `<arch> <sha>` per
 /// line, beside `web-theme.pin` and held to the same discipline: the digest is
@@ -1059,7 +1059,7 @@ mod tests {
         let app = app("");
         let direct = release_url(&app, "x86_64");
         assert!(
-            direct.starts_with("https://github.com/wwx0wwx/one-monitor/releases/download/pio/"),
+            direct.starts_with("https://github.com/wwx0wwx/one-monitor/releases/download/voy/"),
             "{direct}"
         );
 
