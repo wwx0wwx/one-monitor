@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws", "macros"] }
-rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 argon2 = "0.5"
 rand = "0.9"
@@ -37,7 +37,7 @@ hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
 # Local GeoIP lookups from a MaxMind .mmdb when that provider is selected.
-maxminddb = "0.24"
+maxminddb = "0.27"
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

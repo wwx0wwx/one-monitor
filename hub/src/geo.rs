@@ -74,8 +74,8 @@ pub fn lookup(app: &App, ip: &str) -> Option<String> {
     }
     let reader = reader(app)?;
     let address: IpAddr = ip.parse().ok()?;
-    let found: maxminddb::geoip2::Country = reader.lookup(address).ok()?;
-    let code = found.country?.iso_code?;
+    let found = reader.lookup(address).ok()?.decode::<maxminddb::geoip2::Country>().ok()??;
+    let code = found.country.iso_code?;
     Some(code.to_ascii_uppercase())
 }
 
