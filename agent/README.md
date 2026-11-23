@@ -34,6 +34,10 @@ monitor-agent --server https://your-hub --token <token>
 | `--server` | 必填 | hub 地址，也可用 `MONITOR_SERVER` |
 | `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
+| `--insecure` | 关 | 允许连远程 hub 时走明文 `ws://`，token 在链路上裸奔；只给没有 TLS、直接以 ip:port 访问的 hub 用 |
+
+每个参数的值单独占一个参数（`--token <token>`），不支持 `--token=<token>`。写错时 agent 报
+`unknown argument` 并退出，报错里不重复参数的内容——它可能就是 token，而 stderr 会进系统日志。
 
 ## 上报字段
 
@@ -63,7 +67,9 @@ cargo test
 cargo clippy --all-targets
 ```
 
-发布产物为 musl 静态链接二进制，推送 `v*` tag 由 `.github/workflows/release.yml` 构建。
+发布产物为 x86_64 与 aarch64 的 musl 静态链接二进制。agent 按代号发布（`pio` → `voy` → `cas` → `new`）：
+推送对应代号的 tag，由 `.github/workflows/release-agent.yml` 构建并发布，hub 侧再把 `AGENT_TAG` 与
+`hub/agent.pin` 指向新代号。详见仓库根目录 README 的「tag 纪律」。
 
 ## 许可
 

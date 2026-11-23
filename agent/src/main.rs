@@ -25,7 +25,7 @@ use collect::Collector;
 /// each flown farther than the last. Reported to the hub in every hello and
 /// shown to the operator, never compared programmatically; the Cargo package
 /// version stays numeric because the toolchain requires semver.
-pub const CODENAME: &str = "pio";
+pub const CODENAME: &str = "voy";
 
 struct Args {
     server: String,
@@ -53,8 +53,13 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Result<Args> {
+    parse(std::env::args().skip(1))
+}
+
+/// The arguments after the program's own name.
+fn parse<I: Iterator<Item = String>>(args: I) -> Result<Args> {
     let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
-    let mut it = std::env::args().skip(1);
+    let mut it = args;
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
@@ -63,7 +68,13 @@ fn parse_args() -> Result<Args> {
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
-            other => bail!("unknown argument: {other}"),
+            // Never repeated in the message: the argument nobody recognised may
+            // be the token itself, written as `--token=<token>`, and stderr is
+            // the journal, which a restart loop rewrites every few seconds.
+            _ => bail!(
+                "unknown argument (not repeated here: it may hold the token). \
+                 Each option takes its value as the next argument, e.g. --token <token>; see --help"
+            ),
         }
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
@@ -574,6 +585,34 @@ mod tests {
         // A transport failure is not a refusal, whatever its flavour.
         assert!(!token_rejected(&anyhow::Error::new(WsError::ConnectionClosed)));
         assert!(!token_rejected(&anyhow::anyhow!("no connection after 120s")));
+    }
+
+    /// An argument nobody recognised is the one route a token takes into the
+    /// journal: written as `--token=<token>` it is what `parse` is handed, and
+    /// stderr is where the error goes, on every restart of a unit that cannot
+    /// start. The message names the argument and never its value.
+    #[test]
+    fn an_unknown_argument_is_refused_without_repeating_it() {
+        let refused = parse(std::iter::once("--token=not-for-the-journal".to_string()))
+            .err()
+            .expect("the unknown argument is refused")
+            .to_string();
+        assert!(refused.contains("unknown argument"), "{refused}");
+        assert!(!refused.contains("not-for-the-journal"), "{refused}");
+        // And says what to write instead.
+        assert!(refused.contains("--token <token>"), "{refused}");
+
+        // A well-formed command line still parses, values included.
+        let args = parse(
+            ["--server", "https://hub.example.com", "--token", "t0k3n", "--insecure"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .unwrap();
+        assert_eq!(args.server, "https://hub.example.com");
+        assert_eq!(args.token, "t0k3n");
+        assert!(args.insecure);
+        assert_eq!(args.interval, 1);
     }
 
     #[test]
