@@ -193,8 +193,8 @@ pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
         return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
     }
     // The same rendered frame the browser streams receive, for the same reason:
-    // otherwise every visitor would rebuild every node's row against the
-    // connection the agents write through.
+    // otherwise every visitor would rebuild every node's row with two queries
+    // against the pooled read connections.
     ([(axum::http::header::CONTENT_TYPE, "application/json")], live_snapshot(&app, full).as_str().to_owned())
         .into_response()
 }
@@ -220,16 +220,18 @@ fn default_hours() -> i64 {
 /// `PUBLIC_HOURS` bounds what one request costs; this bounds how many may run,
 /// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
 /// the other two paths an anonymous caller can make expensive. This is the most
-/// expensive of the three: every request holds the single connection the agents
-/// report through for its entire scan, measured at 118 ms for a week of four
-/// probes and growing with `retention_days`. Without a gate, 120 requests from
-/// one machine took the panel's own node list from 1 ms to 2.8 s.
+/// expensive of the three: every request holds one of the pooled read
+/// connections (`READERS` in `db.rs`) for its entire scan, measured at 118 ms
+/// for a week of four probes and growing with `retention_days`. Without a gate,
+/// 120 requests from one machine took the panel's own node list from 1 ms to
+/// 2.8 s.
 ///
-/// Four, because the requests serialise on that one connection regardless: a
-/// fifth in flight buys no throughput and merely places another scan ahead of
-/// the next agent report. What the number actually sets is how long that wait
-/// can become -- four at roughly 120 ms is half a second -- while leaving room
-/// for several people opening charts simultaneously.
+/// Four, the size of that pool: a reader a history scan holds is one another
+/// read -- the public page's own list among them -- can be assigned and wait
+/// on, and a fifth in flight buys no throughput, only a queue. What the number
+/// actually sets is how long that wait can become -- one scan's worth, since
+/// they run side by side -- while leaving room for several people opening
+/// charts simultaneously.
 ///
 /// Refused rather than queued, as in `auth`: a queue admits the same flood,
 /// merely later.
@@ -269,9 +271,9 @@ pub async fn metrics(
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
     // Off the runtime, for the reason given in `db_stats` below: this reads every
-    // probe result the node has retained within the window and holds the
-    // connection the agents report through throughout. That route is behind
-    // `Admin` and cheaper than this one, which anyone can reach.
+    // probe result the node has retained within the window and holds a pooled
+    // read connection throughout. That route is behind `Admin` and cheaper than
+    // this one, which anyone can reach.
     //
     // It is also what makes the gate above effective: the permit is held across
     // an await, so exactly four callers are inside it at once rather than however
@@ -305,8 +307,8 @@ pub async fn metrics(
 ///
 /// The thinning below bounds the response, not the scan behind it: `hours=2160`
 /// returns 320 rows after reading every probe result the node has retained. At a
-/// month of retention that is 224 ms holding the single write connection the
-/// agents report through, growing with `retention_days`.
+/// month of retention that is 224 ms holding a pooled read connection, growing
+/// with `retention_days`.
 ///
 /// The public ceiling is a week because that is the widest chart the themes
 /// draw, so nothing in use is lost. The panel retains the quarter year, being
@@ -350,9 +352,10 @@ fn readable(app: &App, full: bool, id: i64) -> bool {
 pub const SOCKET_BUFFER: usize = 4 * 1024;
 
 /// Largest frame either socket accepts, matching the 64 KiB cap on the HTTP
-/// body. That limit is a tower layer and never applies here, where the default
-/// ceiling is 64 MiB -- reachable with a node's own token, for content that is
-/// stored and then served to every viewer of the public page.
+/// body. That limit is a tower layer and never applies here, where the library's
+/// default ceiling is 64 MiB -- reachable with a node's own token, for content
+/// that is then held in the hub's memory and sent in every frame the panel
+/// streams.
 pub const MAX_FRAME: usize = 64 * 1024;
 
 /// How long one rendered snapshot is reused. Just under the push interval, so
@@ -1235,9 +1238,9 @@ fn scratch_path(app: &App, kind: &str) -> String {
 ///
 /// Off the runtime, like the three routes below: `stats` counts every row of
 /// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
-/// index scan -- holding the connection the agents report through throughout. At
-/// 2.2M rows that is 127 ms during which the public page and every agent report
-/// also wait, growing with `retention_days`.
+/// index scan -- holding a pooled read connection throughout. At 2.2M rows that
+/// is 127 ms during which whatever is assigned that connection waits, growing
+/// with `retention_days`.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
     match tokio::task::spawn_blocking(move || app.db.stats()).await {
         Ok(Ok(stats)) => Json(stats).into_response(),
@@ -1808,6 +1811,12 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
             if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) =>
         {
             Some("retention days must be a number from 1 to 3650".into())
+        }
+        // Read as on unless it is exactly "off", so a value that is neither
+        // would be stored, read back as a setting that was made, and leave the
+        // status page public for whoever meant to close it.
+        "public_page" if !matches!(value, "on" | "off") => {
+            Some("public_page must be on or off".into())
         }
         "auto_join_ping" if !matches!(value, "on" | "off") => {
             Some("auto join must be on or off".into())
@@ -2971,8 +2980,8 @@ mod tests {
     }
 
     /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
-    /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials -- the same arrangement
+    /// concurrently. Each holds a pooled read connection for its entire scan,
+    /// and the path takes no credentials -- the same arrangement
     /// `RELAY_GATE` and `PASSWORD_GATE` enforce on the other two anonymous paths
     /// that make this process work hard.
     #[tokio::test]
@@ -3025,6 +3034,16 @@ mod tests {
         let refused = save(json!({"public_page": false})).await;
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(app.db.get("public_page"), None);
+
+        // And a switch carrying a value that is neither of its two. The public
+        // page reads as on for anything but "off", so "maybe" stored here would
+        // answer "is the status page public" with yes while looking like a
+        // setting that had been made.
+        let refused = save(json!({"public_page": "maybe", "retention_metrics_days": "9"})).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.get("public_page"), None);
+        assert_eq!(app.db.get("retention_metrics_days"), None, "nothing from the rejected write was stored");
+        assert!(app.public_page(), "a hub that never stored the switch keeps its default");
 
         let saved = save(json!({"public_page": "off", "retention_metrics_days": "7"})).await;
         assert_eq!(saved.status(), StatusCode::OK);
