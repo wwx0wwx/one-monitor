@@ -109,9 +109,10 @@ test("requestTimeoutMs: the database's own requests get the time the database ta
   expect(requestTimeoutMs("/api/db/restore")).toBe(5 * 60_000)
   // A restore piece carries its offset in the query; that is still the route.
   expect(requestTimeoutMs("/api/db/restore?offset=4194304&total=9000000&force=true")).toBe(5 * 60_000)
-  // The other database routes are bounded work, or report differently.
-  expect(requestTimeoutMs("/api/db")).toBe(15_000)
-  expect(requestTimeoutMs("/api/db/vacuum")).toBe(15_000)
+  // The data page counts every history row, and reclaiming space rebuilds the
+  // whole file: both grow with the database in the same way.
+  expect(requestTimeoutMs("/api/db")).toBe(5 * 60_000)
+  expect(requestTimeoutMs("/api/db/vacuum")).toBe(5 * 60_000)
 })
 
 test("the hub's named refusal arrives with its name and its message, not as raw JSON", async () => {

@@ -152,19 +152,20 @@ export class ApiError extends Error {
 const REQUEST_TIMEOUT_MS = 15_000
 
 /**
- * The limit for the two requests whose answer is a whole database's worth of
- * work. Exporting a backup copies the file and hashes every row in it;
- * importing one verifies all of that before the first page is copied. Both
- * grow with the database, and past a few million history rows each took
- * longer than the ordinary limit on a small machine -- the hub was well and
- * the work was being done, and the panel reported a timeout. Five minutes
- * covers the largest file the hub restores (256 MiB) there, and still puts an
- * end to a hub that has stopped answering.
+ * The limit for the requests whose answer is a whole database's worth of work.
+ * Exporting a backup copies the file and hashes every row in it; importing one
+ * verifies all of that before the first page is copied; the data page counts
+ * the history; reclaiming space rebuilds the file. All grow with the database,
+ * and past a few million history rows each took longer than the ordinary limit
+ * on a small machine -- the hub was well and the work was being done, and the
+ * panel reported a timeout. Five minutes covers the largest file the hub
+ * restores (256 MiB) there, and still puts an end to a hub that has stopped
+ * answering.
  */
 const DATABASE_TIMEOUT_MS = 5 * 60_000
 
 /** Request paths (as `fetch` sees them) answered after reading the whole database. */
-const DATABASE_ROUTES = ["/api/db/backup", "/api/db/restore"]
+const DATABASE_ROUTES = ["/api/db", "/api/db/backup", "/api/db/restore", "/api/db/vacuum"]
 
 /**
  * How long `path` may take to answer: the ordinary limit, or the database's
