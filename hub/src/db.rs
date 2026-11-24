@@ -172,6 +172,15 @@ CREATE TABLE IF NOT EXISTS session (
 /// database already in service.
 const SCHEMA_VERSION: i64 = 7;
 
+/// The earlier of two timestamps, either of which may stand for no row at all.
+fn earliest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
 fn add_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
@@ -1278,14 +1287,63 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Drops history beyond each retention window. Traffic totals live in their
-    /// own table precisely so history can be pruned freely.
+    /// History is keyed by node first, so each statement names its node and the
+    /// plan is a seek on the primary key. A cutoff on `ts` alone can only be a
+    /// scan of the whole table, on the one connection every report writes
+    /// through: measured at 46 s over 20 million rows, against 5 ms this way.
+    const PRUNE_METRIC: &str = "DELETE FROM metric WHERE node_id = ?1 AND ts < ?2";
+    const PRUNE_PING: &str = "DELETE FROM ping_record WHERE node_id = ?1 AND ts < ?2";
+
+    /// A node's first history row, by the same seek.
+    const OLDEST_METRIC: &str = "SELECT ts FROM metric WHERE node_id = ?1 ORDER BY ts LIMIT 1";
+    const OLDEST_PING: &str = "SELECT ts FROM ping_record WHERE node_id = ?1 ORDER BY ts LIMIT 1";
+
+    /// Every node's id, in order. The history tables are keyed by node first, so
+    /// whatever spans the history goes node by node rather than by a scan of it.
+    fn node_ids(&self, conn: &Connection) -> Result<Vec<i64>> {
+        let mut stmt = conn.prepare("SELECT id FROM node ORDER BY id")?;
+        let ids = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Where the history begins: the earliest row over both pruned tables. What
+    /// the data page holds against the retention window, so it has to be the
+    /// truth over every node -- by one seek per node and table, not by a scan.
+    fn oldest_history(&self, conn: &Connection) -> Result<Option<i64>> {
+        let mut metric = conn.prepare(Self::OLDEST_METRIC)?;
+        let mut ping = conn.prepare(Self::OLDEST_PING)?;
+        let mut oldest = None;
+        for id in self.node_ids(conn)? {
+            let first = |stmt: &mut rusqlite::Statement<'_>| -> Result<Option<i64>> {
+                Ok(stmt.query_row([id], |r| r.get(0)).optional()?)
+            };
+            oldest = earliest(oldest, first(&mut metric)?);
+            oldest = earliest(oldest, first(&mut ping)?);
+        }
+        Ok(oldest)
+    }
+
+    /// Drops history beyond each retention window. Traffic totals live in their own
+    /// table precisely so history can be pruned freely.
+    ///
+    /// Node by node, each statement a seek (`PRUNE_METRIC`, `PRUNE_PING`). A
+    /// node's metrics go with the node (`ON DELETE CASCADE`, foreign keys on),
+    /// so every metric has its node among the ids. `ping_record` has no foreign
+    /// key, and `delete_node` clears it with the node. The count is what the two
+    /// statements removed.
     pub fn prune(&self, keep_metrics: i64, keep_ping: i64) -> Result<usize> {
         let now = Utc::now().timestamp();
         let conn = self.conn();
-        let a = conn.execute("DELETE FROM metric WHERE ts < ?1", [now - keep_metrics * 86_400])?;
-        let b = conn.execute("DELETE FROM ping_record WHERE ts < ?1", [now - keep_ping * 86_400])?;
-        Ok(a + b)
+        let ids = self.node_ids(&conn)?;
+        let (cut_metrics, cut_ping) = (now - keep_metrics * 86_400, now - keep_ping * 86_400);
+        let mut metric = conn.prepare(Self::PRUNE_METRIC)?;
+        let mut ping = conn.prepare(Self::PRUNE_PING)?;
+        let mut removed = 0;
+        for id in ids {
+            removed += metric.execute(params![id, cut_metrics])?;
+            removed += ping.execute(params![id, cut_ping])?;
+        }
+        Ok(removed)
     }
 
     // ---- ping ----
@@ -1600,12 +1658,11 @@ impl Db {
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         // Pruned at different cutoffs now, so the earlier of the two marks where
-        // history begins. A full scan of each, which the counts below incur.
-        let oldest: Option<i64> = conn.query_row(
-            "SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM metric UNION ALL SELECT MIN(ts) FROM ping_record)",
-            [],
-            |r| r.get(0),
-        )?;
+        // history begins. Node by node, each a seek: over the whole table it
+        // would be a scan of all of it, as the counts below are -- the one thing
+        // on this page that has to read every row, and the reason the panel
+        // gives this request the database's own time.
+        let oldest = self.oldest_history(&conn)?;
         let mut rows = serde_json::Map::new();
         for table in TABLES {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
@@ -2316,6 +2373,16 @@ mod tests {
         db.insert_ping(id, task, now - 9 * 86_400, 12).unwrap();
         assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400);
 
+        // Another node with older metrics, and a third with no history at all:
+        // the earliest row anywhere wins, whichever node and table it is on.
+        let late = node(&db, 1);
+        let _bare = node(&db, 1);
+        db.insert_metric(late, now - 12 * 86_400, &serde_json::json!({"cpu": 1.0})).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], now - 12 * 86_400);
+
+        db.prune(10, 10).unwrap();
+        assert_eq!(db.stats().unwrap()["oldest"], now - 9 * 86_400, "what pruning leaves is what is dated");
+
         db.set("retention_metrics_days", "9999").unwrap();
         assert_eq!(db.stats().unwrap()["retention"], 3_650, "a stored window is still clamped");
     }
@@ -2749,6 +2816,114 @@ mod tests {
         db.prune(30, 30).unwrap();
         assert_eq!(db.metrics(id, 0, 60).unwrap().len(), 1);
         assert_eq!(db.all_traffic()[&id].total_rx, 800);
+    }
+
+    /// Old and new history for two nodes in both pruned tables, and a node with
+    /// none. Built afresh each call, so two spellings of one deletion can run
+    /// over the same rows.
+    fn history_fixture() -> (Db, [i64; 3], i64) {
+        let db = db();
+        let now = Utc::now().timestamp();
+        let nodes = [node(&db, 1), node(&db, 1), node(&db, 1)];
+        let task = db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![nodes[0], nodes[1]],
+            })
+            .unwrap();
+        // One node has a row on either side of a five-day cutoff in both tables,
+        // one has only what the cutoff takes, one has no history at all.
+        for (id, stamps) in [
+            (nodes[0], [now - 10 * 86_400, now - 86_400]),
+            (nodes[1], [now - 10 * 86_400, now - 40 * 86_400]),
+        ] {
+            for ts in stamps {
+                db.insert_metric(id, ts, &serde_json::json!({"cpu": 1.0})).unwrap();
+                db.insert_ping(id, task, ts, 12).unwrap();
+            }
+        }
+        (db, nodes, now)
+    }
+
+    fn history_left(db: &Db, table: &str) -> Vec<(i64, i64)> {
+        db.conn()
+            .prepare(&format!("SELECT node_id, ts FROM {table} ORDER BY node_id, ts"))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// Node by node, pruning takes what a cutoff on time alone took: the same
+    /// rows gone, the same rows left, in both tables, and the same count. Only
+    /// the spelling changed, for the sake of the plan.
+    #[test]
+    fn prune_node_by_node_takes_what_a_cutoff_on_time_alone_took() {
+        let (fixed, nodes, _) = history_fixture();
+        let (reference, _, now) = history_fixture();
+
+        let removed = fixed.prune(5, 5).unwrap();
+        let cutoff = now - 5 * 86_400;
+        let by_scan = {
+            // One guard, let go before `history_left` asks for the connection:
+            // the mutex around it is not reentrant.
+            let scanned = reference.conn();
+            scanned.execute("DELETE FROM metric WHERE ts < ?1", [cutoff]).unwrap()
+                + scanned.execute("DELETE FROM ping_record WHERE ts < ?1", [cutoff]).unwrap()
+        };
+        assert_eq!(removed, by_scan, "as many rows removed");
+        for table in ["metric", "ping_record"] {
+            assert_eq!(history_left(&fixed, table), history_left(&reference, table), "{table}");
+        }
+        assert_eq!(
+            history_left(&fixed, "metric"),
+            vec![(nodes[0], now - 86_400)],
+            "only the first node's recent row"
+        );
+        assert_eq!(history_left(&fixed, "ping_record"), vec![(nodes[0], now - 86_400)]);
+        assert_eq!(fixed.prune(5, 5).unwrap(), 0, "nothing is left to take");
+    }
+
+    /// Why node by node: history is keyed `(node_id, ts)`, so a cutoff on `ts`
+    /// alone can only read every row -- on the connection every report writes
+    /// through, 46 s over 20 million rows where the seeks take 5 ms. A schema
+    /// change that turned any of these back into a scan would bring that back
+    /// without a test going red, unless this one does.
+    #[test]
+    fn pruning_and_dating_the_history_seek_each_nodes_rows_instead_of_scanning() {
+        let db = db();
+        let plan = |sql: &str| -> Vec<String> {
+            // Asked for, not run -- and SQLite still counts the parameters.
+            let holes = sql.matches('?').count();
+            db.conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(std::iter::repeat_n(0_i64, holes)), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for sql in [Db::PRUNE_METRIC, Db::PRUNE_PING, Db::OLDEST_METRIC, Db::OLDEST_PING] {
+            let lines = plan(sql);
+            assert!(
+                lines.iter().any(|l| l.contains("SEARCH") && l.contains("PRIMARY KEY")),
+                "{sql}: {lines:?}"
+            );
+            assert!(
+                lines.iter().all(|l| !l.contains("SCAN") && !l.contains("TEMP B-TREE")),
+                "{sql}: {lines:?}"
+            );
+        }
+        // The spelling each replaces, for the record.
+        for sql in ["DELETE FROM metric WHERE ts < ?1", "DELETE FROM ping_record WHERE ts < ?1"] {
+            assert!(plan(sql).iter().any(|l| l.contains("SCAN")), "{sql}");
+        }
     }
 
     /// The rekeying in `open()`: rows must survive it, and the chart's query must
