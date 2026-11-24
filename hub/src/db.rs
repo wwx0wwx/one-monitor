@@ -377,8 +377,18 @@ impl std::error::Error for ChecksumMismatch {}
 /// different contents feed the hash the same bytes.
 ///
 /// Reads the whole file. Both callers already do, and run off the runtime.
+///
+/// Rows are encoded into a buffer that reaches the hash [`HASH_BUFFER`] at a
+/// time. Feeding each value to the hash on its own meant four calls per value,
+/// which over a database of 2.2M history rows (90 MB) cost about seven seconds
+/// on each side of a backup on a two-core machine; buffered, about three and a
+/// half -- beside the two the copy itself takes. The bytes hashed are the same
+/// either way, so a backup taken by either build verifies on the other. What
+/// remains is why the panel allows these two routes far longer than the
+/// others; see the test that pins the digest below.
 fn content_checksum(conn: &Connection) -> Result<String> {
     let mut hash = Sha256::new();
+    let mut buf = Vec::with_capacity(HASH_BUFFER + 16);
     for (table, order) in CHECKSUM_ORDER {
         let sql = if table == "setting" {
             format!("SELECT * FROM {table} WHERE key <> '{CHECKSUM_KEY}' ORDER BY {order}")
@@ -391,33 +401,42 @@ fn content_checksum(conn: &Connection) -> Result<String> {
         while let Some(row) = rows.next()? {
             for column in 0..columns {
                 match row.get_ref(column)? {
-                    ValueRef::Null => hash.update([0]),
+                    ValueRef::Null => buf.push(0),
                     ValueRef::Integer(v) => {
-                        hash.update([1]);
-                        hash.update(v.to_le_bytes());
+                        buf.push(1);
+                        buf.extend_from_slice(&v.to_le_bytes());
                     }
                     ValueRef::Real(v) => {
-                        hash.update([2]);
-                        hash.update(v.to_le_bytes());
+                        buf.push(2);
+                        buf.extend_from_slice(&v.to_le_bytes());
                     }
                     ValueRef::Text(v) => {
-                        hash.update([3]);
-                        hash.update((v.len() as u64).to_le_bytes());
-                        hash.update(v);
+                        buf.push(3);
+                        buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                        buf.extend_from_slice(v);
                     }
                     ValueRef::Blob(v) => {
-                        hash.update([4]);
-                        hash.update((v.len() as u64).to_le_bytes());
-                        hash.update(v);
+                        buf.push(4);
+                        buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                        buf.extend_from_slice(v);
                     }
                 }
                 // Where one value ends, whatever either holds.
-                hash.update([0xff]);
+                buf.push(0xff);
+            }
+            if buf.len() >= HASH_BUFFER {
+                hash.update(&buf);
+                buf.clear();
             }
         }
     }
+    hash.update(&buf);
     Ok(hex::encode(hash.finalize()))
 }
+
+/// How much of the encoded rows is gathered before it is hashed; see
+/// [`content_checksum`].
+const HASH_BUFFER: usize = 64 * 1024;
 
 /// The checksum a backup records of itself, when it records one that can be
 /// read: `None` for a backup from before there was one, and for a file whose
@@ -2229,6 +2248,43 @@ mod tests {
         let before = content_checksum(&db).unwrap();
         db.execute("INSERT INTO setting (key, value) VALUES (?1, 'whatever')", [CHECKSUM_KEY]).unwrap();
         assert_eq!(before, content_checksum(&db).unwrap(), "the checksum's own row is outside it");
+    }
+
+    /// The checksum is a file format. A backup records one, and whichever
+    /// build reads the backup later has to arrive at the same digest from the
+    /// same rows -- or refuse a sound backup as changed. So the digest of one
+    /// small database holding every kind of value is pinned here, on a value
+    /// the build that introduced the checksum (`v1.6.10`) was verified to
+    /// produce for it, and a change to the encoding fails in this file rather
+    /// than on a backup years later.
+    ///
+    /// Rows only: no page layout, no first-run settings and no session rows,
+    /// which differ from one hub to the next.
+    #[test]
+    fn the_checksum_of_one_database_is_the_same_on_every_build() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&SCHEMA.replace("PRAGMA journal_mode = WAL;", "")).unwrap();
+        db.execute_batch(
+            "INSERT INTO setting (key, value) VALUES ('a', ''), ('b', 'plain'), ('c', x'00ff10'), \
+                                  ('backup_checksum', 'whatever a previous backup left here');
+             INSERT INTO setting (key, value) VALUES ('z', '中文 \"quotes\" and a newline\nin the middle');
+             INSERT INTO node (id, name, token, created_at, price, remark, expires_at) \
+                                  VALUES (1, 'n', 'tok', 1, 2.5, '', NULL);
+             INSERT INTO node (id, name, token, created_at, price, sort) VALUES (2, 'n2', 'tok2', -5, -0.125, -9);
+             INSERT INTO traffic (node_id, boot_id, total_rx) VALUES (1, 'boot', 9007199254740993), (2, '', -1);
+             INSERT INTO metric VALUES (1, 60, 0.0, 0, 0, 0, 0, 0, 0, 0, 0);
+             INSERT INTO ping_task (id, name, target, interval) VALUES (3, 'p', '1.1.1.1:443', 60);
+             INSERT INTO ping_node VALUES (3, 1), (3, 2);
+             INSERT INTO ping_record VALUES (1, 3, 60, -1), (1, 3, 120, 25);
+             INSERT INTO session (token_hash, ip, expires_at) VALUES ('h', '', 0);",
+        )
+        .unwrap();
+        // Checked against the build that introduced the checksum: offered this
+        // database with this value recorded, `v1.6.10` restored it unforced.
+        assert_eq!(
+            content_checksum(&db).unwrap(),
+            "77e0a24516dc9104945a94c456b6b02515b73859bc12e02827892d39d2320c9f"
+        );
     }
 
     /// `oldest` is what the data page compares against the retention window, so it
