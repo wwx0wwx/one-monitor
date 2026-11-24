@@ -10,7 +10,9 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, useNodes, type Node } from "@/lib/api"
 import { parseThemeSettings } from "@/lib/display"
+import { appliedFilter } from "@/lib/filter"
 import { daysUntil } from "@/lib/format"
+import { chosenDark, THEME_CHOICE } from "@/lib/theme"
 
 type Me = {
   authed: boolean
@@ -54,32 +56,24 @@ function useNodeRoute() {
 }
 
 function useTheme() {
-  const readSaved = () => {
-    // localStorage throws in private modes and embedded WebViews with storage
-    // blocked -- an unreadable preference degrades to following the system
-    // rather than a SecurityError that takes the whole page down with it.
+  // localStorage throws in private modes and embedded WebViews with storage
+  // blocked -- an unreadable preference degrades to following the system
+  // rather than a SecurityError that takes the whole page down with it.
+  const readChoice = () => {
     try {
-      return localStorage.getItem("theme")
+      return chosenDark(localStorage.getItem(THEME_CHOICE))
     } catch {
       return null
     }
   }
-  // "System mode" is the absence of an explicit choice: no stored theme yet.
-  // The first manual toggle ends it, exactly as before -- only now the page
-  // also says so, so the live following below can be switched off.
-  const [followSystem, setFollowSystem] = useState(() => readSaved() === null)
-  const [dark, setDark] = useState(() => {
-    const saved = readSaved()
-    return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
-  })
+  // "System mode" is the absence of an explicit choice: nothing stored. The
+  // page tracks the scheme live while in it (below), and it ends at the first
+  // manual toggle -- the only thing that ever writes a choice, see
+  // `THEME_CHOICE`.
+  const [followSystem, setFollowSystem] = useState(() => readChoice() === null)
+  const [dark, setDark] = useState(() => readChoice() ?? matchMedia("(prefers-color-scheme: dark)").matches)
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    try {
-      localStorage.setItem("theme", dark ? "dark" : "light")
-    } catch {
-      // The choice lives for this session only; that is the graceful outcome,
-      // not an error worth surfacing.
-    }
   }, [dark])
   // In system mode the page tracks the scheme live: it can flip while the tab
   // is open (sunset schedules, a keyboard dark-mode key), and a value read
@@ -99,7 +93,21 @@ function useTheme() {
   useEffect(() => {
     document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#0a0a0a" : "#ffffff")
   }, [dark])
-  return [dark, () => { setFollowSystem(false); setDark((d) => !d) }] as const
+  return [dark, () => {
+    const next = !dark
+    // The toggle is the choice, and the only place one is stored. A page
+    // that saved the scheme it happened to open in pinned every visitor to
+    // their first visit's scheme, and following the system lasted exactly
+    // that one visit.
+    try {
+      localStorage.setItem(THEME_CHOICE, next ? "dark" : "light")
+    } catch {
+      // The choice lives for this session only; that is the graceful outcome,
+      // not an error worth surfacing.
+    }
+    setFollowSystem(false)
+    setDark(next)
+  }] as const
 }
 
 export default function App() {
@@ -176,19 +184,22 @@ export default function App() {
   const selected = sorted.find((n) => n.id === open)
   // The group filter is a dimension the operator files servers under; the list
   // stays flat otherwise, as it always was.
-  const [group, setGroup] = useState(() => new URLSearchParams(location.search).get("group") ?? "")
+  //
   // The filter is part of the address: a shared link opens on the same slice.
+  // What the address asks for is kept as asked; whether it names a slice --
+  // any -- is decided once the pills are known, below.
+  const [requested, setRequested] = useState(() => new URLSearchParams(location.search).get("group") ?? "")
   // replaceState rather than push, so Back still leaves the site instead of
   // unwinding every filter tried on the way.
   const pick = (next: string) => {
-    setGroup(next)
+    setRequested(next)
     const url = new URL(location.href)
     if (next) url.searchParams.set("group", next)
     else url.searchParams.delete("group")
     history.replaceState({}, "", url)
   }
   useEffect(() => {
-    const sync = () => setGroup(new URLSearchParams(location.search).get("group") ?? "")
+    const sync = () => setRequested(new URLSearchParams(location.search).get("group") ?? "")
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
@@ -219,13 +230,6 @@ export default function App() {
   const regions = [...new Set(sorted.map((n) => n.country).filter(Boolean))]
     .filter((r) => !groups.includes(r))
     .sort()
-  const inGroup = (n: Node) =>
-    group === EXPIRING
-      ? expiring.some((e) => e.id === n.id)
-      : groups.includes(group)
-        ? n.group === group
-        : n.country === group
-  const shown = group ? sorted.filter(inGroup) : sorted
   const count = (name: string) => sorted.filter((n) => (name === EXPIRING ? expiring.some((e) => e.id === n.id) : groups.includes(name) ? n.group === name : n.country === name)).length
   // The pills stay thumb-sized on a phone (44px is the smallest a finger hits
   // without missing) and drop back to their compact height from sm up, so the
@@ -284,6 +288,23 @@ export default function App() {
 
   // What this page shows, as the operator set it from the hub.
   const ts = parseThemeSettings(me.theme)
+
+  // The pills on offer, each of which is a filter: a group, a region while
+  // region grouping is on, the expiring one while it is on and something
+  // expires. The filter applied is what the address asked for if it is one of
+  // them, and none otherwise -- see `appliedFilter`.
+  const offered = (name: string) =>
+    name === EXPIRING
+      ? ts.display.expiring && expiring.length > 0
+      : groups.includes(name) || (ts.display.region && regions.includes(name))
+  const group = appliedFilter(requested, offered)
+  const inGroup = (n: Node) =>
+    group === EXPIRING
+      ? expiring.some((e) => e.id === n.id)
+      : groups.includes(group)
+        ? n.group === group
+        : n.country === group
+  const shown = group ? sorted.filter(inGroup) : sorted
 
   return (
     <div className="min-h-svh">
