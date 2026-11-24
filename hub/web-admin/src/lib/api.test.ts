@@ -1,5 +1,5 @@
 import { expect, test } from "vitest"
-import { addresses, ApiError, changes, GIB, lastChunkOffset, provisioningSite, restoreOutcome, trafficCorrection, upload } from "./api.ts"
+import { addresses, ApiError, changes, GIB, lastChunkOffset, provisioningSite, restoreOutcome, trafficCorrection, upload, uploadPath } from "./api.ts"
 
 test("changes reports only the keys whose value actually moved", () => {
   expect(changes({ public: true, price: 5 }, { price: 20 })).toEqual({ price: 20 })
@@ -61,6 +61,14 @@ test("lastChunkOffset names the piece the hub applies an upload on", () => {
   expect(lastChunkOffset(3 * 4 * MiB)).toBe(2 * 4 * MiB)
 })
 
+test("uploadPath: the piece's address, with whatever query the route was given", () => {
+  expect(uploadPath("/db/restore", 0, 9)).toBe("/api/db/restore?offset=0&total=9")
+  // The operator's answer to a backup that failed its checksum rides along,
+  // spelled the way the hub's query string reads as true: `force=1` is refused
+  // before any handler runs.
+  expect(uploadPath("/db/restore?force=true", 4 * 1024 * 1024, 9)).toBe("/api/db/restore?force=true&offset=4194304&total=9")
+})
+
 test("restoreOutcome: what to say when a restore stops before the page reloads", () => {
   const refused = new ApiError(400, "the file is a damaged database")
   // The hub's own verdict is passed on whenever its answer arrived.
@@ -81,6 +89,39 @@ test("restoreOutcome: what to say when a restore stops before the page reloads",
     expect(outcome.text).not.toContain("没有改动")
     expect(outcome.text).toContain("可能已经完成")
   }
+  // The hub's refusal to replace the database with a backup that fails its own
+  // checksum is not a verdict but a question for the operator, and is told
+  // apart by the name the hub gives it.
+  const changed = new ApiError(409, "the backup's contents do not match the checksum it was taken with", "checksum_mismatch")
+  expect(restoreOutcome(false, changed)).toEqual({ tone: "mismatch", text: changed.message })
+  // A 409 from anywhere else -- a proxy's -- is only a failure.
+  expect(restoreOutcome(false, new ApiError(409, "Conflict"))).toEqual({ tone: "error", text: "Conflict" })
+})
+
+test("the hub's named refusal arrives with its name and its message, not as raw JSON", async () => {
+  const message = "the backup's contents do not match the checksum it was taken with"
+  const answered = async () => new Response(JSON.stringify({ error: "checksum_mismatch", message }), { status: 409 })
+  const caught: unknown = await upload("/db/restore", file, undefined, undefined, answered, nowait).catch((e: unknown) => e)
+  expect(caught).toBeInstanceOf(ApiError)
+  expect(caught).toMatchObject({ status: 409, code: "checksum_mismatch", message })
+  expect(restoreOutcome(false, caught)).toEqual({ tone: "mismatch", text: message })
+})
+
+test("every other refusal stays the text it arrived as", async () => {
+  // The hub's own, in plain text.
+  const plain = async () => new Response("the file is not a hub backup: no node table", { status: 400 })
+  await expect(upload("/db/restore", file, undefined, undefined, plain, nowait)).rejects.toMatchObject({
+    status: 400,
+    code: undefined,
+    message: "the file is not a hub backup: no node table",
+  })
+  // A proxy's, with no body at all: HTTP/2 dropped the reason phrase, so
+  // the number is all there is to show.
+  const wordless = async () => new Response("", { status: 502 })
+  await expect(upload("/db/restore", file, undefined, undefined, wordless, nowait)).rejects.toMatchObject({
+    status: 502,
+    message: "HTTP 502",
+  })
 })
 
 test("both kinds of transient fault are ridden out to one completed upload", async () => {

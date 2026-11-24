@@ -17,7 +17,7 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, trust_cf_ip,
     trust_private_xff, trusted_proxies, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{ChecksumMismatch, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -1148,6 +1148,12 @@ static THEME_UPLOAD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::On
 pub struct Chunk {
     offset: u64,
     total: u64,
+    /// Restore only, and read on the last piece: go ahead although the backup
+    /// fails the checksum it was taken with, the operator having confirmed it
+    /// in the panel. Spelled `force=true` in the query string -- the one
+    /// spelling a query string reads as true. See `db_restore`.
+    #[serde(default)]
+    force: bool,
 }
 
 /// Appends one piece to `path`, returning the file's length afterwards; the
@@ -1352,9 +1358,9 @@ pub async fn db_restore(
     // that must follow it happens; the cookie below is the only part that needs
     // a live caller, and a caller that left has no use for a cookie.
     let restoring = {
-        let (app, source) = (app.clone(), source.clone());
+        let (app, source, force) = (app.clone(), source.clone(), chunk.force);
         tokio::spawn(async move {
-            let outcome = restore(&app, &source).await;
+            let outcome = restore(&app, &source, force).await;
             // SQLite writes a -wal and a -shm beside any file it opens in WAL
             // mode, and a plain copy of a running hub's database is exactly
             // that. They are removed when the connection closes cleanly; these
@@ -1395,17 +1401,38 @@ pub async fn db_restore(
             };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
+        // The one refusal the operator may overrule. Answered as its own
+        // status with its own name, so that the panel can tell it from a
+        // damaged or foreign file and ask rather than report: nothing has been
+        // copied, the upload is gone, and the same file uploaded again with
+        // `force` is restored. The confirmation is a second full upload on
+        // purpose -- the operator sees the warning before anything replaces
+        // the database, not after.
+        Err(e) if !chunk.force && e.root_cause().downcast_ref::<ChecksumMismatch>().is_some() => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "checksum_mismatch",
+                "message": format!("{e:#}"),
+            })),
+        )
+            .into_response(),
         Err(e) => bad(&format!("{e:#}")),
     }
 }
 
-async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
+/// `insist` is the operator's answer to a backup that fails the checksum it
+/// was taken with, once the panel has shown it; see `Chunk::force`.
+async fn restore(app: &Shared, path: &str, insist: bool) -> Result<(), anyhow::Error> {
     // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
     // on a 256 MiB upload is not runtime work, and the copy that follows holds
     // the connection the agents write through.
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
-        app.db.check_backup(&source)?;
+        if insist {
+            app.db.check_backup_insisting(&source)?;
+        } else {
+            app.db.check_backup(&source)?;
+        }
         app.db.restore_from(&source)
     })
     .await?
@@ -2252,7 +2279,7 @@ mod tests {
     async fn a_chunk_continues_an_upload_only_where_the_last_one_ended() {
         let path = std::env::temp_dir().join(format!("monitor-chunk-{}", std::process::id()));
         let path = path.to_str().unwrap();
-        let piece = |offset, total| Chunk { offset, total };
+        let piece = |offset, total| Chunk { offset, total, force: false };
         let body = |bytes: &'static [u8]| axum::body::Body::from(bytes);
 
         // Two pieces in order, with the length indicating where the next begins.
@@ -2276,6 +2303,14 @@ mod tests {
         assert_eq!(receive(path, &piece(0, 2), 1024, body(b"hi")).await.unwrap(), 2);
         assert_eq!(std::fs::read(path).unwrap(), b"hi");
         std::fs::remove_file(path).unwrap();
+
+        // How the query string spells the one flag: absent is false, and the
+        // panel's answer is the word `true`. Pinned because a query string is
+        // stricter than a struct literal -- `force=1`, the natural shorthand,
+        // is refused before any handler runs, which nothing that builds the
+        // struct directly would show.
+        assert!(!serde_urlencoded::from_str::<Chunk>("offset=0&total=6").unwrap().force);
+        assert!(serde_urlencoded::from_str::<Chunk>("offset=0&total=6&force=true").unwrap().force);
     }
 
     /// Both scratch names a restore uses sit beside the live database, and one left
@@ -2304,7 +2339,7 @@ mod tests {
             Admin,
             State(app.clone()),
             test_peer(),
-            Query(Chunk { offset: 0, total: bytes.len() as u64 }),
+            Query(Chunk { offset: 0, total: bytes.len() as u64, force: false }),
             HeaderMap::new(),
             axum::body::Body::from(bytes),
         )
@@ -2319,6 +2354,69 @@ mod tests {
             .filter(|name| !matches!(name.as_str(), "live.db" | "live.db-wal" | "live.db-shm"))
             .collect();
         assert!(left.is_empty(), "left beside the database: {left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A backup that fails the checksum it was taken with is not restored on
+    /// the strength of the upload alone: the request has to come back saying
+    /// the operator has seen the warning. Until then the live database is left
+    /// exactly as it was, sessions included.
+    #[tokio::test]
+    async fn a_changed_backup_is_restored_only_once_the_operator_insists() {
+        let dir = std::env::temp_dir().join(format!("monitor-restore-changed-{}", &random_token()[..16]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+        node(&app, "backed-up", true);
+
+        let copy = format!("{live}.copy");
+        app.db.backup_into(&copy).unwrap();
+        // A value changed in place after the copy was taken. Still a healthy
+        // SQLite file, so nothing but the checksum can tell.
+        let edited = rusqlite::Connection::open(&copy).unwrap();
+        edited.execute("UPDATE node SET name = 'renamed since' WHERE id = 1", []).unwrap();
+        drop(edited);
+        let bytes = std::fs::read(&copy).unwrap();
+        std::fs::remove_file(&copy).unwrap();
+
+        // What a restore would take away, to see whether it did.
+        node(&app, "added-after", true);
+        let session = random_token();
+        app.db.create_session(&sha256(&session), Utc::now().timestamp() + 3_600, "").unwrap();
+
+        let upload = |force, bytes: Vec<u8>| {
+            let app = app.clone();
+            async move {
+                db_restore(
+                    Admin,
+                    State(app),
+                    test_peer(),
+                    Query(Chunk { offset: 0, total: bytes.len() as u64, force }),
+                    HeaderMap::new(),
+                    axum::body::Body::from(bytes),
+                )
+                .await
+            }
+        };
+
+        let refused = upload(false, bytes.clone()).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["error"], "checksum_mismatch", "{answer}");
+        assert!(answer["message"].as_str().is_some_and(|m| !m.is_empty()), "{answer}");
+        assert_eq!(
+            app.db.nodes().unwrap().len(),
+            2,
+            "nothing was copied: the node added after the backup is still there"
+        );
+        assert!(app.db.session_valid(&sha256(&session)), "and no session was dropped");
+
+        // The same file, with the operator's answer.
+        let done = upload(true, bytes).await;
+        assert_eq!(done.status(), StatusCode::OK);
+        let names: Vec<String> = app.db.nodes().unwrap().into_iter().map(|n| n.name).collect();
+        assert_eq!(names, ["renamed since"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

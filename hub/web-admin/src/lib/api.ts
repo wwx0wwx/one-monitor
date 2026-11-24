@@ -136,9 +136,15 @@ export function provisioningSite(site: string): string {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /**
+   * A name the hub gives a refusal when a sentence is not enough for the panel
+   * to act on, as with the restore route's 409. Absent for every other answer.
+   */
+  code?: string
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.status = status
+    this.code = code
   }
 }
 
@@ -219,6 +225,36 @@ export async function download(path: string): Promise<Response> {
 const CHUNK = 4 * 1024 * 1024
 
 /**
+ * Where one piece of an upload is sent. `path` may already carry a query of
+ * its own, as the restore route's answer to a failed checksum does.
+ */
+export function uploadPath(path: string, offset: number, size: number): string {
+  return `/api${path}${path.includes("?") ? "&" : "?"}offset=${offset}&total=${size}`
+}
+
+/**
+ * What a refusal said, for the error thrown on it. The hub answers 4xx in plain
+ * text -- or, where the panel has to act on more than a sentence, as JSON
+ * naming the refusal; the restore route's 409 is the one so far.
+ */
+function refusal(status: number, body: string): ApiError {
+  if (status === 413) {
+    // Never reached the hub: the proxy in front answered, and only its own
+    // logs record it. The message names the setting responsible.
+    return new ApiError(status, "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m")
+  }
+  try {
+    const named = JSON.parse(body) as { error?: unknown; message?: unknown }
+    if (typeof named.error === "string" && typeof named.message === "string") {
+      return new ApiError(status, named.message, named.error)
+    }
+  } catch {
+    // Plain text, as nearly every refusal is.
+  }
+  return new ApiError(status, body || `HTTP ${status}`)
+}
+
+/**
  * Uploads a file one chunk at a time. There is no upload id: the hub tracks an
  * upload by the length of what it has already written, so a chunk states only
  * where it begins. The last one carries the result.
@@ -244,7 +280,7 @@ export async function upload<T>(
   // schedule, and a no-op sleep keeps the backoff from adding seconds to the
   // suite. No caller passes them.
   post: (offset: number) => Promise<Response> = (offset) =>
-    request(`/api${path}?offset=${offset}&total=${file.size}`, {
+    request(uploadPath(path, offset, file.size), {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
@@ -272,15 +308,8 @@ export async function upload<T>(
             continue
           }
         }
-        // Exhausted retries, or a 4xx the same bytes cannot fix. A 413 never
-        // reached the hub: the proxy in front answered, and only its own logs
-        // record it. The message names the setting responsible.
-        throw new ApiError(
-          res.status,
-          res.status === 413
-            ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-            : (await res.text()) || res.statusText || `HTTP ${res.status}`,
-        )
+        // Exhausted retries, or a 4xx the same bytes cannot fix.
+        throw refusal(res.status, await res.text())
       } catch (e) {
         // Abort is the operator's choice, not a fault to retry -- and the
         // request timeout arrives here under the same name; the ApiError above
@@ -309,20 +338,31 @@ export function lastChunkOffset(size: number): number {
 }
 
 /**
- * What to say when a restore upload ends without the page reloading: the one
- * upload whose answer can go missing after the hub has already acted on it.
+ * What to do when a restore upload ends without the page reloading.
  *
- * Up to the last piece nothing is applied, so an abort or a timeout there
- * really did leave the database alone. The last piece is different: the hub
- * applies a complete upload whether or not this tab is still listening, and
- * its response is the only thing that says which way it went. Without that
- * response the outcome is unknown and is reported as unknown -- "cancelled,
- * nothing changed" about a database that has just been replaced is the one
- * wrong answer here. A response that did arrive is the hub's own verdict, and
- * is passed on as it stands.
+ * `"mismatch"`: the hub refused to replace the database with a backup that
+ * fails the checksum it was taken with, and copied nothing. That refusal is
+ * the operator's to overrule, so it is not a message to show and forget --
+ * the dialog stays and asks; the same file is then uploaded again with the
+ * answer (`force=true` -- the one spelling a query string reads as true).
+ *
+ * `"info"` / `"error"`: the one upload whose answer can go missing after the
+ * hub has already acted on it. Up to the last piece nothing is applied, so an
+ * abort or a timeout there really did leave the database alone. The last piece
+ * is different: the hub applies a complete upload whether or not this tab is
+ * still listening, and its response is the only thing that says which way it
+ * went. Without that response the outcome is unknown and is reported as
+ * unknown -- "cancelled, nothing changed" about a database that has just been
+ * replaced is the one wrong answer here. A response that did arrive is the
+ * hub's own verdict, and is passed on as it stands.
  */
-export function restoreOutcome(lastPieceSent: boolean, e: unknown): { tone: "error" | "info"; text: string } {
-  if (e instanceof ApiError) return { tone: "error", text: e.message }
+export function restoreOutcome(
+  lastPieceSent: boolean,
+  e: unknown,
+): { tone: "error" | "info" | "mismatch"; text: string } {
+  if (e instanceof ApiError) {
+    return e.code === "checksum_mismatch" ? { tone: "mismatch", text: e.message } : { tone: "error", text: e.message }
+  }
   if (lastPieceSent) {
     return { tone: "info", text: "没能确认恢复结果：备份已发完，恢复可能已经完成。请刷新页面确认；若被登出，重新登录即可" }
   }

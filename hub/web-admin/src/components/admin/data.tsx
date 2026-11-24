@@ -42,6 +42,10 @@ export function Data() {
   // The last piece has been sent: the hub applies the backup as soon as it
   // lands, so from here on there is no "cancel", only waiting for the answer.
   const [restoring, setRestoring] = useState(false)
+  // The hub refused the last upload because the backup fails the checksum it was
+  // taken with, and copied nothing. Holds what it said, and keeps the dialog
+  // open asking whether to restore the file regardless.
+  const [mismatch, setMismatch] = useState<string | null>(null)
   // Closing the dialog must stop the upload rather than merely hide it: restore
   // is the one irreversible action here, and it takes minutes on a large
   // backup.
@@ -101,10 +105,13 @@ export function Data() {
     }
   }
 
-  async function restore(file: File) {
+  // `insist` is the operator's answer to a backup that failed its own
+  // checksum: the hub then restores that same file without holding it to one.
+  async function restore(file: File, insist = false) {
     setBusy("restore")
     setSent(0)
     setRestoring(false)
+    setMismatch(null)
     abort.current = new AbortController()
     // The last piece is the one the hub applies the backup on. From the moment
     // it is sent, what this tab does next decides nothing -- a close or a
@@ -121,9 +128,11 @@ export function Data() {
     }
     // A backup that fits in one piece is applied by its very first request.
     if (lastAt === 0) finalPiece()
+    // Whether the dialog stays open afterwards to ask about the checksum.
+    let askAgain = false
     try {
       await upload(
-        "/db/restore",
+        insist ? "/db/restore?force=true" : "/db/restore",
         file,
         (n) => {
           setSent(n)
@@ -144,11 +153,24 @@ export function Data() {
       // the original database in place. From the last piece on, only the hub's
       // answer says what happened -- and without one, nothing here can.
       const outcome = restoreOutcome(finalSent, e)
-      if (outcome.tone === "info") toast.info(outcome.text)
+      // The hub found the backup changed since it was taken and copied
+      // nothing. Not the hub's decision to make for good: the file may be the
+      // only copy there is. So the dialog stays, says what was found, and
+      // offers to send the same file again with the answer. It takes the place
+      // of a toast: a warning that scrolls away would leave a refused restore
+      // looking like a failure.
+      askAgain = outcome.tone === "mismatch"
+      if (askAgain) {
+        setMismatch(outcome.text)
+        // Nothing is in progress any more -- the hub refused and stopped --
+        // so the dialog can be closed again, which it could not while the
+        // answer to the upload was still awaited.
+        setRestoring(false)
+      } else if (outcome.tone === "info") toast.info(outcome.text)
       else toast.error(outcome.text)
       setBusy("")
     }
-    setPending(null)
+    if (!askAgain) setPending(null)
   }
 
   // The page's own three states: loading, error with a retry, the data. A
@@ -291,9 +313,15 @@ export function Data() {
       )}
       {pending && (
         <ConfirmDialog
-          title="用备份覆盖当前数据？"
-          description={`将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`}
-          confirmLabel={busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : "确认恢复"}
+          title={mismatch ? "备份文件对不上它自带的校验值，仍要恢复？" : "用备份覆盖当前数据？"}
+          description={
+            mismatch
+              ? `这个备份在导出时记下了自己内容的校验值，和现在的内容对不上：文件在导出之后变过——存放时损坏，或者被改动。刚才没有恢复任何东西。仍然恢复，就会把这份可能有错的数据覆盖到当前数据库上，且无法撤销；如果还有别的备份，建议换一份。 hub 的原话：${mismatch}`
+              : `将用 ${pending.name}（${bytes(pending.size)}）整体替换当前数据库。当前的服务器、设置和历史全部丢失，且无法撤销。`
+          }
+          confirmLabel={
+            busy === "restore" ? `已上传 ${bytes(sent)} / ${bytes(pending.size)}` : mismatch ? "仍然恢复" : "确认恢复"
+          }
           // While earlier pieces are still going up, cancelling stays possible
           // the dialog's own way (Esc / clicking outside, which runs onClose);
           // once the last piece has been sent the cancel button says so and stops.
@@ -303,8 +331,9 @@ export function Data() {
             if (restoring) return
             abort.current?.abort()
             setPending(null)
+            setMismatch(null)
           }}
-          onConfirm={() => restore(pending)}
+          onConfirm={() => restore(pending, mismatch !== null)}
         />
       )}
     </div>

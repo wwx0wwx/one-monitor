@@ -10,8 +10,10 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate, Utc};
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 /// A string an agent reported, cut down to what may be shown. Control
@@ -318,6 +320,117 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
 /// Every table a backup must carry before this build will restore it.
 const TABLES: [&str; 8] =
     ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+
+/// The row a backup carries with a checksum of its own contents, kept in
+/// `setting` because that is the one table every backup has had since the
+/// first schema.
+///
+/// `PRAGMA integrity_check` reads a file's structure: pages linked as they
+/// declare, indexes agreeing with their rows. A value changed in place leaves
+/// all of that intact -- one bit flipped on the disk a backup was kept on, a
+/// row edited with the sqlite3 shell -- and a restore went ahead and replaced
+/// the live database with it. This is the other half: every row of every table,
+/// hashed, and the hash stored beside the rows it describes. Written into the
+/// copy at backup; held to at restore, before a page is copied; never kept in
+/// the live database. A backup from a build before this one carries none, and
+/// is taken on its structure alone, as it always was.
+pub const CHECKSUM_KEY: &str = "backup_checksum";
+
+/// Every table [`content_checksum`] reads, with the order its rows are read
+/// in: the primary key, so that the reading at backup and the reading at
+/// restore walk the rows the same way however the pages are laid out. The same
+/// eight tables as [`TABLES`]; a test holds the two together.
+const CHECKSUM_ORDER: [(&str, &str); TABLES.len()] = [
+    ("setting", "key"),
+    ("node", "id"),
+    ("traffic", "node_id"),
+    ("metric", "node_id, ts"),
+    ("ping_task", "id"),
+    ("ping_node", "task_id, node_id"),
+    ("ping_record", "node_id, ts, task_id"),
+    ("session", "token_hash"),
+];
+
+/// A backup whose rows no longer hash to the checksum it was taken with.
+///
+/// A type of its own so that the panel can tell this refusal from every other:
+/// it is the one the operator may overrule -- a damaged file can still be the
+/// only copy there is -- where a file that is not a hub database at all is not
+/// something to be talked out of.
+#[derive(Debug)]
+pub struct ChecksumMismatch;
+
+impl std::fmt::Display for ChecksumMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the backup's contents do not match the checksum it was taken with: \
+             the file has changed since it was made -- a damaged copy, or an edited one"
+        )
+    }
+}
+
+impl std::error::Error for ChecksumMismatch {}
+
+/// sha256 of every row of every table but [`CHECKSUM_KEY`] itself, each value
+/// tagged by its type and length and followed by a separator, so that no two
+/// different contents feed the hash the same bytes.
+///
+/// Reads the whole file. Both callers already do, and run off the runtime.
+fn content_checksum(conn: &Connection) -> Result<String> {
+    let mut hash = Sha256::new();
+    for (table, order) in CHECKSUM_ORDER {
+        let sql = if table == "setting" {
+            format!("SELECT * FROM {table} WHERE key <> '{CHECKSUM_KEY}' ORDER BY {order}")
+        } else {
+            format!("SELECT * FROM {table} ORDER BY {order}")
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let columns = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            for column in 0..columns {
+                match row.get_ref(column)? {
+                    ValueRef::Null => hash.update([0]),
+                    ValueRef::Integer(v) => {
+                        hash.update([1]);
+                        hash.update(v.to_le_bytes());
+                    }
+                    ValueRef::Real(v) => {
+                        hash.update([2]);
+                        hash.update(v.to_le_bytes());
+                    }
+                    ValueRef::Text(v) => {
+                        hash.update([3]);
+                        hash.update((v.len() as u64).to_le_bytes());
+                        hash.update(v);
+                    }
+                    ValueRef::Blob(v) => {
+                        hash.update([4]);
+                        hash.update((v.len() as u64).to_le_bytes());
+                        hash.update(v);
+                    }
+                }
+                // Where one value ends, whatever either holds.
+                hash.update([0xff]);
+            }
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// The checksum a backup records of itself, when it records one that can be
+/// read: `None` for a backup from before there was one, and for a file whose
+/// `setting` table has no `value` column to read it from. That is not a hub
+/// backup, which the schema comparison in `examine_backup` refuses while naming
+/// what it lacks -- rather than this lookup failing first on a missing column.
+fn recorded_checksum(conn: &Connection) -> Result<Option<String>> {
+    let columns = columns_of(conn, "setting")?;
+    if !columns.contains("key") || !columns.contains("value") {
+        return Ok(None);
+    }
+    Ok(conn.query_row("SELECT value FROM setting WHERE key=?1", [CHECKSUM_KEY], |r| r.get(0)).optional()?)
+}
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1508,6 +1621,21 @@ impl Db {
         let reader = Connection::open(self.file())?;
         reader.busy_timeout(std::time::Duration::from_secs(5))?;
         reader.execute("VACUUM INTO ?1", [dest])?;
+        // The copy records a checksum of its own contents, which `check_backup`
+        // holds it to at restore; see `CHECKSUM_KEY`. Computed over the copy
+        // and not the live file, so the hash describes exactly the rows being
+        // handed out, and written into the copy alone: the live database never
+        // carries it, and each backup computes its own. The copy `VACUUM INTO`
+        // writes is in rollback mode, so this leaves a single file behind --
+        // no -wal beside it for the download to miss.
+        let copy = Connection::open(dest)?;
+        copy.busy_timeout(std::time::Duration::from_secs(5))?;
+        let checksum = content_checksum(&copy)?;
+        copy.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![CHECKSUM_KEY, checksum],
+        )?;
         // The copy is the credential store in one portable file: node tokens in
         // the clear, the GitHub secret, the password hash. SQLite creates it
         // under the umask, which at the usual 022 is world-readable.
@@ -1548,6 +1676,17 @@ impl Db {
     /// while the live database is still untouched. The caller owns that file and
     /// deletes it in either case.
     pub fn check_backup(&self, src: &str) -> Result<()> {
+        self.examine_backup(src, false)
+    }
+
+    /// [`Db::check_backup`] for an operator who has seen the backup fail the
+    /// checksum it was taken with and asked for the restore regardless. That
+    /// one gate stands open; every other in it still shuts.
+    pub fn check_backup_insisting(&self, src: &str) -> Result<()> {
+        self.examine_backup(src, true)
+    }
+
+    fn examine_backup(&self, src: &str, insist: bool) -> Result<()> {
         // Read-write rather than read-only: a plain copy of a running hub's
         // database is in WAL mode, and SQLite cannot open such a file read-only
         // without its -shm companion.
@@ -1592,6 +1731,20 @@ impl Db {
         let ours: i64 = self.conn().query_row("PRAGMA page_size", [], |r| r.get(0))?;
         if theirs != ours {
             anyhow::bail!("the backup uses a {theirs}-byte page, this database uses {ours}");
+        }
+        // Read and checked before the migrations below touch an older file:
+        // the checksum describes the file as it was taken, which is the file
+        // the operator is holding. A backup that carries none is from a build
+        // before there was one, and the rest of this function is its whole
+        // examination. A reading of the file that fails is likewise left to
+        // the gates below, which name what is wrong with it; only a reading
+        // that succeeds and disagrees is this refusal.
+        if !insist {
+            if let Some(recorded) = recorded_checksum(&candidate)? {
+                if content_checksum(&candidate).is_ok_and(|computed| computed != recorded) {
+                    return Err(anyhow::Error::new(ChecksumMismatch));
+                }
+            }
         }
         // Brought up to this build's schema here, on the upload. Run after the
         // copy instead, a failed migration would leave the hub on a database it
@@ -1658,6 +1811,12 @@ impl Db {
                 )?;
             }
         }
+        // What the copy said about itself stopped being true of this database
+        // at the first write after the copy, and nothing here reads it: each
+        // backup computes its own. Removed so that a plain file copy of this
+        // database -- taken outside the panel, never checksummed -- is not
+        // refused as changed when it is restored.
+        conn.execute("DELETE FROM setting WHERE key=?1", [CHECKSUM_KEY])?;
         Ok(())
     }
 
@@ -1958,6 +2117,118 @@ mod tests {
 
         newer.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).unwrap();
         db.check_backup(&bad).unwrap();
+    }
+
+    /// `PRAGMA integrity_check` reads structure, and a value changed in place
+    /// leaves the structure intact: a backup whose contents had changed after
+    /// it was taken used to restore as readily as a sound one, replacing the
+    /// live database with a file nobody had vouched for. The backup now
+    /// carries a checksum of its own rows.
+    #[test]
+    fn a_backup_whose_contents_changed_after_it_was_taken_is_told_apart() {
+        let scratch = Scratch::new();
+        let copy = format!("{}.copy", scratch.0);
+        let db = Db::open(&scratch.0).unwrap();
+        let id = node(&db, 1);
+        db.backup_into(&copy).unwrap();
+
+        // The copy records it, and it is a checksum of the copy's own rows.
+        let taken = Connection::open(&copy).unwrap();
+        let recorded: String =
+            taken.query_row("SELECT value FROM setting WHERE key=?1", [CHECKSUM_KEY], |r| r.get(0)).unwrap();
+        assert_eq!(recorded.len(), 64, "a sha256, in hex");
+        assert_eq!(recorded, content_checksum(&taken).unwrap());
+        // Only the copy carries it.
+        assert_eq!(db.get(CHECKSUM_KEY), None, "the live database does not");
+        drop(taken);
+        db.check_backup(&copy).unwrap();
+
+        // A value changed in place: a healthy file by every structural measure,
+        // which is the case the checksum exists for.
+        let edited = Connection::open(&copy).unwrap();
+        edited.execute("UPDATE node SET remark = 'edited after the backup' WHERE id = ?1", [id]).unwrap();
+        let health: String = edited.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(health, "ok", "and that is why structure alone could not tell");
+        let refused = db.check_backup(&copy).unwrap_err();
+        assert!(
+            refused.root_cause().downcast_ref::<ChecksumMismatch>().is_some(),
+            "refused for this reason, and so as the panel can tell: {refused:#}"
+        );
+        // A row added afterwards is a change like any other.
+        edited
+            .execute("INSERT INTO session (token_hash, ip, expires_at) VALUES ('added', '', 0)", [])
+            .unwrap();
+        assert!(
+            db.check_backup(&copy).unwrap_err().root_cause().downcast_ref::<ChecksumMismatch>().is_some(),
+            "a row added after the backup"
+        );
+        // The operator's answer opens this one gate and no other: the file is
+        // examined like any other, then restored as it is.
+        db.check_backup_insisting(&copy).unwrap();
+        drop(edited);
+
+        // The recorded value itself tampered with.
+        let _ = std::fs::remove_file(&copy);
+        db.backup_into(&copy).unwrap();
+        let tampered = Connection::open(&copy).unwrap();
+        tampered
+            .execute("UPDATE setting SET value = 'not the checksum' WHERE key = ?1", [CHECKSUM_KEY])
+            .unwrap();
+        drop(tampered);
+        assert!(db
+            .check_backup(&copy)
+            .unwrap_err()
+            .root_cause()
+            .downcast_ref::<ChecksumMismatch>()
+            .is_some());
+
+        // A backup from a build before the checksum existed carries none, and
+        // is examined as it always was: on its structure.
+        let _ = std::fs::remove_file(&copy);
+        db.backup_into(&copy).unwrap();
+        let older = Connection::open(&copy).unwrap();
+        older
+            .execute_batch(&format!(
+                "DELETE FROM setting WHERE key = '{CHECKSUM_KEY}';
+                 UPDATE node SET remark = 'changed, with nothing to compare against'"
+            ))
+            .unwrap();
+        drop(older);
+        db.check_backup(&copy).unwrap();
+
+        // Once restored, the copy's claim about itself is not kept: this
+        // database moves on from its first write, and each backup hashes its
+        // own rows.
+        let _ = std::fs::remove_file(&copy);
+        db.backup_into(&copy).unwrap();
+        db.check_backup(&copy).unwrap();
+        db.restore_from(&copy).unwrap();
+        assert_eq!(db.get(CHECKSUM_KEY), None, "not carried into the live database");
+        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// The checksum reads every table a backup carries -- one left out would be
+    /// a table whose changes go unnoticed -- and follows the rows and nothing
+    /// else.
+    #[test]
+    fn the_checksum_reads_every_table_a_backup_carries_and_follows_its_rows() {
+        let mut read: Vec<&str> = CHECKSUM_ORDER.iter().map(|(table, _)| *table).collect();
+        read.sort_unstable();
+        let mut carried = TABLES.to_vec();
+        carried.sort_unstable();
+        assert_eq!(read, carried);
+
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&SCHEMA.replace("PRAGMA journal_mode = WAL;", "")).unwrap();
+        let empty = content_checksum(&db).unwrap();
+        db.execute("INSERT INTO node (name, token, created_at) VALUES ('n', 'tok', 1)", []).unwrap();
+        let with_node = content_checksum(&db).unwrap();
+        assert_ne!(empty, with_node, "a row added is seen");
+        db.execute("UPDATE node SET remark = 'changed'", []).unwrap();
+        assert_ne!(with_node, content_checksum(&db).unwrap(), "and so is a value changed in place");
+        let before = content_checksum(&db).unwrap();
+        db.execute("INSERT INTO setting (key, value) VALUES (?1, 'whatever')", [CHECKSUM_KEY]).unwrap();
+        assert_eq!(before, content_checksum(&db).unwrap(), "the checksum's own row is outside it");
     }
 
     /// `oldest` is what the data page compares against the retention window, so it
