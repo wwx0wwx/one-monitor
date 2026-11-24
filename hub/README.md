@@ -81,7 +81,7 @@ agent 装在节点的 `/opt/monitor/monitor-agent`，token 写在 0600 的 `/opt
 （以 [Releases](https://github.com/wwx0wwx/one-monitor/releases) 里 `theme-komari-likely-v*` 的最新 tag 为准）：
 
 ```text
-https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.9/theme.tar.gz
+https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.10/theme.tar.gz
 ```
 
 也可以纯命令行（CI / AI 助手场景），四条依次执行：
@@ -90,7 +90,7 @@ https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.
 curl -s -c cj -H 'content-type: application/json' \
   -d '{"password":"<管理员密码>"}' https://hub.example.com/api/auth/login
 curl -fSL -o theme.tar.gz \
-  https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.9/theme.tar.gz
+  https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.10/theme.tar.gz
 size=$(stat -c%s theme.tar.gz)
 curl -s -b cj -X POST --data-binary @theme.tar.gz \
   "https://hub.example.com/api/themes?offset=0&total=$size"
@@ -110,7 +110,7 @@ curl -s -b cj -X PUT -H 'content-type: application/json' \
 
 ```bash
 docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.6.9
+  ghcr.io/wwx0wwx/one-monitor:1.6.10
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
@@ -122,11 +122,24 @@ docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.6.9 --yes     # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.6.10 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
 agent 升级：在每台节点上重跑安装命令，见[「添加节点」](#3-添加节点agent)。
+
+## 流量怎么算
+
+- **累计流量**只记 hub 亲眼看着网卡计数器涨上去的那部分。节点重启（`boot_id` 变了）或计数器回落时，
+  以新读数重新对齐：不重复计，也不倒扣。
+- **今日流量**和**本周期流量**从跨过边界后的第一次上报开始计，那次上报的增量就是新周期的起点数字。
+  「今天」按 hub 所在机器的时区算（容器镜像默认 UTC，所以容器里的「今日」在 UTC 零点清零）；
+  周期的起点日期由每台服务器自己的流量清零日决定。
+- **节点离线（或 hub 停机）期间跨过了清零时刻**：节点重新上报时，距离它上一次上报的增量全部计入新周期。
+  这是有意的取舍：hub 无从知道这段流量有多少发生在清零之前，宁可多报，也不因为少报而漏掉流量告警。
+  节点正常在线时每秒上报一次，误差只有约一秒的流量；离线期间节点若重启过，`boot_id` 变了，这段增量不计。
+- agent 上报的是内核网卡的累计字节数；常见的容器网卡、网桥、VLAN 子接口、隧道按名单排除，
+  以免同一段流量被记两遍。请在宿主机上运行 agent，见 [agent 的 README](../agent/README.md)。
 
 ## 卸载与数据
 
@@ -136,6 +149,9 @@ sudo sh install-hub.sh --purge       # 连数据库一起删，不可撤销
 ```
 
 日常备份：后台「数据」页下载备份（导入也是这里），或直接拷 `/opt/monitor/data/monitor.db`（hub 在线时建议用前者）。
+
+从 v1.6.10 起，面板导出的备份自带一份内容校验值。导入时如果文件内容和导出时对不上——存放时损坏了，或者被改动过——
+hub 会先拦下并说明情况，不碰现有数据，由你决定是否「仍然恢复」。更早版本导出的备份没有校验值，导入时只检查文件结构。
 
 ## 反向代理
 
