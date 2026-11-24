@@ -151,6 +151,30 @@ export class ApiError extends Error {
 /** One request may not hang forever. */
 const REQUEST_TIMEOUT_MS = 15_000
 
+/**
+ * The limit for the two requests whose answer is a whole database's worth of
+ * work. Exporting a backup copies the file and hashes every row in it;
+ * importing one verifies all of that before the first page is copied. Both
+ * grow with the database, and past a few million history rows each took
+ * longer than the ordinary limit on a small machine -- the hub was well and
+ * the work was being done, and the panel reported a timeout. Five minutes
+ * covers the largest file the hub restores (256 MiB) there, and still puts an
+ * end to a hub that has stopped answering.
+ */
+const DATABASE_TIMEOUT_MS = 5 * 60_000
+
+/** Request paths (as `fetch` sees them) answered after reading the whole database. */
+const DATABASE_ROUTES = ["/api/db/backup", "/api/db/restore"]
+
+/**
+ * How long `path` may take to answer: the ordinary limit, or the database's
+ * for the routes in `DATABASE_ROUTES`. The query is not part of the comparison
+ * -- a restore piece carries its offset there.
+ */
+export function requestTimeoutMs(path: string): number {
+  return DATABASE_ROUTES.includes(path.split("?")[0]) ? DATABASE_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+}
+
 /** The message `request` aborts with when that time is up. Read by name and message by the one caller that tells a timeout from a cancel. */
 const TIMED_OUT = "请求超时"
 
@@ -165,7 +189,7 @@ const TIMED_OUT = "请求超时"
  */
 async function request(path: string, init: RequestInit): Promise<Response> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(new DOMException(TIMED_OUT, "AbortError")), REQUEST_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(new DOMException(TIMED_OUT, "AbortError")), requestTimeoutMs(path))
   const caller = init.signal
   const forward = () => controller.abort(caller?.reason)
   if (caller) {
