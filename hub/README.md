@@ -110,7 +110,7 @@ curl -s -b cj -X PUT -H 'content-type: application/json' \
 
 ```bash
 docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.6.11
+  ghcr.io/wwx0wwx/one-monitor:1.6.12
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
@@ -122,7 +122,7 @@ docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.6.11 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.6.12 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
@@ -153,8 +153,9 @@ sudo sh install-hub.sh --purge       # 连数据库一起删，不可撤销
 从 v1.6.10 起，面板导出的备份自带一份内容校验值。导入时如果文件内容和导出时对不上——存放时损坏了，或者被改动过——
 hub 会先拦下并说明情况，不碰现有数据，由你决定是否「仍然恢复」。更早版本导出的备份没有校验值，导入时只检查文件结构。
 
-算这个校验值要把全部数据读一遍，所以库越大，导出和导入越慢：两百万行历史（约 90 MB）在这上面各多花几秒。
-面板给这两个操作留的时间比其它操作长得多，库大时耐心等一下即可，不是卡住了。
+面板「数据」页的几个操作——导出、导入、回收空间，以及页面本身要数的行数——都要把全部数据读一遍，
+其中导出的备份还多一道校验值，所以库越大越慢：两百万行历史（约 90 MB）时各多花几秒。
+面板给这几个请求留的时间比其它操作长得多（5 分钟），库大时耐心等一下即可，不是卡住了。
 
 ## 反向代理
 
