@@ -635,11 +635,19 @@ pub fn trusted_proxies_valid(value: &str) -> bool {
         .all(|entry| Net::parse(entry).is_some())
 }
 
-/// Whether the panel trusts a private-network peer's X-Forwarded-For; on by
-/// default, preserving container deployments, and read per request like
-/// `trust_cf_ip` for the same reason.
+/// Whether the panel trusts a private-network peer's X-Forwarded-For. Off
+/// until the operator turns it on, and read per request like `trust_cf_ip` for
+/// the same reason.
+///
+/// It used to be on unless switched off, for the deployments that need it: a hub
+/// in a container, fronted by a proxy in another on the same bridge. It is also
+/// the trust a hub reachable from a private network must not hand out unasked,
+/// and the default deployment -- the installer's, a proxy on the same host --
+/// never needed it, loopback being trusted on its own. A database from before
+/// this has the trust written out as the "on" it was living by at startup; see
+/// `keep_private_proxy_trust`.
 pub fn trust_private_xff(app: &App) -> bool {
-    app.db.get("trust_private_xff").as_deref() != Some("off")
+    app.db.get("trust_private_xff").as_deref() == Some("on")
 }
 
 #[cfg(test)]

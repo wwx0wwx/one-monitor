@@ -392,6 +392,9 @@ fn invalidate_snapshot(app: &App) {
     for slot in app.snapshot.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         slot.0 = 0;
     }
+    // The site's facts with them: a setting just saved is on the page now, not
+    // up to a second from now.
+    app.facts.lock().unwrap_or_else(|e| e.into_inner()).0 = 0;
 }
 
 /// What one tick of a browser stream may send: the admin frame while the session
@@ -605,11 +608,24 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// An expiry date as the panel's date field sends it -- a calendar day,
+/// `YYYY-MM-DD` -- or nothing at all for a machine that does not expire. The
+/// readers all parse the day; anything else they skip, which left a node
+/// looking permanent, with no reminder and no roll-forward, because of a slip
+/// in one field sent by hand.
+fn expiry_error(expires: Option<&str>) -> Option<&'static str> {
+    (expires.is_some_and(|date| date.parse::<chrono::NaiveDate>().is_err()))
+        .then_some("expiry date must be a day, YYYY-MM-DD, or empty for none")
+}
+
 /// The display settings a theme may read anonymously, defaulted: a key the
 /// operator never touched reads as the page the theme ships with, so an older
 /// theme meeting a newer hub simply never looks at what it does not know.
-fn theme_display(app: &App) -> Value {
-    let get = |key: &str, fallback: &str| app.db.get(key).unwrap_or_else(|| fallback.to_owned());
+///
+/// Of the settings as they stand, read in one query: there are over twenty of
+/// these, and one row at a time made them one database round trip each.
+fn theme_display(settings: &std::collections::HashMap<String, String>) -> Value {
+    let get = |key: &str, fallback: &str| settings.get(key).cloned().unwrap_or_else(|| fallback.to_owned());
     json!({
         "bg_enabled": get("bg_enabled", "off"),
         "bg_desktop": get("bg_desktop", ""),
@@ -635,28 +651,80 @@ fn theme_display(app: &App) -> Value {
         "ip_capsule": get("ip_capsule", "off"),
         "expiring_group": get("expiring_group", "on"),
         "region_group": get("region_group", "on"),
+        // On by default, as the page has always been: the theme asks jsDelivr
+        // for its flag pictures, and jsDelivr and open.er-api.com for the day's
+        // exchange table. A site that would rather not have its visitors talked
+        // to switches them off.
+        "flags_cdn": get("flags_cdn", "on"),
+        "fx_api": get("fx_api", "on"),
     })
 }
 
+/// How long the site's facts are read once for.
+const FACTS_TTL_MS: i64 = 1_000;
+
+/// The part of `/api/me` that is the same for whoever asks: what the site is
+/// called, and how its status page is to look.
+///
+/// Read from the database at most this often, however many visitors arrive. The
+/// public page asks for it on every load, anonymous and unthrottled, and at one
+/// query per setting it was the dearest thing a caller who was nobody could ask
+/// for -- a run of refreshes held a pooled connection for most of its time. A
+/// second is short enough that a setting saved in the panel is on the page by
+/// the time the operator looks, and `invalidate_snapshot` drops it at once
+/// where that is not soon enough. The lock is held through the read on purpose:
+/// a burst then costs one read, and the rest wait the few milliseconds it takes.
+fn site_facts(app: &App) -> Value {
+    let now = Utc::now().timestamp_millis();
+    let mut cache = app.facts.lock().unwrap_or_else(|e| e.into_inner());
+    if !(0..FACTS_TTL_MS).contains(&(now.saturating_sub(cache.0))) {
+        let settings = app.db.all_settings().unwrap_or_default();
+        *cache = (
+            now,
+            json!({
+                "site_name": settings.get("site_name").cloned().unwrap_or_else(|| "Monitor".into()),
+                "site_description": settings.get("site_description").cloned().unwrap_or_default(),
+                // What the status page renders is the operator's call, kept here so
+                // every visitor sees the same picture rather than each browser its own.
+                "theme": theme_display(&settings),
+            }),
+        );
+    }
+    cache.1.clone()
+}
+
 pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
-    Json(json!({
-        "authed": authed(&app, &headers),
+    let authed = authed(&app, &headers);
+    let public_page = app.public_page();
+    let mut me = json!({
+        "authed": authed,
         // The sign-in page asks for an authenticator code only when one is bound.
         "totp": crate::auth::totp_bound(&app),
-        "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
-        "site_description": app.db.get("site_description").unwrap_or_default(),
-        "public_page": app.public_page(),
+        "public_page": public_page,
         "can_provision": provisioning_allowed(&app, &headers),
-        // What the status page renders is the operator's call, kept here so
-        // every visitor sees the same picture rather than each browser its own.
-        "theme": theme_display(&app),
+    });
+    // With the status page closed, the site is closed too: its name, its
+    // description, how its page is to look and its public address are the
+    // operator's, and a caller who is nobody gets none of them. The sign-in
+    // page needs no more than it is closed and whether a code is asked for.
+    if authed || public_page {
+        let facts = site_facts(&app);
+        for (key, value) in facts.as_object().into_iter().flatten() {
+            me[key] = value.clone();
+        }
         // The hub's own public URL when one was given, which is what belongs in an
         // install command -- not whichever address this browser used, which
         // behind a proxy may be a loopback port. Empty by default, in which case
         // the browser's address is the only one available and the panel falls
         // back to its own origin.
-        "site": app.site,
-    }))
+        me["site"] = json!(app.site);
+    } else {
+        me["site_name"] = json!("");
+        me["site_description"] = json!("");
+        me["theme"] = json!({});
+        me["site"] = json!("");
+    }
+    Json(me)
 }
 
 pub async fn create_node(
@@ -679,6 +747,9 @@ pub async fn create_node(
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
     {
+        return bad(message);
+    }
+    if let Some(message) = expiry_error(node.expires_at.as_deref()) {
         return bad(message);
     }
     // Names identify a row the operator edits and reinstalls against; two rows
@@ -868,6 +939,9 @@ pub async fn update_node(
         }
     }
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
+        return bad(message);
+    }
+    if let Some(message) = expiry_error(node.expires_at.as_ref().and_then(|v| v.as_deref())) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -1105,6 +1179,8 @@ const READABLE_SETTINGS: &[&str] = &[
     "ip_capsule",
     "expiring_group",
     "region_group",
+    "flags_cdn",
+    "fx_api",
 ];
 
 // ---- the database itself ----
@@ -1948,6 +2024,7 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // ---- what the status page shows: the theme's display settings ----
         "bg_enabled" | "cost_public" | "show_busiest" | "show_swap" | "show_speed" | "show_billing"
         | "ip_capsule" | "expiring_group" | "region_group" | "trust_private_xff"
+        | "flags_cdn" | "fx_api"
             if !matches!(value, "on" | "off") =>
         {
             Some(format!("{key} must be on or off"))
@@ -2059,6 +2136,9 @@ pub async fn save_settings(
             return fail(e);
         }
     }
+    // A display setting saved from the status page is on the page on its next
+    // read: the facts `/api/me` serves are not left a second behind.
+    invalidate_snapshot(&app);
     with_cookies(Json(json!({"ok": true})), [reissued])
 }
 
@@ -2817,6 +2897,9 @@ mod tests {
             json!({"name": "x", "traffic_reset_day": 99}),
             json!({"name": "x", "price": -5.0}),
             json!({"name": "x", "traffic_limit": -1}),
+            // An expiry date is a day or nothing: anything else would have read as a machine that never expires.
+            json!({"name": "x", "expires_at": "soon"}),
+            json!({"name": "x", "expires_at": "2030-02-30"}),
         ] {
             let created = create_node(
                 Admin,
@@ -3540,6 +3623,98 @@ mod tests {
         assert_eq!(with.digest.as_deref(), Some("sha256:ab"));
         for without in [r#"{"name":"theme.tar.gz"}"#, r#"{"name":"theme.tar.gz","digest":null}"#] {
             assert_eq!(serde_json::from_str::<Asset>(without).unwrap().digest, None);
+        }
+    }
+
+    /// With the status page closed, a caller who is nobody learns that it is
+    /// closed and whether a code is asked for -- nothing else: not the site's
+    /// name, its description, how its page is to look, or its public address.
+    #[tokio::test]
+    async fn a_visitor_who_is_nobody_learns_nothing_about_a_site_whose_page_is_closed() {
+        let mut state = app();
+        state.site = "https://monitor.example.com".into();
+        let app = std::sync::Arc::new(state);
+        app.db.set("site_name", "A Private Fleet").unwrap();
+        app.db.set("site_description", "and where it lives").unwrap();
+        app.db.set("public_page", "off").unwrap();
+
+        let closed = me(State(app.clone()), HeaderMap::new()).await.0;
+        assert_eq!(closed["authed"], false);
+        assert_eq!(closed["public_page"], false);
+        for key in ["site_name", "site_description", "site"] {
+            assert_eq!(closed[key], "", "{key} is not told");
+        }
+        assert_eq!(closed["theme"], json!({}), "nor how the page is to look");
+
+        // Signed in, the same request is whole again.
+        let token = random_token();
+        app.db.create_session(&sha256(&token), Utc::now().timestamp() + 3_600, "").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("monitor_session={token}").parse().unwrap());
+        let signed = me(State(app.clone()), headers).await.0;
+        assert_eq!(signed["authed"], true);
+        assert_eq!(signed["site_name"], "A Private Fleet");
+        assert_eq!(signed["site"], "https://monitor.example.com");
+
+        // And for everyone once the page is open.
+        app.db.set("public_page", "on").unwrap();
+        invalidate_snapshot(&app);
+        let open = me(State(app), HeaderMap::new()).await.0;
+        assert_eq!(open["site_name"], "A Private Fleet");
+        assert_eq!(open["site_description"], "and where it lives");
+        assert_eq!(open["site"], "https://monitor.example.com");
+        assert_eq!(open["theme"]["flags_cdn"], "on");
+        assert_eq!(open["theme"]["fx_api"], "on");
+    }
+
+    /// The facts of the site are read once a second, not once a request -- and
+    /// a setting saved in the panel is not left behind by that second.
+    #[tokio::test]
+    async fn the_sites_facts_are_read_once_a_second_and_dropped_when_a_setting_is_saved() {
+        let app = std::sync::Arc::new(app());
+        app.db.set("site_name", "First").unwrap();
+        assert_eq!(me(State(app.clone()), HeaderMap::new()).await.0["site_name"], "First");
+        app.db.set("site_name", "Second").unwrap();
+        assert_eq!(site_facts(&app)["site_name"], "First", "inside the second the read is reused");
+        invalidate_snapshot(&app);
+        assert_eq!(me(State(app), HeaderMap::new()).await.0["site_name"], "Second");
+    }
+
+    /// A day is taken, by either path, and null clears it.
+    #[tokio::test]
+    async fn an_expiry_date_that_is_a_day_is_taken_down_both_paths() {
+        let app = std::sync::Arc::new(app());
+        let made = create_node(
+            Admin,
+            State(app.clone()),
+            domain_headers(),
+            Ok(Json(serde_json::from_value(json!({"name": "x", "expires_at": "2030-01-02"})).unwrap())),
+        )
+        .await;
+        assert_eq!(made.status(), StatusCode::OK);
+        let found = app.db.nodes().unwrap().into_iter().find(|n| n.name == "x").unwrap();
+        assert_eq!(found.expires_at.as_deref(), Some("2030-01-02"));
+        let cleared = update_node(
+            Admin,
+            State(app.clone()),
+            Path(found.id),
+            Ok(Json(serde_json::from_value(json!({"expires_at": null})).unwrap())),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let after = app.db.nodes().unwrap().into_iter().find(|n| n.id == found.id).unwrap();
+        assert_eq!(after.expires_at, None);
+    }
+
+    /// The two requests the theme itself makes can be switched off, and take
+    /// nothing but on or off.
+    #[test]
+    fn the_two_requests_the_theme_makes_take_only_on_or_off() {
+        let app = app();
+        for key in ["flags_cdn", "fx_api"] {
+            assert_eq!(setting_error(&app, key, &json!("on")), None);
+            assert_eq!(setting_error(&app, key, &json!("off")), None);
+            assert!(setting_error(&app, key, &json!("maybe")).is_some(), "{key}");
         }
     }
 }

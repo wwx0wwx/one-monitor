@@ -395,6 +395,24 @@ impl std::error::Error for ChecksumMismatch {}
 /// either way, so a backup taken by either build verifies on the other. What
 /// remains is why the panel allows these two routes far longer than the
 /// others; see the test that pins the digest below.
+/// One value on its way to the hash. Through the buffer while it is small;
+/// from where SQLite holds it, a piece at a time, when it is not. A backup is
+/// a file the operator chose, but a hand-made one may hold a value of any
+/// size, and copying it whole into the buffer first doubled what the hub kept
+/// in memory for it -- against a unit file that allows 256 MiB. The bytes reach
+/// the hash in the same order either way, so the checksum does not move.
+fn feed(hash: &mut Sha256, buf: &mut Vec<u8>, value: &[u8]) {
+    if value.len() <= HASH_BUFFER {
+        buf.extend_from_slice(value);
+        return;
+    }
+    hash.update(&*buf);
+    buf.clear();
+    for piece in value.chunks(HASH_BUFFER) {
+        hash.update(piece);
+    }
+}
+
 fn content_checksum(conn: &Connection) -> Result<String> {
     let mut hash = Sha256::new();
     let mut buf = Vec::with_capacity(HASH_BUFFER + 16);
@@ -422,12 +440,12 @@ fn content_checksum(conn: &Connection) -> Result<String> {
                     ValueRef::Text(v) => {
                         buf.push(3);
                         buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-                        buf.extend_from_slice(v);
+                        feed(&mut hash, &mut buf, v);
                     }
                     ValueRef::Blob(v) => {
                         buf.push(4);
                         buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-                        buf.extend_from_slice(v);
+                        feed(&mut hash, &mut buf, v);
                     }
                 }
                 // Where one value ends, whatever either holds.
@@ -775,6 +793,16 @@ impl Db {
             .optional()
             .ok()
             .flatten()
+    }
+
+    /// Every setting as it stands, by key: for the callers that read most of
+    /// the table at once, where one query beats one per key. Small by design --
+    /// a setting is a word or a link, never a document.
+    pub fn all_settings(&self) -> Result<HashMap<String, String>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare("SELECT key, value FROM setting")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -1877,9 +1905,11 @@ impl Db {
     /// half a database behind.
     ///
     /// Call [`Db::check_backup`] first, as it is what brings `src` to this
-    /// build's schema; the copy is then the last step and nothing after it can
-    /// fail. Like the other two, this reads and writes the whole file and belongs
-    /// off the runtime.
+    /// build's schema. Once the copy has been made the live database is the
+    /// backup's, and this returns `Ok` whatever the small bookkeeping after it
+    /// manages: a `Err` here would tell the caller that nothing was restored.
+    /// Like the other two, this reads and writes the whole file and belongs off
+    /// the runtime.
     pub fn restore_from(&self, src: &str) -> Result<()> {
         let mut conn = self.conn();
         // The ids this database has already issued, read before the backup's
@@ -1891,22 +1921,33 @@ impl Db {
             .map(|&table| Ok((table, Self::issued(&conn, table)?)))
             .collect::<Result<_>>()?;
         conn.restore(rusqlite::MAIN_DB, src, None::<fn(rusqlite::backup::Progress)>)?;
-        for (table, mark) in current {
-            let kept = Self::issued(&conn, table)?.max(mark);
-            if kept != mark {
-                conn.execute(
-                    "INSERT INTO setting (key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![format!("{table}_id_issued"), kept.to_string()],
-                )?;
+        // From here on the live database is the backup's. Whatever the
+        // bookkeeping below does, that is what the caller must hear: reported
+        // as a failure, a restore that had in fact happened left the caller
+        // skipping what must follow one -- old sessions and agents cleared --
+        // and the operator free to try again onto a database already replaced.
+        let bookkeeping = || -> Result<()> {
+            for (table, mark) in current {
+                let kept = Self::issued(&conn, table)?.max(mark);
+                if kept != mark {
+                    conn.execute(
+                        "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![format!("{table}_id_issued"), kept.to_string()],
+                    )?;
+                }
             }
+            // What the copy said about itself stopped being true of this database
+            // at the first write after the copy, and nothing here reads it: each
+            // backup computes its own. Removed so that a plain file copy of this
+            // database -- taken outside the panel, never checksummed -- is not
+            // refused as changed when it is restored.
+            conn.execute("DELETE FROM setting WHERE key=?1", [CHECKSUM_KEY])?;
+            Ok(())
+        };
+        if let Err(e) = bookkeeping() {
+            tracing::warn!("database restored, but the bookkeeping after the copy failed: {e:#}");
         }
-        // What the copy said about itself stopped being true of this database
-        // at the first write after the copy, and nothing here reads it: each
-        // backup computes its own. Removed so that a plain file copy of this
-        // database -- taken outside the panel, never checksummed -- is not
-        // refused as changed when it is restored.
-        conn.execute("DELETE FROM setting WHERE key=?1", [CHECKSUM_KEY])?;
         Ok(())
     }
 
@@ -3163,5 +3204,22 @@ mod tests {
         assert_eq!(mode(), 0o600, "filled in place, so still only the owner's");
         let check = Db::open(":memory:").unwrap();
         check.check_backup(&copy).unwrap();
+    }
+
+    /// A value too large for the buffer reaches the hash by the same bytes as
+    /// one that fits: the checksum may not depend on which path was taken.
+    #[test]
+    fn a_large_value_hashes_the_same_from_where_it_lies() {
+        let big: Vec<u8> = (0..HASH_BUFFER + 7).map(|i| (i % 251) as u8).collect();
+        for value in [&big[..10], &big[..HASH_BUFFER], &big[..]] {
+            let mut buffered = Sha256::new();
+            let mut buf = b"header".to_vec();
+            feed(&mut buffered, &mut buf, value);
+            buffered.update(&buf);
+            let mut direct = Sha256::new();
+            direct.update(b"header");
+            direct.update(value);
+            assert_eq!(buffered.finalize(), direct.finalize(), "a value of {} bytes", value.len());
+        }
     }
 }

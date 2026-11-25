@@ -930,4 +930,20 @@ mod tests {
         // Unknown methods are ignored.
         assert!(dispatch(&app, id, 1, "ip", r#"{"method":"whatever"}"#).is_ok());
     }
+
+    /// A second connection for a node ends the first at once: its outbound
+    /// channel goes with the entry it is replaced by, and `None` from that
+    /// channel is the first connection's way out. Nothing lingers until the
+    /// silence timeout, and a node holds one socket.
+    #[tokio::test]
+    async fn a_replaced_connection_ends_at_once() {
+        let app = app();
+        let id = node(&app);
+        let (first, mut gone) = mpsc::channel(1);
+        app.agents.write().unwrap().insert(id, Agent::new(1, first));
+        let (second, _kept) = mpsc::channel(1);
+        app.agents.write().unwrap().insert(id, Agent::new(2, second));
+        assert!(gone.recv().await.is_none(), "the first connection is told it is over");
+        assert!(current(&app, id, 2));
+    }
 }

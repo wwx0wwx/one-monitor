@@ -45,6 +45,11 @@ pub struct App {
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
     pub snapshot: Mutex<[(i64, axum::extract::ws::Utf8Bytes); 2]>,
+    /// What the site is called and how its status page is to look, with the
+    /// millisecond it was read: once a second at most rather than once per
+    /// request, the public page asking for it on every load. See
+    /// `api::site_facts`.
+    pub facts: Mutex<(i64, serde_json::Value)>,
     pub throttle: auth::Throttle,
     /// Failed agent registrations, counted separately from failed sign-ins: the
     /// two have different threat models, and a batch install run with a stale
@@ -82,6 +87,7 @@ impl App {
             db,
             agents: RwLock::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
+            facts: Mutex::new((0, serde_json::Value::Null)),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
             totp: auth::TotpFailures::default(),
@@ -297,13 +303,13 @@ pub(crate) mod test_support {
     }
 }
 
-/// Where the hub's own binary is published, and at which codename release.
+/// Where the agent binaries are published, and at which codename release. The
 /// repository also publishes the hub and the themes, so "latest" no longer
 /// names an agent release; the codename does, and moving to the next one (pio →
 /// voy → cas → new) means moving this tag in the same change that cuts it. Not
 /// settings: redirecting them implies a fork, which rebuilds these lines anyway.
 const AGENT_REPO: &str = "wwx0wwx/one-monitor";
-const AGENT_TAG: &str = "voy";
+const AGENT_TAG: &str = "cas";
 
 /// The sha256 of every agent binary `AGENT_TAG` published, `<arch> <sha>` per
 /// line, beside `web-theme.pin` and held to the same discipline: the digest is
@@ -402,54 +408,125 @@ impl Drop for Scratch {
     }
 }
 
-/// Removes, from the hub's own three directories, the temporary files an
-/// interrupted operation leaves: an export or an import cut short by a crash or
-/// a kill, a theme archive that never got installed, a GeoIP database that
-/// never finished downloading. Useless once the process that wrote them is
-/// gone, and the first two are the whole credential store in one file.
+/// Removes, from the hub's own three directories, what an interrupted
+/// operation leaves: an export or an import cut short by a crash or a kill, a
+/// theme archive that never got installed, a GeoIP database that never finished
+/// downloading, an upload that was walked out on. Useless once the process that
+/// wrote it is gone, and the export, the import and the upload are a whole
+/// backup in one file.
 ///
-/// Startup is the one moment none can be in flight, which is why this runs
-/// there and only there. Matched by the start and the end of the file name --
-/// the middle is random -- and only for regular files: everything else in these
-/// directories is the operator's. An upload still in progress (`*.upload`) is
-/// the panel's to finish or restart, and stays.
-pub(crate) fn sweep_scratch(app: &App) -> Vec<PathBuf> {
+/// By the names the hub itself gives these, and nowhere but its own three
+/// directories: everything else in them is the operator's.
+///
+/// Called at startup, when nothing can be in flight and `older_than` is zero,
+/// and once an hour with a day, which is what keeps an upload a panel may still
+/// be sending to: those have a fixed name, so a fresh one is in use and a day
+/// old one is an upload nobody is going to finish. The panel takes a vanished
+/// upload in stride -- it starts the transfer over -- and so loses nothing it
+/// would not send again.
+pub(crate) fn sweep_scratch(app: &App, older_than: std::time::Duration) -> Vec<PathBuf> {
+    sweep_scratch_at(app, older_than, std::time::SystemTime::now())
+}
+
+/// [`sweep_scratch`] with the clock passed in, so the tests can let a day pass.
+fn sweep_scratch_at(app: &App, older_than: std::time::Duration, now: std::time::SystemTime) -> Vec<PathBuf> {
     let file = app.db.file();
     let database = std::path::Path::new(&file);
     let (dir, name) = (
         database.parent().map(std::path::Path::to_path_buf),
         database.file_name().map(|n| n.to_string_lossy().into_owned()),
     );
-    let mut removed = Vec::new();
     let ends = |name: &str, suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+    let called = |path: &std::path::Path| {
+        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    let stale = |path: &std::path::Path| aged(path, older_than, now);
+    let mut removed = Vec::new();
     if let (Some(dir), Some(name)) = (dir, name.filter(|n| !n.is_empty())) {
-        let names = ["backup", "restoring"].map(|kind| format!("{name}.{kind}-"));
-        removed.extend(remove_where(&dir, |file| {
-            names.iter().any(|start| file.starts_with(start))
-                && ends(file, &[".tmp", ".tmp-wal", ".tmp-shm", ".tmp-journal"])
+        let scratch = ["backup", "restoring"].map(|kind| format!("{name}.{kind}-"));
+        // What a restore reads: the backup the operator sent, all of it.
+        let upload = format!("{name}.upload");
+        removed.extend(remove_where(&dir, |path| {
+            let file = called(path);
+            path.is_file()
+                && ((scratch.iter().any(|start| file.starts_with(start))
+                    && ends(&file, &[".tmp", ".tmp-wal", ".tmp-shm", ".tmp-journal"]))
+                    || (file == upload && stale(path)))
         }));
     }
-    removed.extend(remove_where(&app.themes, |file| {
-        file.starts_with(".installing-") && ends(file, &[".tar.gz"])
+    // A theme archive between its last piece and its installation; the upload it
+    // came from; and the directory an installation unpacks into, or moves the
+    // theme it replaces aside to, when a kill leaves it there.
+    removed.extend(remove_where(&app.themes, |path| {
+        let file = called(path);
+        (file.starts_with(".installing-") && ends(&file, &[".tar.gz"]) && path.is_file())
+            || (file == ".upload.tar.gz" && path.is_file() && stale(path))
+            || ((file.starts_with(".staging-") || file.starts_with(".replaced-"))
+                && path.is_dir()
+                && stale(path))
     }));
     if let Some(geoip) = app.themes.parent().map(|data| data.join("geoip")) {
-        removed.extend(remove_where(&geoip, |file| {
-            file.starts_with("country.") && ends(file, &[".part", ".tmp"])
+        removed.extend(remove_where(&geoip, |path| {
+            let file = called(path);
+            file.starts_with("country.") && ends(&file, &[".part", ".tmp"]) && path.is_file()
         }));
     }
     removed
 }
 
-/// The regular files of `dir` that `is_one` names, removed.
-fn remove_where(dir: &std::path::Path, is_one: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+/// Whether `path` was last written at least `older_than` ago. Zero asks only
+/// that it exists; a file whose age cannot be read is never old enough.
+fn aged(path: &std::path::Path, older_than: std::time::Duration, now: std::time::SystemTime) -> bool {
+    older_than.is_zero()
+        || std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= older_than)
+}
+
+/// The entries of `dir` that `is_one` names, removed -- a file as a file, a
+/// directory with what it holds. Judged on the entry itself, not on where a
+/// link points: a link is never followed, and one that merely carries such a
+/// name stays where it is.
+fn remove_where(dir: &std::path::Path, is_one: impl Fn(&std::path::Path) -> bool) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     entries
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
         .map(|entry| entry.path())
-        .filter(|path| path.file_name().is_some_and(|n| is_one(&n.to_string_lossy())))
-        .filter(|path| std::fs::remove_file(path).is_ok())
+        .filter(|path| is_one(path))
+        .filter(|path| match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path).is_ok(),
+            Ok(meta) if meta.is_file() => std::fs::remove_file(path).is_ok(),
+            _ => false,
+        })
         .collect()
+}
+
+/// Keeps every installed hub trusting private-network proxies as it did.
+///
+/// A fresh install no longer does: the hub listens on loopback behind a proxy
+/// on the same host, which needs no such trust, and a hub reachable from a
+/// private network hands anyone on it the power to name their own address in
+/// `X-Forwarded-For` -- the login throttle's key, and what the session list
+/// shows. An upgrade must not change that under an operator who never touched
+/// the switch, so a database that predates this has the trust written out as
+/// the explicit "on" it was already living by. Runs before `first_run`, which
+/// is what tells a fresh database from an installed one.
+fn keep_private_proxy_trust(app: &App) {
+    if app.db.get("admin_password_hash").is_none() {
+        return;
+    }
+    if matches!(app.db.get("trust_private_xff").as_deref(), Some("on" | "off")) {
+        return;
+    }
+    match app.db.set("trust_private_xff", "on") {
+        Ok(()) => info!(
+            "trusting X-Forwarded-For from private-network proxies as this hub always has; \
+             the switch is now explicit, under Security"
+        ),
+        Err(e) => warn!("could not record how private-network proxies are trusted: {e:#}"),
+    }
 }
 
 /// How many release downloads the hub relays concurrently.
@@ -470,6 +547,26 @@ static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RE
 /// reading cannot stretch a permit past the download it paid for.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Each architecture's agent, kept once it has been fetched and found to hash
+/// to what `agent.pin` names: `[x86_64, aarch64]`.
+///
+/// Those bytes cannot change while this binary runs -- a different file would
+/// fail the pin -- so every request after the first is answered from memory
+/// instead of sending the hub out to GitHub, or to the mirror in front of it,
+/// again. That outbound fetch is the dearest thing an anonymous caller can ask
+/// for, and it was asked for once per node. Under 2 MiB each, against a unit
+/// file that allows 256 MiB.
+static RELAYED: [std::sync::OnceLock<Vec<u8>>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+
+/// Where `arch`'s verified agent is kept, for the two architectures there is one.
+fn relayed(arch: &str) -> Option<&'static std::sync::OnceLock<Vec<u8>>> {
+    match arch {
+        "x86_64" => Some(&RELAYED[0]),
+        "aarch64" => Some(&RELAYED[1]),
+        _ => None,
+    }
+}
+
 /// Serves the agent binary from the hub itself, so a node that can reach the hub
 /// can install without reaching GitHub: IPv6-only machines cannot resolve
 /// github.com, and neither can blocked networks.
@@ -485,8 +582,11 @@ const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 /// the unit file's MemoryMax=256M leaves the ceiling far away, and a hash needs
 /// the whole body anyway.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
-    if !matches!(arch.as_str(), "x86_64" | "aarch64") {
+    let Some(cache) = relayed(&arch) else {
         return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
+    };
+    if let Some(bytes) = cache.get() {
+        return ([(header::CONTENT_TYPE, "application/octet-stream")], bytes.clone()).into_response();
     }
     let Some(pinned) = pinned_sha(&arch) else {
         warn!("agent.pin holds no digest for {arch}; refusing to relay unverified bytes");
@@ -523,6 +623,8 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
         return (StatusCode::BAD_GATEWAY, "release does not match the pinned digest; refusing")
             .into_response();
     }
+    // Lost only a race with another request that finished the same fetch.
+    let _ = cache.set(bytes.clone());
     ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
@@ -612,7 +714,9 @@ async fn main() -> Result<()> {
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes.clone(), secrets, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
-    for left in sweep_scratch(&app) {
+    // Before `first_run`, which tells a fresh database from an installed one.
+    keep_private_proxy_trust(&app);
+    for left in sweep_scratch(&app, std::time::Duration::ZERO) {
         info!("removed {}, left behind by an interrupted operation", left.display());
     }
     if exposed_over_plain_http(&url) {
@@ -885,6 +989,12 @@ pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
         std::fs::Permissions::from_mode(0o600)
     })?;
     app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
+    // Written out rather than left to the default, on the very first start:
+    // `keep_private_proxy_trust` tells a fresh database from one installed
+    // before this by the absence of a password, and this is the last moment
+    // there is none. A row that says "off" keeps the next start from reading
+    // a fresh install as an old one and trusting private-network proxies.
+    app.db.set("trust_private_xff", "off")?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
@@ -957,6 +1067,11 @@ async fn housekeeping(app: Shared) {
         }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
+        }
+        // An upload nobody is finishing: the backup or theme archive as it
+        // arrived, left by a dialog closed or a tab navigated away from.
+        for left in sweep_scratch(&app, std::time::Duration::from_secs(86_400)) {
+            info!("removed {}, an upload nothing finished", left.display());
         }
         if let Err(e) = renew_online_nodes(&app) {
             warn!("rolling expiry dates failed: {e:#}");
@@ -1199,7 +1314,7 @@ mod tests {
         let app = app("");
         let direct = release_url(&app, "x86_64");
         assert!(
-            direct.starts_with("https://github.com/wwx0wwx/one-monitor/releases/download/voy/"),
+            direct.starts_with(&format!("https://github.com/{AGENT_REPO}/releases/download/{AGENT_TAG}/")),
             "{direct}"
         );
 
@@ -1321,9 +1436,9 @@ mod tests {
         drop(Scratch::new(&gone));
     }
 
-    /// What an interrupted export, restore, theme install and GeoIP download
-    /// leave, and nothing that is the operator's or an upload the panel may
-    /// still finish.
+    /// What an interrupted export, restore, theme install and download leave,
+    /// an upload walked out on, and the directories a killed theme install
+    /// leaves -- and nothing that is the operator's.
     #[test]
     fn startup_removes_what_interrupted_operations_left_and_nothing_else() {
         let base = crate::test_support::scratch_dir("monitor-hub-sweep");
@@ -1336,34 +1451,121 @@ mod tests {
             base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp-wal"),
             // The rollback journal SQLite keeps beside a copy while a write is under way.
             base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp-journal"),
+            // A restore upload and a theme upload that nobody finished: the
+            // backup and the archive exactly as they arrived.
+            base.join("monitor.db.upload"),
+            themes.join(".upload.tar.gz"),
             themes.join(".installing-9a8b7c6d5e4f3210.tar.gz"),
             geoip.join("country.5c4b3a2a1b0c9d8e.part"),
-            geoip.join("country.5c4b3a2a1b0c9d8e.tmp"),
             // The fixed names the GeoIP download used before it named per call.
             geoip.join("country.part"),
         ];
+        for path in &stale {
+            std::fs::write(path, "left over").unwrap();
+        }
+        // What a theme install makes and a kill leaves where it was: the
+        // directory being unpacked into, and the theme it was replacing, moved
+        // aside.
+        let leftovers = [themes.join(".staging-9a8b7c6d5e4f3210"), themes.join(".replaced-1f2e3d4c5b6a7988")];
+        for dir in &leftovers {
+            std::fs::create_dir_all(dir.join("dist")).unwrap();
+            std::fs::write(dir.join("dist/index.html"), "half of it").unwrap();
+        }
         let kept = [
-            base.join("monitor.db.upload"),
-            themes.join(".upload.tar.gz"),
             geoip.join("country.mmdb"),
             base.join("notes.txt"),
             base.join("my-backup-notes.tmp"),
             base.join("monitor.db.backup-notes"),
+            themes.join("komari-likely/dist/index.html"),
         ];
-        for path in stale.iter().chain(&kept) {
-            std::fs::write(path, "left or kept").unwrap();
+        for path in &kept {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "the operator's").unwrap();
         }
-        std::fs::create_dir_all(themes.join("komari-likely")).unwrap();
 
-        let removed = sweep_scratch(&app);
+        let removed = sweep_scratch(&app, std::time::Duration::ZERO);
 
-        assert_eq!(removed.len(), stale.len(), "removed {removed:?}");
-        for path in &stale {
+        assert_eq!(removed.len(), stale.len() + leftovers.len(), "removed {removed:?}");
+        for path in stale.iter().chain(&leftovers) {
             assert!(!path.exists(), "{} should have been removed", path.display());
         }
         for path in &kept {
             assert!(path.is_file(), "{} is not the hub's to remove", path.display());
         }
         assert!(themes.join("komari-likely").is_dir() && base.join("monitor.db").is_file());
+    }
+
+    /// The hourly pass meets uploads in progress: a panel may be a minute into
+    /// sending a backup, and the hub must not pull the file from under it. Only
+    /// one that has sat untouched for a day is an upload nobody is finishing.
+    #[test]
+    fn the_hourly_pass_leaves_an_upload_that_may_still_be_arriving() {
+        let base = crate::test_support::scratch_dir("monitor-hub-sweep-hourly");
+        let app = file_app(&base);
+        let themes = app.themes.clone();
+        let uploads = [base.join("monitor.db.upload"), themes.join(".upload.tar.gz")];
+        for path in &uploads {
+            std::fs::write(path, "half of it").unwrap();
+        }
+        std::fs::create_dir_all(themes.join(".staging-fresh/dist")).unwrap();
+        let day = std::time::Duration::from_secs(86_400);
+        let now = std::time::SystemTime::now();
+        let two_days_later = now + std::time::Duration::from_secs(2 * 86_400);
+
+        assert!(sweep_scratch_at(&app, day, now).is_empty(), "a minute into an upload");
+        assert!(uploads.iter().all(|p| p.is_file()) && themes.join(".staging-fresh").is_dir());
+
+        let removed = sweep_scratch_at(&app, day, two_days_later);
+        assert_eq!(removed.len(), 3, "removed {removed:?}");
+        assert!(uploads.iter().all(|p| !p.exists()) && !themes.join(".staging-fresh").exists());
+    }
+
+    /// A fresh install does not trust private-network proxies; an installed one
+    /// keeps trusting them as it always did, and one whose operator said no
+    /// keeps that.
+    #[test]
+    fn a_fresh_install_does_not_trust_private_proxies_and_an_installed_one_keeps_doing_so() {
+        let fresh = app("https://x");
+        keep_private_proxy_trust(&fresh);
+        assert!(!crate::auth::trust_private_xff(&fresh));
+        assert_eq!(fresh.db.get("trust_private_xff"), None, "nothing is written for a fresh database");
+
+        // Installed before the switch existed: no row, or a blank one.
+        for blank in [None, Some("")] {
+            let installed = app("https://x");
+            installed.db.set("admin_password_hash", "a hash").unwrap();
+            if let Some(blank) = blank {
+                installed.db.set("trust_private_xff", blank).unwrap();
+            }
+            keep_private_proxy_trust(&installed);
+            assert!(crate::auth::trust_private_xff(&installed), "as it always did");
+            assert_eq!(installed.db.get("trust_private_xff").as_deref(), Some("on"));
+        }
+
+        let refused = app("https://x");
+        refused.db.set("admin_password_hash", "a hash").unwrap();
+        refused.db.set("trust_private_xff", "off").unwrap();
+        keep_private_proxy_trust(&refused);
+        assert!(!crate::auth::trust_private_xff(&refused));
+    }
+
+    /// The start after the first one has a password to see, and must not take
+    /// a fresh install for an old one on that account.
+    #[test]
+    fn a_fresh_install_is_still_untrusting_on_its_second_start() {
+        let fresh = app("https://x");
+        keep_private_proxy_trust(&fresh);
+        first_run(&fresh, "https://x").unwrap();
+        keep_private_proxy_trust(&fresh);
+        assert_eq!(fresh.db.get("trust_private_xff").as_deref(), Some("off"));
+        assert!(!crate::auth::trust_private_xff(&fresh));
+    }
+
+    /// Where each architecture's verified agent is kept once fetched.
+    #[test]
+    fn each_architecture_has_one_place_its_verified_agent_is_kept() {
+        let (x86, arm) = (relayed("x86_64").unwrap(), relayed("aarch64").unwrap());
+        assert!(!std::ptr::eq(x86, arm), "a slot of its own, not one shared");
+        assert!(relayed("riscv64").is_none());
     }
 }
