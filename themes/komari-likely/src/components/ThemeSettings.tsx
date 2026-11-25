@@ -19,6 +19,15 @@ function pickVariant(link: string, dark: boolean) {
   return (dark ? darkPart || light : light).trim()
 }
 
+/** Every setting the panel writes, at its default: what 「恢复默认」 puts back. */
+const DEFAULTS: Record<string, string> = {
+  bg_enabled: "off", bg_desktop: "", bg_mobile: "", bg_opacity: "100", bg_blur: "0", bg_fit: "cover",
+  bg_position: "center", card_opacity: "70", card_blur: "64",
+  content_width: "1400", logo_url: "",
+  cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
+  ip_capsule: "off", expiring_group: "on", region_group: "on", flags_cdn: "on", fx_api: "on",
+}
+
 /** Whether the viewport currently matches `query`. The change listener lets a
  *  crossing re-render; the cleanup takes the listener back down. Exists so the
  *  background can pick one source in JS instead of shipping both and hiding
@@ -198,6 +207,9 @@ export function ThemeSettingsButton({ settings, onSave }: {
 }) {
   const [open, setOpen] = useState(false)
   const [error, setError] = useState("")
+  // Between the press on 「恢复默认」 and the one that means it.
+  const [confirming, setConfirming] = useState(false)
+  const dismiss = () => { setOpen(false); setConfirming(false) }
   const save = (patch: Record<string, string>) =>
     onSave(patch).then(() => setError(""), (e: Error) => setError(e.message || "保存失败"))
 
@@ -211,7 +223,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
     const close = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return
       e.stopPropagation()
-      setOpen(false)
+      dismiss()
     }
     addEventListener("keydown", close, true)
     return () => removeEventListener("keydown", close, true)
@@ -236,7 +248,7 @@ export function ThemeSettingsButton({ settings, onSave }: {
       {open && (
         <>
           {/* Click anywhere else closes; the panel sits above this blanket. */}
-          <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} aria-hidden />
+          <div className="fixed inset-0 z-20" onClick={dismiss} aria-hidden />
           {/* Narrow screens first: anchored to the trigger's right edge, the
               w-80 panel overflows a 390px viewport by 17px, and the body does
               not scroll sideways to reveal what was cut. Below sm it becomes a
@@ -405,22 +417,46 @@ export function ThemeSettingsButton({ settings, onSave }: {
               />
             </Section>
 
+            {/* The two places the page itself asks someone other than the hub.
+                Both are on by default, as they always were; a site that would
+                rather not have its visitors talked to can switch them off. */}
+            <Section title="外部请求">
+              <Toggle
+                label="国旗图片"
+                hint="从 jsDelivr 加载 Twemoji 国旗。关闭后显示系统自带的表情国旗，不再为此向第三方发请求。"
+                checked={display.flags}
+                onChange={(on) => save({ flags_cdn: on ? "on" : "off" })}
+              />
+              <Toggle
+                label="汇率换算"
+                hint="从 jsDelivr 和 open.er-api.com 取当天的汇率来换算价格。关闭后价格按各自的原币显示。"
+                checked={display.fx}
+                onChange={(on) => save({ fx_api: on ? "on" : "off" })}
+              />
+            </Section>
+
             {error && <p role="alert" className="text-xs text-red-600">{error}</p>}
-            <button
-              onClick={() =>
-                save({
-                  bg_enabled: "off", bg_desktop: "", bg_mobile: "", bg_opacity: "100", bg_blur: "0", bg_fit: "cover",
-                  bg_position: "center", card_opacity: "70", card_blur: "64",
-                  content_width: "1400", logo_url: "",
-                  cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
-                  ip_capsule: "off", expiring_group: "on", region_group: "on",
-                })
-              }
-              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            >
-              <RotateCcw className="size-3" />
-              恢复默认
-            </button>
+            {confirming ? (
+              /* One press used to put every setting back at once, background
+                 links included, with nothing to undo it by. */
+              <span role="alert" className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                <span className="text-muted-foreground">把全部 {Object.keys(DEFAULTS).length} 项设置恢复默认？背景图链接也会清空。</span>
+                <button onClick={() => { save(DEFAULTS); setConfirming(false) }} className="font-medium text-red-700 underline underline-offset-2">
+                  确认恢复
+                </button>
+                <button onClick={() => setConfirming(false)} className="text-muted-foreground underline underline-offset-2">
+                  取消
+                </button>
+              </span>
+            ) : (
+              <button
+                onClick={() => setConfirming(true)}
+                className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              >
+                <RotateCcw className="size-3" />
+                恢复默认
+              </button>
+            )}
           </div>
         </>
       )}

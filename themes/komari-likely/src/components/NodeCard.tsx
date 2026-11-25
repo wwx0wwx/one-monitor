@@ -25,7 +25,7 @@ export function monthUsage(node: Node): number {
 // A node that has reported once has told the hub its shape -- cores, memory,
 // disk -- and the hub retains its traffic totals whether connected or not. A node
 // that never connected is the only case with nothing to show.
-function deployed(node: Node) {
+export function deployed(node: Node) {
   return node.cpu_cores > 0 || node.mem_total > 0
 }
 
@@ -242,9 +242,22 @@ export function NodeCard({ node, onOpen, show = SHOW_ALL }: {
       ) : (
         /* Never connected: nothing to plot, so the card stays short rather than
            padding out to match its neighbours. */
-        <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
-          还没有接入。在后台生成安装命令并执行一次。
-        </p>
+        <div className="mt-3">
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            还没有接入。在后台生成安装命令并执行一次。
+          </p>
+          {/* What it costs and when it falls due are the operator's entries,
+              known before the machine ever reports -- and the reason such a
+              server can already sit in 即将到期. */}
+          {show.billing && (
+            <div className="mt-3 flex justify-end border-t pt-3">
+              <div className="flex flex-col items-end gap-0.5">
+                <Expiry node={node} />
+                <Price node={node} />
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </Card>
   )

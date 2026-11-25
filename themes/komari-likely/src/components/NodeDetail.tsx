@@ -228,6 +228,37 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
     return () => { active = false }
   }, [node.id, hours, tab])
 
+  // How often the window is fetched again while this screen is open. The
+  // figures above it move every couple of seconds; without this the charts
+  // stayed at the window opened with, and a spike that began afterwards was
+  // invisible until a reload or a change of range.
+  const CHART_REFRESH_MS = 10_000
+  useEffect(() => {
+    const points = Math.round(globalThis.innerWidth * (globalThis.devicePixelRatio || 1))
+    const series = tab === "latency" ? "ping" : "metrics"
+    let active = true
+    let inFlight = false
+    // A refresh keeps what is drawn -- the brush included -- and says nothing
+    // when it cannot get through: a chart already on screen is no place for an
+    // error line, and the next one is ten seconds away. Nor does it run in a
+    // background tab, where nobody is watching and the request would only add
+    // to the hub's load.
+    const refresh = () => {
+      if (!active || inFlight || document.visibilityState === "hidden") return
+      inFlight = true
+      api<{ metrics: Point[]; ping: PingPoint[]; probes: Probes; loss?: Loss }>(
+        `/nodes/${node.id}/metrics?hours=${hours}&points=${points}&series=${series}`,
+      )
+        .then((next) => { if (active) setData(next) })
+        .catch(() => {})
+        .finally(() => { inFlight = false })
+    }
+    const timer = setInterval(refresh, CHART_REFRESH_MS)
+    // Back in the foreground, at once: the tab was not refreshing while hidden.
+    document.addEventListener("visibilitychange", refresh)
+    return () => { active = false; clearInterval(timer); document.removeEventListener("visibilitychange", refresh) }
+  }, [node.id, hours, tab])
+
   const m = node.metrics
   // One series per probe that reported, labelled from the names the samples
   // arrived with. Memoised, as are the two below: the node prop changes every few

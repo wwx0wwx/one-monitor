@@ -31,3 +31,14 @@ test("an empty value falls back to the default rather than reading as 0", () => 
   expect(blank.layout.contentWidth).toBe(1400)
   expect(parseThemeSettings({ card_blur: "0" }).bg.cardBlur).toBe(0) // 显式的 0 仍然成立
 })
+
+// Two things on the page ask someone other than the hub: the flag pictures
+// (jsDelivr) and the day's exchange table (jsDelivr, open.er-api.com). Both
+// stay on unless the operator switches them off -- the page as it has always
+// been -- and off stays off.
+test("the flag pictures and the exchange table can be kept from asking a third party", () => {
+  expect(parseThemeSettings({}).display.flags).toBe(true) // a missing key is on
+  expect(parseThemeSettings({ flags_cdn: "off" }).display.flags).toBe(false)
+  expect(parseThemeSettings({}).display.fx).toBe(true)
+  expect(parseThemeSettings({ fx_api: "off" }).display.fx).toBe(false)
+})

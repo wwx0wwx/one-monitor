@@ -9,7 +9,7 @@ import { BackgroundLayer, ThemeSettingsButton } from "@/components/ThemeSettings
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, useNodes, type Node } from "@/lib/api"
-import { parseThemeSettings } from "@/lib/display"
+import { DisplayContext, parseThemeSettings } from "@/lib/display"
 import { appliedFilter } from "@/lib/filter"
 import { daysUntil } from "@/lib/format"
 import { chosenDark, THEME_CHOICE } from "@/lib/theme"
@@ -33,25 +33,32 @@ const NodeDetail = lazy(loadDetail)
 // leaves the detail view rather than the site. The hub serves index.html for any
 // unknown path, so no server-side route is required.
 function useNodeRoute() {
+  // What the address names: a node, the list, or neither. `/` is the list and
+  // so is `/index.html`, which the hub serves the page from as well;
+  // `/node/5` is that node. Anything else is no page this theme has. It used
+  // to get the list, which made a mistyped or stale link look like a working
+  // one.
   const read = () => {
-    const match = location.pathname.match(/^\/node\/(\d+)/)
-    return match ? Number(match[1]) : null
+    const path = location.pathname.replace(/\/+$/, "")
+    const match = path.match(/^\/node\/(\d+)$/)
+    return { id: match ? Number(match[1]) : null, missing: !(match || path === "" || path === "/index.html") }
   }
-  const [id, setId] = useState(read)
+  const [route, setRoute] = useState(read)
   useEffect(() => {
-    const sync = () => setId(read())
+    const sync = () => setRoute(read())
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
   return [
-    id,
+    route.id,
     (next: number | null) => {
       // The query rides along, so a filtered list that opens a node returns to
       // itself rather than to every machine again.
       history.pushState({}, "", next === null ? `/${location.search}` : `/node/${next}${location.search}`)
-      setId(next)
+      setRoute({ id: next, missing: false })
       scrollTo(0, 0)
     },
+    route.missing,
   ] as const
 }
 
@@ -115,7 +122,7 @@ export default function App() {
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const { nodes, error, closed } = useNodes()
-  const [open, go] = useNodeRoute()
+  const [open, go, missing] = useNodeRoute()
 
   const loadMe = useCallback(() => {
     // `|| "..."` because an empty message reads as no error: api() falls back to
@@ -307,6 +314,7 @@ export default function App() {
   const shown = group ? sorted.filter(inGroup) : sorted
 
   return (
+    <DisplayContext value={ts.display}>
     <div className="min-h-svh">
       <BackgroundLayer bg={ts.bg} dark={dark} />
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
@@ -356,7 +364,11 @@ export default function App() {
       <main className="mx-auto max-w-[var(--content-w,1400px)] space-y-5 px-4 py-4 sm:px-6">
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        {open !== null ? (
+        {missing ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">
+            没有这个页面：{location.pathname}。<button className="underline" onClick={() => go(null)}>返回状态页</button>
+          </p>
+        ) : open !== null ? (
           !nodes ? (
             <Skeleton className="h-96" />
           ) : selected ? (
@@ -422,5 +434,6 @@ export default function App() {
       </main>
       {ts.display.ipCapsule && <IpCapsule />}
     </div>
+    </DisplayContext>
   )
 }

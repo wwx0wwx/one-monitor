@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react"
+import { useContext, useEffect, useState } from "react"
+
+import { DisplayContext } from "@/lib/display"
 
 /**
  * The day's published USD table -- never a hand-written approximation. Two
@@ -85,8 +87,11 @@ async function load(): Promise<Table | null> {
  */
 export function useCnyTable(): Table | null | undefined {
   const [table, setTable] = useState<Table | null | undefined>(readCache)
+  // With the table switched off nothing is asked and nothing is quoted: null
+  // throughout, the answer that stands for "no source answered".
+  const { fx } = useContext(DisplayContext)
   useEffect(() => {
-    if (table !== undefined) return
+    if (!fx || table !== undefined) return
     let active = true
     load().then((fresh) => {
       if (active) setTable(fresh)
@@ -94,8 +99,8 @@ export function useCnyTable(): Table | null | undefined {
     return () => {
       active = false
     }
-  }, [table])
-  return table
+  }, [table, fx])
+  return fx ? table : null
 }
 
 /** CNY per one unit of `code` from a loaded table; null when the table does

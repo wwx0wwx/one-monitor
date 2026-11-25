@@ -1,3 +1,5 @@
+import { createContext } from "react"
+
 /** What the status page shows, as the operator set it on the hub. /api/me
  *  carries the keys as raw strings; this is the shape the page renders from,
  *  with the defaults of a hub that never heard of any of them -- which is also
@@ -28,6 +30,12 @@ export type Display = {
   ipCapsule: boolean
   expiring: boolean
   region: boolean
+  /** Country flags as pictures fetched from jsDelivr (Twemoji). Off, the
+   *  system's own emoji flag stands in and nothing is asked of anyone. */
+  flags: boolean
+  /** Prices converted at the day's exchange table, fetched from jsDelivr and
+   *  open.er-api.com. Off, every price stays in its own currency. */
+  fx: boolean
 }
 
 export type Layout = {
@@ -85,6 +93,14 @@ export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings 
       ipCapsule: flag(raw, "ip_capsule", false),
       expiring: flag(raw, "expiring_group", true),
       region: flag(raw, "region_group", true),
+      flags: flag(raw, "flags_cdn", true),
+      fx: flag(raw, "fx_api", true),
     },
   }
 }
+
+/** The display settings in force, for the pieces that render far from the root
+ *  -- a flag beside a node's name, a price in a card -- and would otherwise
+ *  take them as a prop through every layer between. Outside a provider it is
+ *  what the hub's own defaults render. */
+export const DisplayContext = createContext<Display>(parseThemeSettings(undefined).display)

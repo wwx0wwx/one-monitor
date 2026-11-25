@@ -1,5 +1,6 @@
-import { memo, useState } from "react"
+import { memo, useContext, useState } from "react"
 
+import { DisplayContext } from "@/lib/display"
 import { cn } from "@/lib/utils"
 
 const FALLBACK = "🌐"
@@ -22,8 +23,18 @@ function twemojiUrl(emoji: string): string {
  * system emoji renders in its place -- a shape either way, a broken image never.
  */
 export const Flag = memo(function Flag({ country, className }: { country: string; className?: string }) {
+  // The operator can keep the page from asking a CDN for these: off, the
+  // system emoji is the flag, and no request leaves the visitor's browser.
+  const { flags } = useContext(DisplayContext)
   const [broken, setBroken] = useState(false)
   const emoji = emojiFor(country)
+  if (!flags) {
+    return (
+      <span className={cn("inline-flex size-[18px] shrink-0 items-center justify-center", className)} title={country || undefined}>
+        <span className="text-sm leading-none" aria-hidden>{emoji}</span>
+      </span>
+    )
+  }
   return (
     <span className={cn("inline-flex size-[18px] shrink-0 items-center justify-center", className)} title={country || undefined}>
       {broken ? (
