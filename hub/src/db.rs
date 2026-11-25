@@ -636,15 +636,26 @@ fn restrict(path: &str) {
     }
 }
 
-/// One file, owner-only. Also applied to the backup copy `VACUUM INTO` writes,
-/// which is the entire credential store in one portable file, created under the
-/// umask like any other.
+/// One file, owner-only.
 fn own_only(file: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
     }
+}
+
+/// A new, empty file only its owner may read or write.
+fn create_private(file: &str) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(file)?;
+    Ok(())
 }
 
 /// The `main` database's path as SQLite reports it, empty for `:memory:`.
@@ -1696,6 +1707,13 @@ impl Db {
         // checkpoint racing this read returns SQLITE_BUSY immediately.
         let reader = Connection::open(self.file())?;
         reader.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Created empty and owner-only before SQLite writes a byte into it:
+        // `VACUUM INTO` takes an existing empty file and keeps its mode. Left
+        // to the statement, the copy would come into being under the umask --
+        // readable by every user at the usual 022 -- and stay that way through
+        // the whole checksum pass below, in a directory anyone may walk where
+        // the deployment is not the installer's.
+        create_private(dest)?;
         reader.execute("VACUUM INTO ?1", [dest])?;
         // The copy records a checksum of its own contents, which `check_backup`
         // holds it to at restore; see `CHECKSUM_KEY`. Computed over the copy
@@ -1712,10 +1730,6 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![CHECKSUM_KEY, checksum],
         )?;
-        // The copy is the credential store in one portable file: node tokens in
-        // the clear, the GitHub secret, the password hash. SQLite creates it
-        // under the umask, which at the usual 022 is world-readable.
-        own_only(dest);
         Ok(())
     }
 
@@ -3125,5 +3139,29 @@ mod tests {
         // Editing an existing probe does not count as adding one.
         let first = db.ping_tasks().unwrap()[0].id;
         save(first, vec![id]).expect("an existing probe can still be edited at the cap");
+    }
+
+    /// The copy is the credential store in one file, and private from the byte
+    /// it starts on: created empty and owner-only for `VACUUM INTO` to fill,
+    /// which it does without touching the mode.
+    #[test]
+    fn a_backup_is_private_from_its_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let db = Db::open(&scratch.0).unwrap();
+        let copy = format!("{}.copy", scratch.0);
+        let mode = || std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+
+        // What makes it so: a new empty file, owner-only, never an existing one.
+        create_private(&copy).unwrap();
+        assert_eq!(std::fs::metadata(&copy).unwrap().len(), 0);
+        assert_eq!(mode(), 0o600);
+        assert!(create_private(&copy).is_err(), "an existing file is never written through");
+
+        std::fs::remove_file(&copy).unwrap();
+        db.backup_into(&copy).unwrap();
+        assert_eq!(mode(), 0o600, "filled in place, so still only the owner's");
+        let check = Db::open(":memory:").unwrap();
+        check.check_backup(&copy).unwrap();
     }
 }

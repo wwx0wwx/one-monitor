@@ -10,6 +10,7 @@ use axum::Json;
 use chrono::{Local, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::agent_ws::Agent;
@@ -1257,42 +1258,57 @@ pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
 
 /// Returns a compact copy of the whole database.
 ///
-/// The copy is written beside the live file and then unlinked while still open,
-/// so it exists only for the duration of this response: a client that
-/// disconnects partway through leaves nothing behind, and nothing on disk
-/// outlives the download.
+/// The copy is written beside the live file, opened and unlinked while still
+/// open, all of it before this handler gets anything back: on disk it exists
+/// only while it is being written, and afterwards only through the handle this
+/// response streams. A client that disconnects partway -- while the copy is
+/// being made as much as during the download -- leaves nothing behind, and
+/// nothing on disk outlives the request.
 pub async fn db_backup(_: Admin, State(app): State<Shared>) -> Response {
     let path = scratch_path(&app, "backup");
     // Off the runtime: this reads the entire database while holding the
     // connection the agents write through.
     let copied = {
-        let (app, path) = (app.clone(), path.clone());
-        tokio::task::spawn_blocking(move || app.db.backup_into(&path)).await
+        let app = app.clone();
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || export(&app, &path)).await
     };
-    if let Err(e) = copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
-        let _ = std::fs::remove_file(&path);
-        return fail(e);
-    }
-    let opened = tokio::fs::File::open(&path).await;
-    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_file(&path);
-    match opened {
-        Ok(file) => (
-            [
-                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
-                (header::CONTENT_LENGTH, size.to_string()),
-                // The entire credential store: no shared cache may retain a copy.
-                (header::CACHE_CONTROL, "no-store".to_owned()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
-                ),
-            ],
-            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
-        )
-            .into_response(),
-        Err(e) => fail(e),
-    }
+    let (file, size) = match copied.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
+        Ok(opened) => opened,
+        Err(e) => return fail(e),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, size.to_string()),
+            // The entire credential store: no shared cache may retain a copy.
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"monitor-{}.db\"", Local::now().format("%Y%m%d-%H%M%S")),
+            ),
+        ],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))),
+    )
+        .into_response()
+}
+
+/// Writes the copy at `path`, opens it and unlinks it: by the time this returns
+/// the file is gone from its directory, and lives on through the handle.
+///
+/// All of it inside the blocking closure, because the unlink cannot wait for
+/// the caller. A handler dropped while the copy is being made -- the panel's
+/// five minutes up, the tab closed, the proxy giving up -- never runs what
+/// follows its await. With the unlink there, as it used to be, that left a
+/// complete copy of the credential store in the data directory for good. The
+/// guard takes the ways out that are errors.
+fn export(app: &App, path: &str) -> anyhow::Result<(std::fs::File, u64)> {
+    let _scratch = crate::Scratch::new(path);
+    app.db.backup_into(path)?;
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    std::fs::remove_file(path)?;
+    Ok((file, size))
 }
 
 /// Replaces the live database with an uploaded backup, one chunk per request.
@@ -1496,11 +1512,14 @@ pub async fn upload_theme(
     let installed = {
         let (app, path) = (app.clone(), source.clone());
         tokio::task::spawn_blocking(move || {
+            // Removed in here, for the reason `export` gives: a client that
+            // leaves during the unpacking takes the handler with it, and with
+            // the handler any cleanup that waited on this await.
+            let _scratch = crate::Scratch::new(&path);
             crate::frontend::install(&app.themes, std::fs::File::open(&path)?, None)
         })
         .await
     };
-    let _ = std::fs::remove_file(&source);
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
         Err(e) => bad(&format!("{e:#}")),
@@ -1521,6 +1540,41 @@ struct Release {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+    /// `sha256:<hex>` over the file GitHub holds, on assets uploaded since it
+    /// began recording them; `null` on older ones.
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// Whether the archive that came back is the one GitHub published.
+///
+/// `digest` is what the API recorded for the asset. It was read from
+/// api.github.com directly -- the proxy in the panel's settings fronts release
+/// downloads only -- so it is as trustworthy as the tag it came with, and the
+/// bytes need not be: through a proxy they pass through a third party that the
+/// tag says nothing about, on their way to becoming code that runs in the
+/// administrator's own origin. A proxy that substituted the archive could
+/// update any installed theme to anything, and the panel would report the
+/// version the archive claimed. Mismatching bytes are refused.
+///
+/// Without a digest the two paths part. A direct download came from github.com
+/// over TLS and stands on its own; a proxied one has nothing to stand on and
+/// is refused by name.
+fn hold_to_digest(digest: Option<&str>, archive: &[u8], proxied: bool) -> anyhow::Result<()> {
+    let recorded = digest
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    let Some(recorded) = recorded else {
+        return if proxied {
+            anyhow::bail!("主题包是经 GitHub 代理下载的，而 GitHub 没有记录这个包的摘要，无法确认下载到的就是发布的那个；请留空代理直连 GitHub 再试，或手动上传主题包")
+        } else {
+            Ok(())
+        };
+    };
+    if hex::encode(Sha256::digest(archive)).eq_ignore_ascii_case(recorded) {
+        return Ok(());
+    }
+    anyhow::bail!("下载到的主题包与 GitHub 记录的摘要对不上，它可能在途中被改动过；没有安装任何东西。请留空代理直连 GitHub 再试，或手动上传主题包")
 }
 
 /// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
@@ -1634,7 +1688,8 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     // arrive newest first, and a theme whose newest release is older than
     // three hundred releases of everything combined has stopped shipping.
     let mut next = Some(format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"));
-    let mut newest: Option<(String, String)> = None;
+    // Tag, version and what GitHub says the archive's bytes hash to.
+    let mut newest: Option<(String, String, Option<String>)> = None;
     for _ in 0..3 {
         let Some(url) = next.take() else { break };
         let response = app
@@ -1651,22 +1706,21 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
             // installable, so it is not this theme's either. Both checks come
             // before the tag reaches a URL or a version comparison.
             let Some(tail) = release.tag_name.strip_prefix(&prefix) else { continue };
-            if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-                continue;
-            }
+            let Some(archive) = release.assets.iter().find(|asset| asset.name == ARCHIVE) else { continue };
+            let digest = archive.digest.clone();
             if !path_segment(&release.tag_name) {
                 bail!("release 的 tag {:?} 不能出现在下载地址里", release.tag_name);
             }
             // Owned before the tag itself is moved into the pair below: the
             // tail and its v-less form both borrow release.tag_name.
             let version = tail.strip_prefix('v').unwrap_or(tail).to_owned();
-            if newest.as_ref().is_none_or(|(_, best)| newer(&version, best)) {
-                newest = Some((release.tag_name, version));
+            if newest.as_ref().is_none_or(|(_, best, _)| newer(&version, best)) {
+                newest = Some((release.tag_name, version, digest));
             }
         }
     }
 
-    let Some((tag, version)) = newest else {
+    let Some((tag, version, digest)) = newest else {
         bail!("{owner}/{repo} 的 releases 里没有 {prefix} 开头、带 {ARCHIVE} 的版本");
     };
     // Equal means up to date; anything else is installed, including a
@@ -1679,8 +1733,12 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     // the part a blocked network cannot reach. The API call above is not proxied:
     // most proxies front only releases, and a hub that cannot read the tag still
     // has the upload path.
-    let url =
-        crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
+    //
+    // Which of the two brought the bytes back decides how far they can be
+    // trusted on their own; see `hold_to_digest`.
+    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}");
+    let url = crate::proxied(app, direct.clone());
+    let proxied = url != direct;
     let response =
         app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
     // The transfer stops at Content-Length, so checking it checks the body: a
@@ -1692,6 +1750,7 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
         None => bail!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
     }
     let archive = response.bytes().await?;
+    hold_to_digest(digest.as_deref(), &archive, proxied)?;
 
     // The same unpacking, validation and atomic replace an upload undergoes,
     // constrained to the theme it may replace. The built-in theme has no
@@ -3375,6 +3434,112 @@ mod tests {
         assert!(body.get("geoip_license_key").is_none());
         for secret in ["license-secret", "gezdgnbvgy3tqojq", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
+        }
+    }
+
+    /// The copy is unlinked before it is handed out, so a client that stops
+    /// waiting while it is being written cannot strand it in the data directory.
+    /// The unlink used to sit after the await that a dropped handler never
+    /// returns to, and the whole credential store stayed on disk for good.
+    #[test]
+    fn an_export_is_gone_from_the_directory_before_it_is_handed_out() {
+        let dir = std::env::temp_dir().join(format!("monitor-export-{}", &random_token()[..16]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = App::for_test(Db::open(&live).unwrap());
+        node(&app, "kept", true);
+
+        let path = scratch_path(&app, "backup");
+        let (mut file, size) = export(&app, &path).unwrap();
+        assert!(!std::path::Path::new(&path).exists(), "unlinked while still open: gone from the directory");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, size, "and the whole of it still reads through the handle");
+        // A whole backup, by the check a restore makes of one.
+        std::fs::write(format!("{live}.check"), &bytes).unwrap();
+        app.db.check_backup(&format!("{live}.check")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The handler itself, dropped while the copy is still being made, which is
+    /// what the runtime does for a client that closed the tab or timed out. The
+    /// blocking thread finishes regardless; what it must not do is leave the
+    /// copy behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_leaves_while_the_copy_is_made_leaves_no_copy_behind() {
+        let dir = std::env::temp_dir().join(format!("monitor-export-left-{}", &random_token()[..16]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db").to_string_lossy().into_owned();
+        let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
+        let id = node(&app, "history", true);
+        // Enough history for the copy to still be under way when the handler goes.
+        let now = Utc::now().timestamp();
+        for i in 1..=120_000 {
+            app.db.insert_metric(id, now - i, &serde_json::json!({"cpu": 1.0})).unwrap();
+        }
+        let copies = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
+                .count()
+        };
+
+        let handler = tokio::spawn({
+            let app = app.clone();
+            async move { db_backup(Admin, State(app)).await }
+        });
+        // The moment the copy exists on disk is the moment to walk out on it.
+        for _ in 0..2000 {
+            if copies() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        handler.abort();
+        assert!(handler.await.unwrap_err().is_cancelled(), "the handler is the one dropped here");
+        for _ in 0..6000 {
+            if copies() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(copies(), 0, "the copy the blocking thread was making is not left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_archive_is_held_to_the_digest_github_recorded_and_a_proxied_one_to_nothing_less() {
+        let archive = b"the published theme.tar.gz";
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(archive)));
+        for proxied in [false, true] {
+            assert!(hold_to_digest(Some(&digest), archive, proxied).is_ok());
+            // The hex in either case.
+            assert!(hold_to_digest(
+                Some(&digest.to_ascii_uppercase().replace("SHA256:", "sha256:")),
+                archive,
+                proxied
+            )
+            .is_ok());
+            let swapped = hold_to_digest(Some(&digest), b"another archive entirely", proxied).unwrap_err();
+            assert!(swapped.to_string().contains("摘要"), "{swapped:#}");
+        }
+        // Nothing recorded to hold the bytes to: from github.com they stand on
+        // TLS, through a proxy on nothing at all.
+        let not_hex = format!("sha256:{}", "z".repeat(64));
+        for none in [None, Some("sha512:abcd"), Some("sha256:short"), Some(not_hex.as_str())] {
+            assert!(hold_to_digest(none, archive, false).is_ok());
+            let refused = hold_to_digest(none, archive, true).unwrap_err();
+            assert!(refused.to_string().contains("代理"), "{refused:#}");
+        }
+    }
+
+    #[test]
+    fn github_may_or_may_not_have_recorded_an_assets_digest() {
+        let with: Asset = serde_json::from_str(r#"{"name":"theme.tar.gz","digest":"sha256:ab"}"#).unwrap();
+        assert_eq!(with.digest.as_deref(), Some("sha256:ab"));
+        for without in [r#"{"name":"theme.tar.gz"}"#, r#"{"name":"theme.tar.gz","digest":null}"#] {
+            assert_eq!(serde_json::from_str::<Asset>(without).unwrap().digest, None);
         }
     }
 }

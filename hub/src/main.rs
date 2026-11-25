@@ -98,21 +98,16 @@ impl App {
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static DIRS: AtomicU64 = AtomicU64::new(0);
         // Nothing delivers in tests; `notify::send` drops into the closed channel.
-        // The secrets dir is a fresh tempdir each call: the one-time password
-        // file a test's `first_run` writes never lands in the working tree and
-        // never collides with a parallel test's.
+        // The secrets dir is a fresh tempdir each call, one that goes away with
+        // the test: the one-time password file a `first_run` writes never lands
+        // in the working tree, never collides with a parallel test's, and never
+        // outlives the test either.
         Self::new(
             db,
             String::new(),
             PathBuf::from("themes"),
-            std::env::temp_dir().join(format!(
-                "monitor-hub-unit-{}-{}",
-                std::process::id(),
-                DIRS.fetch_add(1, Ordering::Relaxed),
-            )),
+            crate::test_support::scratch_dir("monitor-hub-unit"),
             tokio::sync::mpsc::channel(1).0,
         )
     }
@@ -209,11 +204,22 @@ pub async fn same_origin(req: axum::extract::Request, next: axum::middleware::Ne
 }
 
 /// Marks every API response `Cache-Control: no-store`; see the layer above.
+///
+/// And every response that is not a protocol switch, the pages' as much as the
+/// API's, `X-Content-Type-Options: nosniff`: the hub says what each body is, and
+/// a browser takes its word rather than guessing from the bytes. A reverse
+/// proxy in front usually adds it -- nginx and most CDN edges do -- but a hub
+/// reached without one should not be the softer for that.
 async fn no_store(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let is_api = req.uri().path().starts_with("/api/");
     let mut response = next.run(req).await;
     if is_api && !response.headers().contains_key(header::CACHE_CONTROL) {
         response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().expect("static value"));
+    }
+    if !response.status().is_informational() {
+        response
+            .headers_mut()
+            .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().expect("static value"));
     }
     response
 }
@@ -253,7 +259,45 @@ pub(crate) fn origin_names_host(origin: &str, host: &str) -> bool {
     }
 }
 
-/// Where the agent binaries are published, and at which codename release. The
+/// Temp directories for the tests, that go away with the test that asked.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    /// Directories created on one thread, removed when the thread ends. Each
+    /// test has its own, so a test that forgets to clean up -- or panics before
+    /// it can -- leaves nothing behind in the temp directory.
+    pub(crate) struct RemoveOnExit(pub(crate) Vec<PathBuf>);
+
+    impl Drop for RemoveOnExit {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    thread_local! {
+        static DIRECTORIES: std::cell::RefCell<RemoveOnExit> =
+            const { std::cell::RefCell::new(RemoveOnExit(Vec::new())) };
+    }
+
+    /// A path no other call gets, under the temp directory, removed when the
+    /// calling thread -- a test's -- ends.
+    pub(crate) fn scratch_dir(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DIRS: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            DIRS.fetch_add(1, Ordering::Relaxed)
+        ));
+        DIRECTORIES.with_borrow_mut(|dirs| dirs.0.push(dir.clone()));
+        dir
+    }
+}
+
+/// Where the hub's own binary is published, and at which codename release.
 /// repository also publishes the hub and the themes, so "latest" no longer
 /// names an agent release; the codename does, and moving to the next one (pio →
 /// voy → cas → new) means moving this tag in the same change that cuts it. Not
@@ -332,6 +376,80 @@ pub fn proxied(app: &App, url: String) -> String {
         Some(proxy) => format!("{}/{url}", proxy.trim().trim_end_matches('/')),
         None => url,
     }
+}
+
+/// A scratch path's removal, tied to the scope that does the work.
+///
+/// A handler dropped at an await point -- its client gone, the proxy timed the
+/// request out -- takes everything after that await with it, the `remove_file`
+/// that was to follow included. So a cleanup that must not depend on the
+/// request outliving the work lives in one of these, held by whatever runs the
+/// work: the path goes when the guard does, on every way out, and one already
+/// gone costs nothing. A directory tree goes the same way as a file.
+pub(crate) struct Scratch(pub(crate) PathBuf);
+
+impl Scratch {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::fs::remove_file(&self.0).is_err() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+/// Removes, from the hub's own three directories, the temporary files an
+/// interrupted operation leaves: an export or an import cut short by a crash or
+/// a kill, a theme archive that never got installed, a GeoIP database that
+/// never finished downloading. Useless once the process that wrote them is
+/// gone, and the first two are the whole credential store in one file.
+///
+/// Startup is the one moment none can be in flight, which is why this runs
+/// there and only there. Matched by the start and the end of the file name --
+/// the middle is random -- and only for regular files: everything else in these
+/// directories is the operator's. An upload still in progress (`*.upload`) is
+/// the panel's to finish or restart, and stays.
+pub(crate) fn sweep_scratch(app: &App) -> Vec<PathBuf> {
+    let file = app.db.file();
+    let database = std::path::Path::new(&file);
+    let (dir, name) = (
+        database.parent().map(std::path::Path::to_path_buf),
+        database.file_name().map(|n| n.to_string_lossy().into_owned()),
+    );
+    let mut removed = Vec::new();
+    let ends = |name: &str, suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+    if let (Some(dir), Some(name)) = (dir, name.filter(|n| !n.is_empty())) {
+        let names = ["backup", "restoring"].map(|kind| format!("{name}.{kind}-"));
+        removed.extend(remove_where(&dir, |file| {
+            names.iter().any(|start| file.starts_with(start))
+                && ends(file, &[".tmp", ".tmp-wal", ".tmp-shm", ".tmp-journal"])
+        }));
+    }
+    removed.extend(remove_where(&app.themes, |file| {
+        file.starts_with(".installing-") && ends(file, &[".tar.gz"])
+    }));
+    if let Some(geoip) = app.themes.parent().map(|data| data.join("geoip")) {
+        removed.extend(remove_where(&geoip, |file| {
+            file.starts_with("country.") && ends(file, &[".part", ".tmp"])
+        }));
+    }
+    removed
+}
+
+/// The regular files of `dir` that `is_one` names, removed.
+fn remove_where(dir: &std::path::Path, is_one: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().is_some_and(|n| is_one(&n.to_string_lossy())))
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
 }
 
 /// How many release downloads the hub relays concurrently.
@@ -494,6 +612,9 @@ async fn main() -> Result<()> {
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes.clone(), secrets, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
+    for left in sweep_scratch(&app) {
+        info!("removed {}, left behind by an interrupted operation", left.display());
+    }
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
@@ -744,7 +865,20 @@ pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
     // operator who just watched the first boot fail reads instead.
     let file = app.secrets.join("initial-password");
     std::fs::create_dir_all(&app.secrets)?;
-    std::fs::write(&file, format!("{password}\n"))?;
+    // Owner-only from its first byte rather than from a chmod after the write:
+    // between the two it would hold the administrator's password under
+    // whatever the umask allows, in a directory anyone may walk where the
+    // deployment is not the installer's.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(&file)?, format!("{password}\n").as_bytes())?;
+    // A file an earlier hub left with wider permissions keeps them through the
+    // rewrite above, which only truncates.
     #[cfg(unix)]
     std::fs::set_permissions(&file, {
         use std::os::unix::fs::PermissionsExt;
@@ -842,19 +976,25 @@ mod tests {
     use axum::http::{StatusCode, Uri};
 
     fn app(site: &str) -> App {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static DIRS: AtomicU64 = AtomicU64::new(0);
         App::new(
             Db::open(":memory:").unwrap(),
             site.into(),
             PathBuf::from("themes"),
-            // A tempdir per call, so a `first_run` test's password file never
-            // lands in the working tree and never collides with another test's.
-            std::env::temp_dir().join(format!(
-                "monitor-hub-test-{}-{}",
-                std::process::id(),
-                DIRS.fetch_add(1, Ordering::Relaxed),
-            )),
+            crate::test_support::scratch_dir("monitor-hub-test"),
+            tokio::sync::mpsc::channel(1).0,
+        )
+    }
+
+    /// An instance on a database file under `dir`, with the themes and the
+    /// GeoIP directory beside it, as a deployment has them.
+    fn file_app(dir: &std::path::Path) -> App {
+        let themes = dir.join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        App::new(
+            Db::open(dir.join("monitor.db").to_str().unwrap()).unwrap(),
+            String::new(),
+            themes.clone(),
+            dir.to_path_buf(),
             tokio::sync::mpsc::channel(1).0,
         )
     }
@@ -1164,5 +1304,66 @@ mod tests {
         first_run(&app, "http://x").unwrap();
         assert!(app.db.ping_tasks().unwrap().is_empty(), "no carrier probes are assumed");
         let _ = std::fs::remove_dir_all(&app.secrets);
+    }
+
+    #[test]
+    fn a_scratch_guard_removes_what_it_names_when_it_goes_out_of_scope() {
+        let base = crate::test_support::scratch_dir("monitor-hub-guard");
+        std::fs::create_dir_all(base.join("tree").join("inner")).unwrap();
+        let (file, tree, gone) = (base.join("file.tmp"), base.join("tree"), base.join("already-gone.tmp"));
+        std::fs::write(&file, "half written").unwrap();
+        {
+            let (_file, _tree) = (Scratch::new(&file), Scratch::new(&tree));
+            assert!(file.is_file() && tree.is_dir(), "still there while the guards live");
+        }
+        assert!(!file.exists() && !tree.exists(), "gone with them, a file and a tree alike");
+        // One naming a path that is already gone is no error.
+        drop(Scratch::new(&gone));
+    }
+
+    /// What an interrupted export, restore, theme install and GeoIP download
+    /// leave, and nothing that is the operator's or an upload the panel may
+    /// still finish.
+    #[test]
+    fn startup_removes_what_interrupted_operations_left_and_nothing_else() {
+        let base = crate::test_support::scratch_dir("monitor-hub-sweep");
+        std::fs::create_dir_all(base.join("geoip")).unwrap();
+        let app = file_app(&base);
+        let (themes, geoip) = (app.themes.clone(), base.join("geoip"));
+        let stale = [
+            base.join("monitor.db.backup-80b4d5e38cec9855.tmp"),
+            base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp"),
+            base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp-wal"),
+            // The rollback journal SQLite keeps beside a copy while a write is under way.
+            base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp-journal"),
+            themes.join(".installing-9a8b7c6d5e4f3210.tar.gz"),
+            geoip.join("country.5c4b3a2a1b0c9d8e.part"),
+            geoip.join("country.5c4b3a2a1b0c9d8e.tmp"),
+            // The fixed names the GeoIP download used before it named per call.
+            geoip.join("country.part"),
+        ];
+        let kept = [
+            base.join("monitor.db.upload"),
+            themes.join(".upload.tar.gz"),
+            geoip.join("country.mmdb"),
+            base.join("notes.txt"),
+            base.join("my-backup-notes.tmp"),
+            base.join("monitor.db.backup-notes"),
+        ];
+        for path in stale.iter().chain(&kept) {
+            std::fs::write(path, "left or kept").unwrap();
+        }
+        std::fs::create_dir_all(themes.join("komari-likely")).unwrap();
+
+        let removed = sweep_scratch(&app);
+
+        assert_eq!(removed.len(), stale.len(), "removed {removed:?}");
+        for path in &stale {
+            assert!(!path.exists(), "{} should have been removed", path.display());
+        }
+        for path in &kept {
+            assert!(path.is_file(), "{} is not the hub's to remove", path.display());
+        }
+        assert!(themes.join("komari-likely").is_dir() && base.join("monitor.db").is_file());
     }
 }

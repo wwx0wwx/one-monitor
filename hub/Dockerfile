@@ -7,7 +7,7 @@
 # Pinned to the build platform because zoneinfo is arch-independent data, which
 # is what keeps a two-platform build from needing QEMU.
 FROM --platform=$BUILDPLATFORM alpine:3 AS base
-RUN apk add --no-cache tzdata && mkdir /data
+RUN apk add --no-cache tzdata && mkdir -m 0700 /data
 
 FROM scratch
 ARG TARGETARCH
@@ -20,7 +20,11 @@ ENV TZ=UTC
 
 # Nothing in this image can mkdir -- no shell, and the hub runs unprivileged --
 # so /data is baked in already owned. The hub creates themes/ under it itself.
-COPY --from=base --chown=65534:65534 /data /data
+# 0700 as the installer's data directory is: the database, the copy an export
+# writes beside it and the one-time password all live here, and a bind mount or
+# a volume made from this directory should not start out readable by every user
+# on the host. --chmod because a copied directory does not keep its mode.
+COPY --chmod=0700 --from=base --chown=65534:65534 /data /data
 # --chmod, because the executable bit does not survive the round trip through
 # actions/upload-artifact: without it the image carries a 0644 binary and every
 # container exits at exec with "permission denied".

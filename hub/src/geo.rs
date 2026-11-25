@@ -144,8 +144,15 @@ pub async fn download(app: &App) -> Result<(String, i64)> {
     let (urls, credentials) = download_url(app);
     let dest = mmdb_path(app);
     std::fs::create_dir_all(dest.parent().expect("geoip/ under data/"))?;
-    let part = dest.with_extension("part");
-    let tmp = dest.with_extension("tmp");
+    // Named per call rather than fixed: two updates that overlap then write
+    // two files, and one abandoned below cannot take the other's with it.
+    let token = &crate::auth::random_token()[..16];
+    let part = dest.with_extension(format!("{token}.part"));
+    let tmp = dest.with_extension(format!("{token}.tmp"));
+    // Gone on every way out of this function, the abrupt ones included: a
+    // handler dropped mid-download -- its client gone -- used to leave the
+    // half-written file behind until the next update succeeded over that name.
+    let (_part, _tmp) = (crate::Scratch::new(&part), crate::Scratch::new(&tmp));
 
     let mut last_err = anyhow::anyhow!("no URL tried");
     for url in urls.split('|') {
