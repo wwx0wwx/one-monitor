@@ -99,6 +99,33 @@ export function parseThemeSettings(raw?: Record<string, string>): ThemeSettings 
   }
 }
 
+/** The keys a hub from v1.6.14 on reads: the switches for the flag pictures
+ *  and the exchange table. Whether the hub knows them is read from what it
+ *  answers -- it sends every key it has, set or not, so one it leaves out is
+ *  one it would refuse, and it refuses a whole request for one unknown key,
+ *  changing nothing else in it either. */
+export const EXTERNAL_REQUEST_KEYS = ["flags_cdn", "fx_api"]
+
+export function knowsExternalRequests(raw?: Record<string, string>): boolean {
+  return EXTERNAL_REQUEST_KEYS.every((key) => key in (raw ?? {}))
+}
+
+/** 「恢复默认」 as two requests: every key but the two, and then the two, so
+ *  that on a hub which has never heard of them the first still goes through
+ *  and restores the rest. */
+export function apartFromExternalRequests(defaults: Record<string, string>): {
+  earlier: Record<string, string>
+  later: Record<string, string>
+} {
+  const earlier: Record<string, string> = {}
+  const later: Record<string, string> = {}
+  for (const [key, value] of Object.entries(defaults)) {
+    const part = EXTERNAL_REQUEST_KEYS.includes(key) ? later : earlier
+    part[key] = value
+  }
+  return { earlier, later }
+}
+
 /** The display settings in force, for the pieces that render far from the root
  *  -- a flag beside a node's name, a price in a card -- and would otherwise
  *  take them as a prop through every layer between. Outside a provider it is

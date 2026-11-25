@@ -346,7 +346,7 @@ export default function App() {
                 <Wrench />
               </a>
             </Button>
-            {me.authed && <ThemeSettingsButton settings={ts} onSave={saveSettings} />}
+            {me.authed && <ThemeSettingsButton settings={ts} raw={me.theme} onSave={saveSettings} />}
             <Button
               variant="ghost"
               size="icon"

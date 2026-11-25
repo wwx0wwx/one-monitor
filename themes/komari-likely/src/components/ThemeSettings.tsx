@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { RotateCcw, Settings2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import type { Bg, ThemeSettings } from "@/lib/display"
+import { apartFromExternalRequests, knowsExternalRequests, type Bg, type ThemeSettings } from "@/lib/display"
 import { followCommitted } from "@/lib/draft"
 import { cn } from "@/lib/utils"
 
@@ -27,6 +27,11 @@ const DEFAULTS: Record<string, string> = {
   cost_public: "off", show_busiest: "on", show_swap: "on", show_speed: "on", show_billing: "on",
   ip_capsule: "off", expiring_group: "on", region_group: "on", flags_cdn: "on", fx_api: "on",
 }
+
+/** 「恢复默认」 as the two requests it goes in: the keys every hub reads, then
+ *  the two from v1.6.14 on. A hub that has never heard of those refuses the
+ *  request they are in -- all of it, changing nothing -- so they travel apart. */
+const { earlier: EARLIER_DEFAULTS, later: LATER_DEFAULTS } = apartFromExternalRequests(DEFAULTS)
 
 /** Whether the viewport currently matches `query`. The change listener lets a
  *  crossing re-render; the cleanup takes the listener back down. Exists so the
@@ -201,8 +206,10 @@ function Section({ title, children }: { title: string; children: React.ReactNode
  *  background and the display toggles, all of it saved to the hub so every
  *  visitor sees the same picture. Every control applies as it is moved; what
  *  the hub refuses shows as a line of red rather than a silent nothing. */
-export function ThemeSettingsButton({ settings, onSave }: {
+export function ThemeSettingsButton({ settings, raw, onSave }: {
   settings: ThemeSettings
+  /** The settings as the hub sent them, which is where what it knows is read. */
+  raw?: Record<string, string>
   onSave: (patch: Record<string, string>) => Promise<void>
 }) {
   const [open, setOpen] = useState(false)
@@ -212,6 +219,15 @@ export function ThemeSettingsButton({ settings, onSave }: {
   const dismiss = () => { setOpen(false); setConfirming(false) }
   const save = (patch: Record<string, string>) =>
     onSave(patch).then(() => setError(""), (e: Error) => setError(e.message || "保存失败"))
+  // On a hub from v1.6.14 on. On an earlier one the two switches are not
+  // offered, since what they write would be refused, and the reset leaves
+  // their keys out rather than be refused with them.
+  const external = knowsExternalRequests(raw)
+  const restore = () => {
+    const done = external ? onSave(EARLIER_DEFAULTS).then(() => onSave(LATER_DEFAULTS)) : onSave(EARLIER_DEFAULTS)
+    setConfirming(false)
+    done.then(() => setError(""), (e: Error) => setError(e.message || "保存失败"))
+  }
 
   // Esc closes the panel no matter where focus sits: the panel is often opened
   // by touch, which leaves focus on <body>, outside this wrapper and out of
@@ -420,28 +436,32 @@ export function ThemeSettingsButton({ settings, onSave }: {
             {/* The two places the page itself asks someone other than the hub.
                 Both are on by default, as they always were; a site that would
                 rather not have its visitors talked to can switch them off. */}
-            <Section title="外部请求">
-              <Toggle
-                label="国旗图片"
-                hint="从 jsDelivr 加载 Twemoji 国旗。关闭后显示系统自带的表情国旗，不再为此向第三方发请求。"
-                checked={display.flags}
-                onChange={(on) => save({ flags_cdn: on ? "on" : "off" })}
-              />
-              <Toggle
-                label="汇率换算"
-                hint="从 jsDelivr 和 open.er-api.com 取当天的汇率来换算价格。关闭后价格按各自的原币显示。"
-                checked={display.fx}
-                onChange={(on) => save({ fx_api: on ? "on" : "off" })}
-              />
-            </Section>
+            {external && (
+              <Section title="外部请求">
+                <Toggle
+                  label="国旗图片"
+                  hint="从 jsDelivr 加载 Twemoji 国旗。关闭后显示系统自带的表情国旗，不再为此向第三方发请求。"
+                  checked={display.flags}
+                  onChange={(on) => save({ flags_cdn: on ? "on" : "off" })}
+                />
+                <Toggle
+                  label="汇率换算"
+                  hint="从 jsDelivr 和 open.er-api.com 取当天的汇率来换算价格。关闭后价格按各自的原币显示。"
+                  checked={display.fx}
+                  onChange={(on) => save({ fx_api: on ? "on" : "off" })}
+                />
+              </Section>
+            )}
 
             {error && <p role="alert" className="text-xs text-red-600">{error}</p>}
             {confirming ? (
               /* One press used to put every setting back at once, background
                  links included, with nothing to undo it by. */
               <span role="alert" className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                <span className="text-muted-foreground">把全部 {Object.keys(DEFAULTS).length} 项设置恢复默认？背景图链接也会清空。</span>
-                <button onClick={() => { save(DEFAULTS); setConfirming(false) }} className="font-medium text-red-700 underline underline-offset-2">
+                <span className="text-muted-foreground">
+                  把全部 {Object.keys(external ? DEFAULTS : EARLIER_DEFAULTS).length} 项设置恢复默认？背景图链接也会清空。
+                </span>
+                <button onClick={restore} className="font-medium text-red-700 underline underline-offset-2">
                   确认恢复
                 </button>
                 <button onClick={() => setConfirming(false)} className="text-muted-foreground underline underline-offset-2">

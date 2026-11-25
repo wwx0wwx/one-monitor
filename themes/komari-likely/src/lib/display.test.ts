@@ -1,5 +1,5 @@
 import { expect, test } from "vitest"
-import { parseThemeSettings } from "./display.ts"
+import { apartFromExternalRequests, knowsExternalRequests, parseThemeSettings } from "./display.ts"
 
 // The visitor-IP capsule is off unless the operator asks for it: on, the
 // theme's browser tells api.ip.sb every visitor's address. The default is
@@ -41,4 +41,21 @@ test("the flag pictures and the exchange table can be kept from asking a third p
   expect(parseThemeSettings({ flags_cdn: "off" }).display.flags).toBe(false)
   expect(parseThemeSettings({}).display.fx).toBe(true)
   expect(parseThemeSettings({ fx_api: "off" }).display.fx).toBe(false)
+})
+
+// The hub answers every key it has, set or not; one missing is one it would
+// refuse along with the whole request carrying it.
+test("a hub is known not to read a key it never answers", () => {
+  expect(knowsExternalRequests({ flags_cdn: "on", fx_api: "on" })).toBe(true)
+  expect(knowsExternalRequests({ flags_cdn: "on" })).toBe(false) // one of the two is not enough
+  expect(knowsExternalRequests({})).toBe(false)
+  expect(knowsExternalRequests(undefined)).toBe(false)
+})
+
+// 「恢复默认」 on a hub that has never heard of the two keys: the rest of the
+// request must not be refused with them.
+test("the defaults split into what every hub reads and the two from v1.6.14 on", () => {
+  const { earlier, later } = apartFromExternalRequests({ bg_enabled: "off", flags_cdn: "on", logo_url: "", fx_api: "on" })
+  expect(earlier).toEqual({ bg_enabled: "off", logo_url: "" })
+  expect(later).toEqual({ flags_cdn: "on", fx_api: "on" })
 })
