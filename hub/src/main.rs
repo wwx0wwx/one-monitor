@@ -419,11 +419,16 @@ impl Drop for Scratch {
 /// directories: everything else in them is the operator's.
 ///
 /// Called at startup, when nothing can be in flight and `older_than` is zero,
-/// and once an hour with a day, which is what keeps an upload a panel may still
-/// be sending to: those have a fixed name, so a fresh one is in use and a day
-/// old one is an upload nobody is going to finish. The panel takes a vanished
-/// upload in stride -- it starts the transfer over -- and so loses nothing it
-/// would not send again.
+/// and once an hour with a day. The hourly pass meets operations in flight --
+/// an export of a large database being written, a restore between its upload
+/// and its copy into the live file, a theme archive about to be unpacked, a
+/// GeoIP database minutes into its download -- so there nothing under a day old
+/// is touched: a file in use was written moments ago, and one that has sat
+/// untouched for a day belongs to no operation. That is also what keeps an
+/// upload a panel may still be sending to: those have a fixed name, so a fresh
+/// one is in use and a day old one is an upload nobody is going to finish. The
+/// panel takes a vanished upload in stride -- it starts the transfer over --
+/// and so loses nothing it would not send again.
 pub(crate) fn sweep_scratch(app: &App, older_than: std::time::Duration) -> Vec<PathBuf> {
     sweep_scratch_at(app, older_than, std::time::SystemTime::now())
 }
@@ -446,12 +451,15 @@ fn sweep_scratch_at(app: &App, older_than: std::time::Duration, now: std::time::
         let scratch = ["backup", "restoring"].map(|kind| format!("{name}.{kind}-"));
         // What a restore reads: the backup the operator sent, all of it.
         let upload = format!("{name}.upload");
+        // Stale for the scratch of an export or an import as for the upload:
+        // the hourly pass finds those under way too.
         removed.extend(remove_where(&dir, |path| {
             let file = called(path);
             path.is_file()
+                && stale(path)
                 && ((scratch.iter().any(|start| file.starts_with(start))
                     && ends(&file, &[".tmp", ".tmp-wal", ".tmp-shm", ".tmp-journal"]))
-                    || (file == upload && stale(path)))
+                    || file == upload)
         }));
     }
     // A theme archive between its last piece and its installation; the upload it
@@ -459,16 +467,16 @@ fn sweep_scratch_at(app: &App, older_than: std::time::Duration, now: std::time::
     // theme it replaces aside to, when a kill leaves it there.
     removed.extend(remove_where(&app.themes, |path| {
         let file = called(path);
-        (file.starts_with(".installing-") && ends(&file, &[".tar.gz"]) && path.is_file())
-            || (file == ".upload.tar.gz" && path.is_file() && stale(path))
-            || ((file.starts_with(".staging-") || file.starts_with(".replaced-"))
-                && path.is_dir()
-                && stale(path))
+        stale(path)
+            && ((file.starts_with(".installing-") && ends(&file, &[".tar.gz"]) && path.is_file())
+                || (file == ".upload.tar.gz" && path.is_file())
+                || ((file.starts_with(".staging-") || file.starts_with(".replaced-")) && path.is_dir()))
     }));
+    // A database of a few MiB is minutes coming down on a slow line.
     if let Some(geoip) = app.themes.parent().map(|data| data.join("geoip")) {
         removed.extend(remove_where(&geoip, |path| {
             let file = called(path);
-            file.starts_with("country.") && ends(&file, &[".part", ".tmp"]) && path.is_file()
+            stale(path) && file.starts_with("country.") && ends(&file, &[".part", ".tmp"]) && path.is_file()
         }));
     }
     removed
@@ -511,8 +519,10 @@ fn remove_where(dir: &std::path::Path, is_one: impl Fn(&std::path::Path) -> bool
 /// `X-Forwarded-For` -- the login throttle's key, and what the session list
 /// shows. An upgrade must not change that under an operator who never touched
 /// the switch, so a database that predates this has the trust written out as
-/// the explicit "on" it was already living by. Runs before `first_run`, which
-/// is what tells a fresh database from an installed one.
+/// the explicit "on" it was already living by. A fresh database is told from an
+/// installed one by the password, which only `first_run` writes -- and it
+/// writes the "off" row before the password, so by the time there is a password
+/// to see there is a row to read, whichever order the two are called in.
 fn keep_private_proxy_trust(app: &App) {
     if app.db.get("admin_password_hash").is_none() {
         return;
@@ -714,7 +724,6 @@ async fn main() -> Result<()> {
         Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes.clone(), secrets, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
-    // Before `first_run`, which tells a fresh database from an installed one.
     keep_private_proxy_trust(&app);
     for left in sweep_scratch(&app, std::time::Duration::ZERO) {
         info!("removed {}, left behind by an interrupted operation", left.display());
@@ -988,13 +997,15 @@ pub(crate) fn first_run(app: &App, url: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::Permissions::from_mode(0o600)
     })?;
-    app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
-    // Written out rather than left to the default, on the very first start:
-    // `keep_private_proxy_trust` tells a fresh database from one installed
-    // before this by the absence of a password, and this is the last moment
-    // there is none. A row that says "off" keeps the next start from reading
-    // a fresh install as an old one and trusting private-network proxies.
+    // Written out rather than left to the default, on the very first start, and
+    // before the password: `keep_private_proxy_trust` tells a fresh database
+    // from one installed before this by the absence of a password, so the row
+    // has to be there the moment there is one. The other order left a start
+    // that failed between the two writes to be read, on the next one, as an old
+    // install that never touched the switch -- and trusted. A row that says
+    // "off" keeps a fresh install from being taken for that.
     app.db.set("trust_private_xff", "off")?;
+    app.db.set("admin_password_hash", &auth::hash_password(&password)?)?;
     println!(
         "\n  Monitor hub is ready.\n\n  \
          Sign in at {url}/admin\n  \
@@ -1068,8 +1079,11 @@ async fn housekeeping(app: Shared) {
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
         }
-        // An upload nobody is finishing: the backup or theme archive as it
-        // arrived, left by a dialog closed or a tab navigated away from.
+        // What an interrupted operation left, a day on: an upload nobody is
+        // finishing -- the backup or theme archive as it arrived, left by a
+        // dialog closed or a tab navigated away from -- and what a kill ended
+        // under way, an export, a restore, an install, a download. Anything
+        // younger may be the one running now.
         for left in sweep_scratch(&app, std::time::Duration::from_secs(86_400)) {
             info!("removed {}, an upload nothing finished", left.display());
         }
@@ -1495,16 +1509,26 @@ mod tests {
         assert!(themes.join("komari-likely").is_dir() && base.join("monitor.db").is_file());
     }
 
-    /// The hourly pass meets uploads in progress: a panel may be a minute into
-    /// sending a backup, and the hub must not pull the file from under it. Only
-    /// one that has sat untouched for a day is an upload nobody is finishing.
+    /// The hourly pass meets operations in flight: an export being written, a
+    /// restore between its upload and its copy, a theme archive about to be
+    /// unpacked, a GeoIP database half downloaded, and a panel a minute into
+    /// sending a backup. The hub must not pull any of them from under the
+    /// operation. Only what has sat untouched for a day is nobody's.
     #[test]
-    fn the_hourly_pass_leaves_an_upload_that_may_still_be_arriving() {
+    fn the_hourly_pass_leaves_what_an_operation_may_still_be_using() {
         let base = crate::test_support::scratch_dir("monitor-hub-sweep-hourly");
+        std::fs::create_dir_all(base.join("geoip")).unwrap();
         let app = file_app(&base);
         let themes = app.themes.clone();
-        let uploads = [base.join("monitor.db.upload"), themes.join(".upload.tar.gz")];
-        for path in &uploads {
+        let in_use = [
+            base.join("monitor.db.backup-80b4d5e38cec9855.tmp"),
+            base.join("monitor.db.restoring-1f2e3d4c5b6a7988.tmp"),
+            base.join("monitor.db.upload"),
+            themes.join(".upload.tar.gz"),
+            themes.join(".installing-9a8b7c6d5e4f3210.tar.gz"),
+            base.join("geoip/country.5c4b3a2a1b0c9d8e.part"),
+        ];
+        for path in &in_use {
             std::fs::write(path, "half of it").unwrap();
         }
         std::fs::create_dir_all(themes.join(".staging-fresh/dist")).unwrap();
@@ -1512,12 +1536,12 @@ mod tests {
         let now = std::time::SystemTime::now();
         let two_days_later = now + std::time::Duration::from_secs(2 * 86_400);
 
-        assert!(sweep_scratch_at(&app, day, now).is_empty(), "a minute into an upload");
-        assert!(uploads.iter().all(|p| p.is_file()) && themes.join(".staging-fresh").is_dir());
+        assert!(sweep_scratch_at(&app, day, now).is_empty(), "while the operations are under way");
+        assert!(in_use.iter().all(|p| p.is_file()) && themes.join(".staging-fresh").is_dir());
 
         let removed = sweep_scratch_at(&app, day, two_days_later);
-        assert_eq!(removed.len(), 3, "removed {removed:?}");
-        assert!(uploads.iter().all(|p| !p.exists()) && !themes.join(".staging-fresh").exists());
+        assert_eq!(removed.len(), in_use.len() + 1, "removed {removed:?}");
+        assert!(in_use.iter().all(|p| !p.exists()) && !themes.join(".staging-fresh").exists());
     }
 
     /// A fresh install does not trust private-network proxies; an installed one
@@ -1550,15 +1574,27 @@ mod tests {
     }
 
     /// The start after the first one has a password to see, and must not take
-    /// a fresh install for an old one on that account.
+    /// a fresh install for an old one on that account -- in the order the hub
+    /// runs the two, `first_run` first. And what a first start leaves if it is
+    /// cut off after writing the row but before the password: no password, so
+    /// nothing to be taken for an old install, and the next start completes it.
     #[test]
     fn a_fresh_install_is_still_untrusting_on_its_second_start() {
         let fresh = app("https://x");
-        keep_private_proxy_trust(&fresh);
         first_run(&fresh, "https://x").unwrap();
         keep_private_proxy_trust(&fresh);
         assert_eq!(fresh.db.get("trust_private_xff").as_deref(), Some("off"));
         assert!(!crate::auth::trust_private_xff(&fresh));
+
+        let cut_short = app("https://x");
+        cut_short.db.set("trust_private_xff", "off").unwrap();
+        keep_private_proxy_trust(&cut_short);
+        assert_eq!(cut_short.db.get("trust_private_xff").as_deref(), Some("off"), "no password yet");
+        assert_eq!(cut_short.db.get("admin_password_hash"), None, "nothing written that was not asked for");
+        first_run(&cut_short, "https://x").unwrap();
+        keep_private_proxy_trust(&cut_short);
+        assert_eq!(cut_short.db.get("trust_private_xff").as_deref(), Some("off"));
+        assert!(!crate::auth::trust_private_xff(&cut_short));
     }
 
     /// Where each architecture's verified agent is kept once fetched.
