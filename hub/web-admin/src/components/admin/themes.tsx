@@ -71,7 +71,10 @@ export function Themes() {
   useEffect(() => { load() }, [])
 
   async function saveBg(patch: Partial<typeof bg>) {
-    setBg((old) => ({ ...old, ...patch }))
+    // Shown at once, and put back if the hub did not take it: a link left on
+    // screen that was never saved reads as saved until a reload drops it.
+    const before = bg
+    setBg({ ...bg, ...patch })
     const body: Record<string, string> = {}
     if (patch.enabled !== undefined) body.bg_enabled = patch.enabled
     if (patch.desktop !== undefined) body.bg_desktop = patch.desktop
@@ -79,7 +82,8 @@ export function Themes() {
     try {
       await api("/settings", { method: "PUT", body: JSON.stringify(body) })
     } catch (e) {
-      toast.error((e as Error).message)
+      setBg(before)
+      toast.error(`${(e as Error).message}（没有保存，已改回原值）`)
     }
   }
 
@@ -175,7 +179,7 @@ export function Themes() {
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               状态页整页背景，对全部访客生效。图床直链（必须 https://），桌面与移动可各设一张，缺一张时两端共用。
               <br />
-              透明度、模糊、铺满方式在状态页右上角的「主题设置」里调整（需登录）。
+              透明度、模糊、铺满方式在状态页右上角的「主题设置」里调整（需先登录；这个按钮由 komari-likely 这类主题提供，默认主题没有）。
             </p>
           </div>
           <Switch

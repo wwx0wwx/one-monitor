@@ -85,7 +85,7 @@ export function Ping({ nodes }: { nodes: Node[] }) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-[24%]">名称</TableHead>
+              <TableHead className="sticky left-0 z-20 w-[24%] bg-background">名称</TableHead>
               <TableHead className="w-[40%]">目标</TableHead>
               <TableHead className="w-[12%]">间隔</TableHead>
               <TableHead className="w-[12%]">服务器</TableHead>
@@ -95,7 +95,7 @@ export function Ping({ nodes }: { nodes: Node[] }) {
           <TableBody>
             {tasks?.map((t) => (
               <TableRow key={t.id}>
-                <TableCell className="font-medium">{t.name}</TableCell>
+                <TableCell className="sticky left-0 z-10 bg-background font-medium group-hover:bg-muted/50">{t.name}</TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
                 <TableCell className="text-sm text-muted-foreground">{t.nodes.length} 台</TableCell>

@@ -162,11 +162,11 @@ export function SettingsTab() {
         <div className="flex items-center gap-2 text-sm">
           <Switch
             aria-labelledby="private-xff-label"
-            checked={s.trust_private_xff !== "off"}
+            checked={s.trust_private_xff === "on"}
             onCheckedChange={(v) => set("trust_private_xff", v ? "on" : "off")}
           />
           <span id="private-xff-label">
-            反代与 hub 之间经过内网时按 X-Forwarded-For 识别来源（Docker 等容器部署需要开；反代在本机或 hub 直接公网时可关闭以收紧）
+            反代与 hub 之间经过内网时按 X-Forwarded-For 识别来源。默认关闭：反代在本机时不需要；Docker 等容器部署、反代不在同一台机器时需要打开
           </span>
         </div>
         <Field
@@ -193,7 +193,7 @@ export function SettingsTab() {
                 // Was missing from this call before: the switch above edited
                 // local state only, and a reload quietly showed the unsaved
                 // value as if it were the hub's.
-                trust_private_xff: s.trust_private_xff === "off" ? "off" : "on",
+                trust_private_xff: s.trust_private_xff === "on" ? "on" : "off",
                 trusted_proxies: String(s.trusted_proxies ?? ""),
               })
             }

@@ -238,7 +238,10 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[20%]">名称</TableHead>
+              {/* Pinned to the left edge: on a phone the table is twice the
+                  screen, and the name is what tells a row from its neighbour
+                  while the rest scrolls. */}
+              <TableHead className="sticky left-0 z-20 w-[20%] bg-background">名称</TableHead>
               <TableHead className="w-[22%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
               <TableHead className="w-[16%]">流量</TableHead>
@@ -261,7 +264,7 @@ export function Nodes({ nodes, refresh, site, canProvision, go }: {
                 }
                 onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
               >
-                <TableCell>
+                <TableCell className="sticky left-0 z-10 bg-background group-hover:bg-muted/50">
                   <div className="flex items-center gap-2">
                     <button
                       type="button"

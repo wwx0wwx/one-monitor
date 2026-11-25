@@ -43,7 +43,10 @@ export function Admin({
 }) {
   return (
     <div className="flex flex-col gap-6 md:flex-row">
-      <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
+      {/* On a phone the sections wrap onto as many rows as they need. In one
+          scrolling row the last three sat off-screen with nothing to say so,
+          and the panel looked like it had four pages. */}
+      <nav aria-label="后台导航" className="flex flex-wrap gap-1 md:w-44 md:shrink-0 md:flex-nowrap md:flex-col">
         {ADMIN_SECTIONS.map(({ path: to, label, icon: Icon }) => {
           const active = path === to
           return (
