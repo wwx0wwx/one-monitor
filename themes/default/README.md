@@ -21,8 +21,7 @@ npm run dev
 
 构建产物位于 `dist/`。提交前运行 `npm run build && npm run lint && npm test`。
 
-`npm test` 校验数字格式化和实时指标的输入边界。没有测试框架，Node 自己剥掉
-类型，失败时退出码非零。
+`npm test` 用 vitest：校验数字格式化、实时指标等输入边界，失败时退出码非零。
 
 ## 主题包
 
