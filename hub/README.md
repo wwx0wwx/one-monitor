@@ -57,13 +57,14 @@ sudo cat /opt/monitor/data/initial-password   # 0600，只给 root 读；首次�
 
 ### 3. 添加节点（agent）
 
-后台「服务器」→ 添加，面板生成该节点的安装命令，整条复制到目标 VPS 上执行：
+后台「服务器」→「添加服务器」，填好名称保存；再点这一行右侧的下载图标（悬停提示「安装 Agent」），
+对话框里就是这个节点的安装命令，整条复制到目标 VPS 上执行：
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --token <TOKEN>
 ```
 
-批量装机用注册窗（一小时内有效，最多 100 台）：后台点开注册窗拿到 KEY，每台机器：
+批量装机用「批量添加」（一小时内有效，最多 100 台）：后台点「批量添加」拿到 KEY，每台机器：
 
 ```bash
 curl -fsSL https://hub.example.com/install.sh | sh -s -- --server https://hub.example.com --register <KEY>
@@ -77,14 +78,14 @@ agent 装在节点的 `/opt/monitor/monitor-agent`，token 写在 0600 的 `/opt
 
 ### 4. 上传并激活主题
 
-后台「主题」→ 上传主题包 → 点击启用。主题包从对应 tag 的 release 下载，例如 komari-likely
+后台「主题」→ 上传主题包 → 点「使用」。主题包从对应 tag 的 release 下载，例如 komari-likely
 （以 [Releases](https://github.com/wwx0wwx/one-monitor/releases) 里 `theme-komari-likely-v*` 的最新 tag 为准）：
 
 ```text
 https://github.com/wwx0wwx/one-monitor/releases/download/theme-komari-likely-v1.2.10/theme.tar.gz
 ```
 
-也可以纯命令行（CI / AI 助手场景），四条依次执行：
+也可以纯命令行（CI / AI 助手场景），依次执行；最后两条是收尾，`cj` 里是一段有效的登录会话，等同于一枚密码：
 
 ```bash
 curl -s -c cj -H 'content-type: application/json' \
@@ -96,21 +97,25 @@ curl -s -b cj -X POST --data-binary @theme.tar.gz \
   "https://hub.example.com/api/themes?offset=0&total=$size"
 curl -s -b cj -X PUT -H 'content-type: application/json' \
   -d '{"theme":"komari-likely"}' https://hub.example.com/api/settings
+curl -s -b cj -X POST https://hub.example.com/api/auth/logout
+rm -f cj
 ```
 
 单片上传上限 8 MiB，theme.tar.gz 远小于此；更大的文件按 `offset` 递增分片。
-主题的显示设置（背景图、19 个显示键）在后台「主题」栏或状态页右上角「主题设置」里调，
+主题的显示设置分两处：背景图的链接和开关在后台「主题」页；其余的（透明度、模糊、19 个显示键）在状态页右上角的
+「主题设置」里，要先登录后台才看得到这个按钮，保存后对所有访客生效。
 每个键的含义与默认值见主题自己的 README（如 [komari-likely](../themes/komari-likely/README.md)）。
 
 **主题是代码，不是数据**：它的 HTML/JS 与后台同源运行，能读取管理会话、调用全部管理 API，
-状态页的每个访客也会执行它。「检查更新」从 GitHub 拉取的也还是代码。只安装你自己或信得过的作者
+状态页的每个访客也会执行它。「检查更新」从 GitHub 拉取的也还是代码；配置了 GitHub 代理时，下载到的包
+会先和 GitHub 记录的摘要核对，对不上就拒绝安装，没有摘要可核对时同样拒绝。只安装你自己或信得过的作者
 发布的主题；安装第三方主题前把它当成「要在你面板上以管理员身份执行的脚本」来审。
 
 ### 容器方式（可选）
 
 ```bash
 docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.6.12
+  ghcr.io/wwx0wwx/one-monitor:1.6.13
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
@@ -122,7 +127,7 @@ docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.6.12 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.6.13 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
@@ -149,13 +154,16 @@ sudo sh install-hub.sh --purge       # 连数据库一起删，不可撤销
 ```
 
 日常备份：后台「数据」页下载备份（导入也是这里），或直接拷 `/opt/monitor/data/monitor.db`（hub 在线时建议用前者）。
+导出时 hub 会在数据目录里短暂写一份副本（`monitor.db.backup-*.tmp`），导出结束就删，导出中途断开也不会留下；
+hub 每次启动时还会清掉之前因断电或被强杀而残留的这类临时文件。所以数据目录里不该长期看到 `*.tmp`。
 
 从 v1.6.10 起，面板导出的备份自带一份内容校验值。导入时如果文件内容和导出时对不上——存放时损坏了，或者被改动过——
 hub 会先拦下并说明情况，不碰现有数据，由你决定是否「仍然恢复」。更早版本导出的备份没有校验值，导入时只检查文件结构。
 
 面板「数据」页的几个操作——导出、导入、回收空间，以及页面本身要数的行数——都要把全部数据读一遍，
 其中导出的备份还多一道校验值，所以库越大越慢：两百万行历史（约 90 MB）时各多花几秒。
-面板给这几个请求留的时间比其它操作长得多（5 分钟），库大时耐心等一下即可，不是卡住了。
+面板给这几个请求，以及「地理位置识别」的更新数据库、主题的检查更新和上传，留的时间比其它操作长得多（5 分钟），
+慢的时候耐心等一下即可，不是卡住了。
 
 ## 反向代理
 
@@ -211,7 +219,7 @@ ingress:
   - service: http_status:404
 ```
 
-四点注意：
+六点注意：
 
 1. **Host 与 `X-Forwarded-Proto: https` 必须透传**（nginx 用上面的 `proxy_set_header`，Apache 用 `ProxyPreserveHost On`）。少一样，面板添加/安装节点就会 403，报错会提示「请通过 HTTPS 域名访问面板」。
 2. **`client_max_body_size` 至少 8m**：备份导入和主题上传按 4 MiB 分片传输，请求体上限不够会传一半失败。
