@@ -68,12 +68,13 @@ test("a failure with no body and no reason phrase still names its status", async
   }
 })
 
-test("a network failure is passed on as what it is, not reported as a timeout", async () => {
+test("a network failure is reported as that, in the page's language, and not as a timeout", async () => {
+  // What fetch rejects with when there is no route to the hub: a TypeError with
+  // the browser's own English message.
   const fetch_ = globalThis.fetch
-  const dropped = new TypeError("Failed to fetch")
-  globalThis.fetch = (async () => { throw dropped }) as typeof fetch
+  globalThis.fetch = (async () => { throw new TypeError("Failed to fetch") }) as typeof fetch
   try {
-    await expect(api("/nodes")).rejects.toBe(dropped)
+    await expect(api("/nodes")).rejects.toMatchObject({ status: 0, message: "连不上服务器：网络断了，或服务器没有响应" })
   } finally {
     globalThis.fetch = fetch_
   }

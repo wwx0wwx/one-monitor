@@ -19,23 +19,30 @@ const NodeDetail = lazy(loadDetail)
 // leaves the detail view rather than the site. The hub serves index.html for any
 // unknown path, so no server-side route is required.
 function useNodeRoute() {
+  // What the address names: a node, the list, or neither. `/` is the list and
+  // so is `/index.html`, which the hub serves the page from as well;
+  // `/node/5` is that node. Anything else is no page this theme has. It used
+  // to get the list, which made a mistyped or stale link look like a working
+  // one.
   const read = () => {
-    const match = location.pathname.match(/^\/node\/(\d+)/)
-    return match ? Number(match[1]) : null
+    const path = location.pathname.replace(/\/+$/, "")
+    const match = path.match(/^\/node\/(\d+)$/)
+    return { id: match ? Number(match[1]) : null, missing: !(match || path === "" || path === "/index.html") }
   }
-  const [id, setId] = useState(read)
+  const [route, setRoute] = useState(read)
   useEffect(() => {
-    const sync = () => setId(read())
+    const sync = () => setRoute(read())
     addEventListener("popstate", sync)
     return () => removeEventListener("popstate", sync)
   }, [])
   return [
-    id,
+    route.id,
     (next: number | null) => {
       history.pushState({}, "", next === null ? "/" : `/node/${next}`)
-      setId(next)
+      setRoute({ id: next, missing: false })
       scrollTo(0, 0)
     },
+    route.missing,
   ] as const
 }
 
@@ -69,7 +76,7 @@ export default function App() {
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const { nodes, error, closed } = useNodes()
-  const [open, go] = useNodeRoute()
+  const [open, go, missing] = useNodeRoute()
 
   // Esc leaves a detail page for the list, the same trip the back button and the
   // site name offer a pointer. Bound only while one is open, and removed with it.
@@ -183,7 +190,11 @@ export default function App() {
       <main className="mx-auto max-w-[1400px] space-y-5 px-4 py-4 sm:px-6">
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        {open !== null ? (
+        {missing ? (
+          <p className="py-16 text-center text-sm text-muted-foreground">
+            没有这个页面：{location.pathname}。<button className="underline" onClick={() => go(null)}>返回状态页</button>
+          </p>
+        ) : open !== null ? (
           !nodes ? (
             <Skeleton className="h-96" />
           ) : selected ? (

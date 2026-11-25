@@ -85,6 +85,9 @@ export class ApiError extends Error {
  */
 const TIMEOUT = 15_000
 
+/** What a request that could not reach the hub is reported as. */
+const UNREACHABLE = "连不上服务器：网络断了，或服务器没有响应"
+
 async function fetchWithTimeout(path: string, init?: RequestInit): Promise<Response> {
   const control = new AbortController()
   const timer = setTimeout(() => control.abort(), TIMEOUT)
@@ -92,6 +95,11 @@ async function fetchWithTimeout(path: string, init?: RequestInit): Promise<Respo
     return await fetch(path, { ...init, signal: control.signal })
   } catch (e) {
     if (control.signal.aborted) throw new ApiError(0, "请求超时")
+    // Nothing answered at all -- no connection, or the one there was dropped.
+    // fetch reports that as a TypeError carrying the browser's own message, in
+    // English and a different one per browser. Said once here, in the page's
+    // language.
+    if (e instanceof TypeError) throw new ApiError(0, UNREACHABLE)
     throw e
   } finally {
     clearTimeout(timer)

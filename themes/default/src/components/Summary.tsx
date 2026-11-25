@@ -1,6 +1,7 @@
 import { Activity, ArrowDown, ArrowDownUp, ArrowUp, Gauge, Server } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
+import { deployed } from "@/components/NodeCard"
 import { speedHistory, type Node } from "@/lib/api"
 import { bytes, rate } from "@/lib/format"
 import { cn } from "@/lib/utils"
@@ -66,6 +67,11 @@ function Spark({ series }: { series: { values: number[]; className: string }[] }
 
 export function Summary({ nodes }: { nodes: Node[] }) {
   const online = nodes.filter((n) => n.online)
+  // A machine that has never reported is not down -- it was never up. Counted
+  // apart, so that 「3 个离线」 names three machines that stopped, and a server
+  // still waiting for its agent does not read as an outage.
+  const offline = nodes.filter((n) => !n.online && deployed(n)).length
+  const never = nodes.length - online.length - offline
   const sum = (pick: (n: Node) => number) => nodes.reduce((total, n) => total + pick(n), 0)
 
   // The busiest node rather than the average: one machine at 95% is what matters,
@@ -86,7 +92,7 @@ export function Summary({ nodes }: { nodes: Node[] }) {
           {online.length} / {nodes.length}
         </div>
         <div className="mt-auto pt-1 text-xs text-muted-foreground">
-          {nodes.length - online.length > 0 ? `${nodes.length - online.length} 个离线` : "全部在线"}
+          {[offline > 0 ? `${offline} 个离线` : "", never > 0 ? `${never} 个未接入` : ""].filter(Boolean).join("、") || "全部在线"}
         </div>
       </Tile>
 
