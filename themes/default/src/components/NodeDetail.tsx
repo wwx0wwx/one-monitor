@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Country, Status, Tags } from "@/components/NodeCard"
 import { api, type Node } from "@/lib/api"
+import { CHART_REFRESH_MS, nextRefreshWait } from "@/lib/refresh"
 import {
   axisBytes, axisTop, bytes, clockFor, quarters, cpuName, CYCLES, FOREVER, money, osName, rate, timeTicks,
 } from "@/lib/format"
@@ -215,35 +216,41 @@ export function NodeDetail({ node, onBack }: { node: Node; onBack: () => void })
     return () => { active = false }
   }, [node.id, hours, tab])
 
-  // How often the window is fetched again while this screen is open. The
-  // figures above it move every couple of seconds; without this the charts
-  // stayed at the window opened with, and a spike that began afterwards was
-  // invisible until a reload or a change of range.
-  const CHART_REFRESH_MS = 10_000
+  // How often the window is fetched again while this screen is open, and what
+  // a refresh that does not get through does to that: see lib/refresh.
   useEffect(() => {
     const points = Math.round(globalThis.innerWidth * (globalThis.devicePixelRatio || 1))
     const series = tab === "latency" ? "ping" : "metrics"
     let active = true
     let inFlight = false
+    let wait = CHART_REFRESH_MS
+    let timer: ReturnType<typeof setTimeout> | undefined
     // A refresh keeps what is drawn -- the brush included -- and says nothing
     // when it cannot get through: a chart already on screen is no place for an
-    // error line, and the next one is ten seconds away. Nor does it run in a
-    // background tab, where nobody is watching and the request would only add
-    // to the hub's load.
+    // error line, and the next one is ten seconds away. What it does take away
+    // is the line the first read left when it failed: the figures have arrived,
+    // and there is nothing left to report. Nor does it run in a background tab,
+    // where nobody is watching and the request would only add to the hub's
+    // load.
     const refresh = () => {
+      clearTimeout(timer)
+      // One already in flight asks for this screen, and books the next.
       if (!active || inFlight || document.visibilityState === "hidden") return
       inFlight = true
       api<{ metrics: Point[]; ping: PingPoint[]; probes: Probes; loss?: Loss }>(
         `/nodes/${node.id}/metrics?hours=${hours}&points=${points}&series=${series}`,
       )
-        .then((next) => { if (active) setData(next) })
-        .catch(() => {})
-        .finally(() => { inFlight = false })
+        .then((next) => {
+          if (active) { setData(next); setFailed("") }
+          wait = nextRefreshWait(wait, true)
+        })
+        .catch(() => { wait = nextRefreshWait(wait, false) })
+        .finally(() => { inFlight = false; if (active) timer = setTimeout(refresh, wait) })
     }
-    const timer = setInterval(refresh, CHART_REFRESH_MS)
+    timer = setTimeout(refresh, CHART_REFRESH_MS)
     // Back in the foreground, at once: the tab was not refreshing while hidden.
     document.addEventListener("visibilitychange", refresh)
-    return () => { active = false; clearInterval(timer); document.removeEventListener("visibilitychange", refresh) }
+    return () => { active = false; clearTimeout(timer); document.removeEventListener("visibilitychange", refresh) }
   }, [node.id, hours, tab])
 
   const m = node.metrics
