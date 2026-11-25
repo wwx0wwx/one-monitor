@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -78,6 +79,18 @@ const SKIP_FSTYPES: &[&str] = &[
     "ceph",
     "glusterfs",
     "9p",
+    // The same kind, met less often. A list only names what it has seen, so
+    // the disk figures are no longer gathered on the reporting thread either
+    // (see `DiskProbe`): a type missed here costs a stale figure, not the
+    // agent.
+    "lustre",
+    "gpfs",
+    "afs",
+    "davfs",
+    "ocfs2",
+    "gfs2",
+    "beegfs",
+    "vmhgfs",
 ];
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -124,10 +137,70 @@ pub struct Metrics {
     pub procs: u32,
 }
 
+/// How long one report waits for the disk figures before going out with the
+/// last ones it had. `statvfs` on local disks answers in well under a
+/// millisecond; this is met only when a mount is slow to answer.
+const DISK_WAIT: Duration = Duration::from_millis(200);
+
+/// The disk figures, gathered on a thread of their own.
+///
+/// `statvfs` on a mount whose server has stopped answering does not return
+/// until the server does, and nothing this side can do ends it sooner. On the
+/// reporting thread that took CPU, memory and network down with it: the agent
+/// kept running and reported nothing, and the hub's silence timeout ended the
+/// session. [`SKIP_FSTYPES`] keeps the mounts known for it away from the call;
+/// this is for the ones nobody listed.
+///
+/// At most one probe is under way. While it is, a report goes out at once with
+/// the last figures -- disk totals move slowly -- and the next report after it
+/// returns takes its answer.
+#[derive(Default)]
+struct DiskProbe {
+    last: (u64, u64),
+    running: Option<JoinHandle<(u64, u64)>>,
+}
+
+impl DiskProbe {
+    /// The figures to report now: a fresh answer if one arrives within `wait`,
+    /// otherwise the last one there was.
+    fn figures(&mut self, mounts: Vec<String>) -> (u64, u64) {
+        self.figures_with(move || disk_usage(&mounts), DISK_WAIT)
+    }
+
+    fn figures_with(
+        &mut self,
+        probe: impl FnOnce() -> (u64, u64) + Send + 'static,
+        wait: Duration,
+    ) -> (u64, u64) {
+        self.take_answer();
+        if self.running.is_none() {
+            self.running = Some(std::thread::spawn(probe));
+        }
+        let deadline = Instant::now() + wait;
+        while !self.take_answer() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.last
+    }
+
+    /// Takes the answer of a probe that has returned, if one has. True when
+    /// nothing is under way afterwards.
+    fn take_answer(&mut self) -> bool {
+        if self.running.as_ref().is_some_and(JoinHandle::is_finished) {
+            let finished = self.running.take().and_then(|handle| handle.join().ok());
+            if let Some(figures) = finished {
+                self.last = figures;
+            }
+        }
+        self.running.is_none()
+    }
+}
+
 #[derive(Default)]
 pub struct Collector {
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
+    disk: DiskProbe,
 }
 
 impl Collector {
@@ -135,11 +208,11 @@ impl Collector {
         Self::default()
     }
 
-    pub fn facts(&self) -> Facts {
+    pub fn facts(&mut self) -> Facts {
         let (v4, v6) = addresses();
         let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
+        let (disk_total, _) = self.disk.figures(real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -161,7 +234,7 @@ impl Collector {
         let mem = meminfo();
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
-        let (disk_total, disk_used) = disk_usage(&real_mount_points());
+        let (disk_total, disk_used) = self.disk.figures(real_mount_points());
         let (rx_total, tx_total) = net_totals();
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
@@ -221,12 +294,22 @@ impl Collector {
 }
 
 fn read_trim(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+    fs::read(path).ok().map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+}
+
+/// A file as text, with any byte that is not UTF-8 replaced.
+///
+/// /proc is the kernel's to spell, and a name the local administrator gave an
+/// interface or a mount point may hold such a byte. Read strictly, the error
+/// costs the whole file: one oddly named interface used to leave the host with
+/// no network figures at all, and one oddly named mount point with no disk.
+pub(crate) fn read_text(path: &str) -> String {
+    fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
 }
 
 /// Parses /proc/meminfo into bytes keyed by field name.
 fn meminfo() -> HashMap<String, u64> {
-    parse_meminfo(&fs::read_to_string("/proc/meminfo").unwrap_or_default())
+    parse_meminfo(&read_text("/proc/meminfo"))
 }
 
 fn parse_meminfo(text: &str) -> HashMap<String, u64> {
@@ -282,7 +365,8 @@ fn busy_percent(prev: (u64, u64), now: (u64, u64)) -> f32 {
 }
 
 fn cpu_jiffies() -> Option<(u64, u64)> {
-    parse_cpu_jiffies(&fs::read_to_string("/proc/stat").ok()?)
+    let stat = fs::read("/proc/stat").ok()?;
+    parse_cpu_jiffies(&String::from_utf8_lossy(&stat))
 }
 
 fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
@@ -303,16 +387,16 @@ fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
 }
 
 fn loadavg() -> [f32; 3] {
-    let text = fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let text = read_text("/proc/loadavg");
     let mut it = text.split_whitespace();
     let mut next = || it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     [next(), next(), next()]
 }
 
 fn uptime() -> u64 {
-    fs::read_to_string("/proc/uptime")
+    fs::read("/proc/uptime")
         .ok()
-        .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
+        .and_then(|bytes| String::from_utf8_lossy(&bytes).split_whitespace().next()?.parse::<f64>().ok())
         .unwrap_or(0.0) as u64
 }
 
@@ -341,7 +425,7 @@ fn addresses() -> (String, String) {
 
 /// Sums the kernel's lifetime byte counters, one count per byte on the wire.
 fn net_totals() -> (u64, u64) {
-    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
+    parse_net_dev(&read_text("/proc/net/dev"))
 }
 
 fn parse_net_dev(text: &str) -> (u64, u64) {
@@ -398,7 +482,7 @@ fn skip_fstype(fstype: &str) -> bool {
 /// later stays invisible until the agent restarts. /proc/self/mounts is a few
 /// kilobytes.
 fn real_mount_points() -> Vec<String> {
-    parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+    parse_mounts(&read_text("/proc/self/mounts"))
 }
 
 fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
@@ -469,10 +553,10 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
 /// charge ext4's 5% root reserve to the user and show a fresh disk several
 /// percent full.
 ///
-/// Blocking, on the thread that also runs the reporting loop. [`SKIP_FSTYPES`]
-/// is what makes that safe: the mounts that hang in D state until a server
-/// answers -- nfs, cifs, ceph, fuse -- never reach this call. Removing an entry
-/// from that list would let a dead NAS freeze the agent, watchdog included.
+/// Blocking, which is why only a [`DiskProbe`] thread calls it. [`SKIP_FSTYPES`]
+/// keeps the mounts that hang in D state until a server answers -- nfs, cifs,
+/// ceph, fuse -- away from this call; the probe is what keeps the reporting
+/// loop running should one get through the list all the same.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;
@@ -491,10 +575,7 @@ fn disk_usage(mounts: &[String]) -> (u64, u64) {
 /// TIME_WAIT sockets live in the v4 `tw` counter for both families, so they are
 /// added once.
 fn conn_counts() -> (u32, u32) {
-    parse_sockstat(
-        &fs::read_to_string("/proc/net/sockstat").unwrap_or_default(),
-        &fs::read_to_string("/proc/net/sockstat6").unwrap_or_default(),
-    )
+    parse_sockstat(&read_text("/proc/net/sockstat"), &read_text("/proc/net/sockstat6"))
 }
 
 fn parse_sockstat(v4: &str, v6: &str) -> (u32, u32) {
@@ -528,7 +609,7 @@ fn proc_count() -> u32 {
 }
 
 fn cpuinfo() -> (String, u32) {
-    let text = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let text = read_text("/proc/cpuinfo");
     let name = text
         .lines()
         .find_map(|l| {
@@ -548,10 +629,12 @@ fn cpuinfo() -> (String, u32) {
 // the two expects.
 
 fn os_pretty_name() -> String {
-    fs::read_to_string("/etc/os-release")
+    fs::read("/etc/os-release")
         .ok()
-        .and_then(|t| {
-            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+        .and_then(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
         })
         .unwrap_or_else(|| "Linux".into())
 }
@@ -578,7 +661,7 @@ fn virtualization() -> String {
             }
         }
     }
-    if fs::read_to_string("/proc/cpuinfo").is_ok_and(|t| t.contains("hypervisor")) {
+    if read_text("/proc/cpuinfo").contains("hypervisor") {
         "vm".into()
     } else {
         "none".into()
@@ -790,6 +873,118 @@ mod tests {
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+    }
+
+    /// A file of this test's own under the temp directory, removed with it.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(bytes: &[u8]) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "monitor-agent-proc-{}-{}.txt",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::write(&path, bytes).unwrap();
+            Self(path)
+        }
+
+        fn text(&self) -> String {
+            read_text(&self.0.to_string_lossy())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// A name that is not UTF-8 costs its own line's name and nothing else:
+    /// read strictly, it used to cost the whole file, and with it every
+    /// interface's or every mount's figures.
+    #[test]
+    fn a_name_that_is_not_utf8_does_not_blank_the_rest_of_the_file() {
+        let mut net =
+            b"Inter-|   Receive                                                |  Transmit\n".to_vec();
+        net.extend_from_slice(
+            b" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets\n",
+        );
+        net.extend_from_slice(b"    eth0: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0\n");
+        net.extend_from_slice(b"     bad\xff\xfe: 9000 1 0 0 0 0 0 0 9000 1 0 0 0 0 0 0\n");
+        net.extend_from_slice(b"    eth1: 300 1 0 0 0 0 0 0 400 1 0 0 0 0 0 0\n");
+        let file = Scratch::new(&net);
+        assert_eq!(
+            parse_net_dev(&fs::read_to_string(&file.0).unwrap_or_default()),
+            (0, 0),
+            "read strictly, there is no text"
+        );
+        // The oddly named one is an interface like the others: its bytes count.
+        assert_eq!(parse_net_dev(&file.text()), (10_300, 11_400));
+
+        let mut mounts = b"/dev/vda1 / ext4 rw 0 0\n".to_vec();
+        mounts.extend_from_slice(b"/dev/vdb1 /mnt/data\xff xfs rw 0 0\n");
+        let file = Scratch::new(&mounts);
+        assert_eq!(parse_mounts(&fs::read_to_string(&file.0).unwrap_or_default()), Vec::<String>::new());
+        assert_eq!(parse_mounts(&file.text()), vec!["/", "/mnt/data\u{FFFD}"]);
+    }
+
+    /// A probe that takes its time, and counts how many of it were started.
+    fn slow_probe(
+        started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce() -> (u64, u64) + Send + 'static {
+        move || {
+            started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(600));
+            (100, 40)
+        }
+    }
+
+    /// `statvfs` on a mount whose server has stopped answering does not return.
+    /// The report must still go out, and must not start a probe per report
+    /// while the first is stuck.
+    #[test]
+    fn the_figures_do_not_wait_for_a_mount_that_does_not_answer() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut disk = DiskProbe::default();
+        let t0 = Instant::now();
+        let first = disk.figures_with(slow_probe(started.clone()), Duration::from_millis(20));
+        let second = disk.figures_with(slow_probe(started.clone()), Duration::from_millis(20));
+        assert_eq!((first, second), ((0, 0), (0, 0)), "nothing is known yet");
+        assert!(t0.elapsed() < Duration::from_millis(300), "neither report waited for the mount");
+        // The probe begins on its own thread; it may take a moment under load.
+        for _ in 0..200 {
+            if started.load(SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(started.load(SeqCst), 1, "one probe under way, not one per report");
+
+        std::thread::sleep(Duration::from_millis(900));
+        let third = disk.figures_with(slow_probe(started.clone()), Duration::from_millis(20));
+        assert_eq!(third, (100, 40), "its answer goes out with the next report");
+        assert_eq!(started.load(SeqCst), 2, "and the next probe starts only now");
+
+        std::thread::sleep(Duration::from_millis(900));
+        let fresh = disk.figures_with(|| (7, 3), Duration::from_millis(200));
+        assert_eq!(fresh, (7, 3), "a probe that answers in time is reported at once");
+    }
+
+    #[test]
+    fn remote_filesystems_met_less_often_are_left_out_too() {
+        let mounts = parse_mounts(
+            "/dev/sdk1 /scratch lustre rw 0 0\n\
+             /dev/sdl1 /gpfs gpfs rw 0 0\n\
+             /dev/sdm1 /afs afs rw 0 0\n\
+             /dev/sdn1 /dav davfs rw 0 0\n\
+             /dev/sdo1 /shared ocfs2 rw 0 0\n\
+             /dev/sdp1 /cluster gfs2 rw 0 0\n\
+             /dev/vda1 / ext4 rw 0 0\n",
+        );
+        assert_eq!(mounts, vec!["/"]);
     }
 }
 

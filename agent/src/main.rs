@@ -25,7 +25,7 @@ use collect::Collector;
 /// each flown farther than the last. Reported to the hub in every hello and
 /// shown to the operator, never compared programmatically; the Cargo package
 /// version stays numeric because the toolchain requires semver.
-pub const CODENAME: &str = "voy";
+pub const CODENAME: &str = "cas";
 
 struct Args {
     server: String,
@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
     // filesystem the totals then omit it. The unit file owns that decision, but
     // the discrepancy must not go unreported.
-    for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
+    for mount in collect::shadowed_mounts(&collect::read_text("/proc/self/mounts")) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
     let mut collector = Collector::new();
