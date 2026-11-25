@@ -11,6 +11,8 @@
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
+- 读 `/proc` 不因个别非 UTF-8 字节整份放弃；网络文件系统（nfs、cifs、ceph、lustre、gpfs 等）不计入磁盘；
+  磁盘数字在单独的线程里探测，停止应答的挂载不会拖住上报（`cas` 起）
 
 ## 安装
 
