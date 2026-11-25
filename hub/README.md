@@ -116,7 +116,7 @@ rm -f cj
 
 ```bash
 docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
-  ghcr.io/wwx0wwx/one-monitor:1.6.14
+  ghcr.io/wwx0wwx/one-monitor:1.6.15
 ```
 
 数据在卷 `monitor-data` 的 `/data`（数据库 + 主题目录）；一次性密码在容器里：`docker exec monitor cat /data/initial-password`（首次登录后自删）。
@@ -131,7 +131,7 @@ docker run -d --name monitor -p 127.0.0.1:28080:28080 -v monitor-data:/data \
 重跑安装器即升级；没写的参数（端口、`--site`）沿用上一次的，校验不过不替换二进制，新版本起不来会自动回滚：
 
 ```bash
-sudo sh install-hub.sh --version v1.6.14 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
+sudo sh install-hub.sh --version v1.6.15 --yes    # 平时省略 --version，装脚本内置的最新 hub tag
 ```
 
 主题升级：后台「主题」页对该主题点检查更新（走 GitHub releases），或重新上传新包；都不需要重启 hub。
@@ -159,7 +159,8 @@ sudo sh install-hub.sh --purge       # 连数据库一起删，不可撤销
 
 日常备份：后台「数据」页下载备份（导入也是这里），或直接拷 `/opt/monitor/data/monitor.db`（hub 在线时建议用前者）。
 导出时 hub 会在数据目录里短暂写一份副本（`monitor.db.backup-*.tmp`），导出结束就删，导出中途断开也不会留下；
-hub 每次启动时还会清掉之前因断电或被强杀而残留的这类临时文件。所以数据目录里不该长期看到 `*.tmp`。
+hub 每次启动时还会清掉之前因断电或被强杀而残留的这类临时文件，之后每小时再清一次、只清一天没动过的，正在进行的导出、
+恢复、主题安装和 GeoIP 下载不会被打断。所以数据目录里不该长期看到 `*.tmp`。
 导入备份或上传主题时中途放弃，传到一半的文件（`monitor.db.upload`、`.upload.tar.gz`）在 hub 下次启动时清掉，
 hub 不重启的话一天后也会清；再传时面板会从头开始。
 
