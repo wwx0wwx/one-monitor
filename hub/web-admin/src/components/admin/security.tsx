@@ -11,7 +11,7 @@ import { api } from "@/lib/api"
 import QRCode from "qrcode"
 
 import { ConfirmDialog, Field, copy } from "./shared"
-import { useSettings, type Settings } from "./settings"
+import { SettingsStatus, useSettings, type Settings } from "./settings"
 
 export type Session = { id: string; current: boolean; created_at: number; ip: string }
 
@@ -123,7 +123,7 @@ export function Sessions() {
 }
 
 export function Security({ siteName }: { siteName: string }) {
-  const { s, set, save } = useSettings()
+  const { s, err, reload, set, save } = useSettings()
   const [password, setPassword] = useState("")
   const [recovery, setRecovery] = useState("")
   // The TOTP binding flow: begin returns a secret the operator scans or
@@ -151,7 +151,16 @@ export function Security({ siteName }: { siteName: string }) {
       .catch(() => { if (live) setQr("") })
     return () => { live = false }
   }, [binding, siteName])
-  if (!s) return null
+  // The sessions list does not depend on the settings: it stays on the page
+  // while they load, and when they fail to.
+  if (!s) {
+    return (
+      <>
+        <Sessions />
+        <SettingsStatus s={s} err={err} reload={reload} />
+      </>
+    )
+  }
 
   async function beginTotp() {
     setBusy(true)

@@ -66,24 +66,31 @@ export const GEOIP_PROVIDERS: Record<string, string> = {
   maxmind: "MaxMind GeoLite2（本地库，需账号）",
 }
 
+/**
+ * What a page that reads the settings shows until they have arrived, and if
+ * they have not. Not a silent null: a blank page says nothing. The loading
+ * line owns the wait, the error branch keeps the retry one click away instead
+ * of one reload away. Every page that reads the settings shows it -- for a
+ * while only this one did, and a failed load left the others blank.
+ */
+export function SettingsStatus({ s, err, reload }: { s: Settings | null; err: string | null; reload: () => void }) {
+  if (s) return null
+  return err ? (
+    <div className="space-y-3 text-center text-sm">
+      <p role="alert" className="text-destructive">加载设置失败：{err}</p>
+      <Button size="sm" variant="outline" onClick={reload}>
+        <RefreshCw /> 重试
+      </Button>
+    </div>
+  ) : (
+    <p className="text-sm text-muted-foreground">加载中…</p>
+  )
+}
+
 export function SettingsTab() {
   const { s, err, reload, set, save } = useSettings()
   const [updating, setUpdating] = useState(false)
-  // Not a silent null: a blank page says nothing. The loading line owns the
-  // wait, the error branch keeps the retry one click away instead of one
-  // reload away.
-  if (!s) {
-    return err ? (
-      <div className="space-y-3 text-center text-sm">
-        <p role="alert" className="text-destructive">加载设置失败：{err}</p>
-        <Button size="sm" variant="outline" onClick={reload}>
-          <RefreshCw /> 重试
-        </Button>
-      </div>
-    ) : (
-      <p className="text-sm text-muted-foreground">加载中…</p>
-    )
-  }
+  if (!s) return <SettingsStatus s={s} err={err} reload={reload} />
   const provider = String(s.geoip_provider ?? "ipinfo")
 
   async function updateGeoip() {

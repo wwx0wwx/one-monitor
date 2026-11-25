@@ -1,5 +1,19 @@
 import { expect, test } from "vitest"
-import { addresses, ApiError, changes, GIB, lastChunkOffset, provisioningSite, requestTimeoutMs, restoreOutcome, trafficCorrection, upload, uploadPath } from "./api.ts"
+import {
+  addresses,
+  ApiError,
+  api,
+  changes,
+  GIB,
+  lastChunkOffset,
+  NetworkError,
+  provisioningSite,
+  requestTimeoutMs,
+  restoreOutcome,
+  trafficCorrection,
+  upload,
+  uploadPath,
+} from "./api.ts"
 
 test("changes reports only the keys whose value actually moved", () => {
   expect(changes({ public: true, price: 5 }, { price: 20 })).toEqual({ price: 20 })
@@ -113,6 +127,31 @@ test("requestTimeoutMs: the database's own requests get the time the database ta
   // whole file: both grow with the database in the same way.
   expect(requestTimeoutMs("/api/db")).toBe(5 * 60_000)
   expect(requestTimeoutMs("/api/db/vacuum")).toBe(5 * 60_000)
+  // A GeoIP database is fetched whole, a theme archive comes in over whatever
+  // link there is, and a theme upload goes up in pieces: on a slow link each
+  // outgrew the ordinary limit in its own direction.
+  expect(requestTimeoutMs("/api/geoip/update")).toBe(5 * 60_000)
+  expect(requestTimeoutMs("/api/themes")).toBe(5 * 60_000)
+  expect(requestTimeoutMs("/api/themes?offset=4194304&total=5000000")).toBe(5 * 60_000)
+  expect(requestTimeoutMs("/api/themes/komari-likely/update")).toBe(5 * 60_000)
+  // Nothing else about themes or the geoip is slow.
+  expect(requestTimeoutMs("/api/ping-tasks")).toBe(15_000)
+})
+
+test("a request that cannot reach the hub says so, in the panel's language", async () => {
+  // What fetch rejects with when there is no connection: a TypeError carrying
+  // the browser's own English message.
+  const fetch_ = globalThis.fetch
+  globalThis.fetch = (async () => { throw new TypeError("Failed to fetch") }) as typeof fetch
+  try {
+    const error: unknown = await api("/nodes").catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(NetworkError)
+    // Still what the upload's retries know a network fault by.
+    expect(error).toBeInstanceOf(TypeError)
+    expect((error as Error).message).toBe("连不上服务器：请检查网络，或确认 hub 还在运行")
+  } finally {
+    globalThis.fetch = fetch_
+  }
 })
 
 test("the hub's named refusal arrives with its name and its message, not as raw JSON", async () => {
@@ -172,6 +211,8 @@ test("three network failures in a row exhaust the retries and surface the error"
     calls++
     throw new TypeError("fetch failed")
   }
+  // The fault reaches the caller as what it was: the translation into the
+  // panel's language is `request`'s, which this fake `post` stands in for.
   await expect(upload("/db/restore", file, undefined, undefined, dead, nowait)).rejects.toSatisfy(
     (e: Error) => e instanceof TypeError,
   )

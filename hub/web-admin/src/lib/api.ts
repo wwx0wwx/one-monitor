@@ -152,28 +152,61 @@ export class ApiError extends Error {
 const REQUEST_TIMEOUT_MS = 15_000
 
 /**
- * The limit for the requests whose answer is a whole database's worth of work.
- * Exporting a backup copies the file and hashes every row in it; importing one
- * verifies all of that before the first page is copied; the data page counts
- * the history; reclaiming space rebuilds the file. All grow with the database,
- * and past a few million history rows each took longer than the ordinary limit
- * on a small machine -- the hub was well and the work was being done, and the
- * panel reported a timeout. Five minutes covers the largest file the hub
- * restores (256 MiB) there, and still puts an end to a hub that has stopped
+ * The limit for the requests that move a whole file, in either direction.
+ *
+ * The database's own work: exporting a backup copies the file and hashes every
+ * row in it; importing one verifies all of that before the first page is
+ * copied; the data page counts the history; reclaiming space rebuilds the file.
+ * All grow with the database, and past a few million history rows each took
+ * longer than the ordinary limit on a small machine.
+ *
+ * And a file crossing the network: a GeoIP database runs to 128 MiB and the hub
+ * gives its own download five minutes, a theme archive comes over a link that
+ * may be slow or proxied, and a theme upload goes up in pieces of 4 MiB. On a
+ * slow link each outgrew the ordinary limit.
+ *
+ * In every case the hub was well and the work was being done, and the panel
+ * reported a timeout. Five minutes covers the largest file the hub restores
+ * (256 MiB) on a small machine, and still puts an end to a hub that has stopped
  * answering.
  */
 const DATABASE_TIMEOUT_MS = 5 * 60_000
 
-/** Request paths (as `fetch` sees them) answered after reading the whole database. */
-const DATABASE_ROUTES = ["/api/db", "/api/db/backup", "/api/db/restore", "/api/db/vacuum"]
+/** Request paths (as `fetch` sees them) answered after a whole file has been read, fetched or taken in. */
+const LONG_ROUTES = [
+  "/api/db",
+  "/api/db/backup",
+  "/api/db/restore",
+  "/api/db/vacuum",
+  "/api/geoip/update",
+  "/api/themes",
+]
+
+/** The theme updater's route, which names the theme it updates. */
+const LONG_ROUTE_PATTERNS = [/^\/api\/themes\/[^/]+\/update$/]
 
 /**
- * How long `path` may take to answer: the ordinary limit, or the database's
- * for the routes in `DATABASE_ROUTES`. The query is not part of the comparison
- * -- a restore piece carries its offset there.
+ * How long `path` may take to answer: the ordinary limit, or the long one for
+ * the routes in `LONG_ROUTES` and the theme updater's. The query is not part of
+ * the comparison -- a restore piece carries its offset there.
  */
+/**
+ * fetch could not reach the hub at all: no connection, or the one there was
+ * dropped. Still a `TypeError`, which is what fetch rejects with and how the
+ * upload's retries tell this fault from a refusal; what changes is only what
+ * it says. Its own message is the browser's -- "Failed to fetch", "Load
+ * failed", "NetworkError when attempting to fetch resource." -- in English,
+ * and a different one per browser.
+ */
+export class NetworkError extends TypeError {}
+
+/** What a request that could not reach the hub is reported as. */
+const UNREACHABLE = "连不上服务器：请检查网络，或确认 hub 还在运行"
+
 export function requestTimeoutMs(path: string): number {
-  return DATABASE_ROUTES.includes(path.split("?")[0]) ? DATABASE_TIMEOUT_MS : REQUEST_TIMEOUT_MS
+  const route = path.split("?")[0]
+  const long = LONG_ROUTES.includes(route) || LONG_ROUTE_PATTERNS.some((pattern) => pattern.test(route))
+  return long ? DATABASE_TIMEOUT_MS : REQUEST_TIMEOUT_MS
 }
 
 /** The message `request` aborts with when that time is up. Read by name and message by the one caller that tells a timeout from a cancel. */
@@ -199,6 +232,9 @@ async function request(path: string, init: RequestInit): Promise<Response> {
   }
   try {
     return await fetch(path, { ...init, signal: controller.signal })
+  } catch (e) {
+    if (e instanceof TypeError) throw new NetworkError(UNREACHABLE)
+    throw e
   } finally {
     clearTimeout(timeout)
     caller?.removeEventListener("abort", forward)

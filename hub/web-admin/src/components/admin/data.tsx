@@ -10,7 +10,7 @@ import { api, download, lastChunkOffset, restoreOutcome, upload } from "@/lib/ap
 import { bytes } from "@/lib/format"
 
 import { ConfirmDialog, Field } from "./shared"
-import { useSettings } from "./settings"
+import { SettingsStatus, useSettings } from "./settings"
 
 export type DbInfo = {
   path: string
@@ -34,7 +34,7 @@ export const DB_ROWS: [string, string][] = [
 export function Data() {
   const [info, setInfo] = useState<DbInfo | null>(null)
   const [err, setErr] = useState<string | null>(null)
-  const { s, set, save } = useSettings()
+  const { s, err: settingsErr, reload, set, save } = useSettings()
   const [busy, setBusy] = useState("")
   const [confirm, setConfirm] = useState<"vacuum" | null>(null)
   const [pending, setPending] = useState<File | null>(null)
@@ -214,7 +214,7 @@ export function Data() {
         </p>
       </Card>
 
-      {s && (
+      {s ? (
         <Card className="gap-4 p-5">
           <div>
             <h3 className="text-sm font-medium">历史数据保留</h3>
@@ -254,6 +254,9 @@ export function Data() {
             </Button>
           </div>
         </Card>
+      ) : (
+        // Where the retention card would be, the reason it is not.
+        <SettingsStatus s={s} err={settingsErr} reload={reload} />
       )}
 
       <Card className="gap-4 p-5">

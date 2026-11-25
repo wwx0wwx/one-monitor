@@ -11,7 +11,7 @@ import { Switch } from "@/components/ui/switch"
 import { api, type Node } from "@/lib/api"
 
 import { Field } from "./shared"
-import { useSettings } from "./settings"
+import { SettingsStatus, useSettings } from "./settings"
 
 export const TEXTAREA =
   "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
@@ -129,9 +129,9 @@ export function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () =>
 }
 
 export function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const { s, set, save } = useSettings()
+  const { s, err, reload, set, save } = useSettings()
   const [testing, setTesting] = useState(false)
-  if (!s) return null
+  if (!s) return <SettingsStatus s={s} err={err} reload={reload} />
   const text = (k: string) => String(s[k] ?? "")
   // A credential is sent only when something was typed: the field starts empty
   // because the hub never returns the stored value.
